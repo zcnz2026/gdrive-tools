@@ -8,8 +8,12 @@
     "default_title": "打开 Google Drive 权限管理中心"
   },
   "background": { "service_worker": "background.js" },
-  "permissions": ["identity", "storage", "alarms", "notifications"],
-  "host_permissions": ["https://www.googleapis.com/*"],
+  "permissions": ["identity", "storage", "alarms", "notifications", "tabs"],
+  "host_permissions": [
+    "https://www.googleapis.com/*",
+    "https://oauth2.googleapis.com/*",
+    "https://accounts.google.com/*"
+  ],
   "oauth2": {
     "client_id": "替换为你的 Chrome 扩展 OAuth Client ID.apps.googleusercontent.com",
     "scopes": ["https://www.googleapis.com/auth/drive"]

@@ -1,8 +1,9 @@
 const $ = id => document.getElementById(id);
 
 const state = {
-  token: null,
-  email: '',
+  accounts: [],        // 已授权账号列表 [{ email, displayName, clientId, ... }]
+  oauthClients: [],    // 已导入的桌面/Web OAuth JSON 凭证列表
+  activeAccount: 'all', // 'all' 或具体 email
   files: [],
   newFileIds: new Set(),
   policy: { ...DEFAULT_POLICY },
@@ -18,7 +19,7 @@ function toast(message) {
   node.textContent = message;
   node.classList.add('show');
   clearTimeout(toast._timer);
-  toast._timer = setTimeout(() => node.classList.remove('show'), 4500);
+  toast._timer = setTimeout(() => node.classList.remove('show'), 4800);
 }
 
 function escapeHtml(value = '') {
@@ -44,17 +45,54 @@ function setStatus(text, ok = false) {
   node.classList.toggle('ok', ok);
 }
 
-async function ensureToken(interactive = true) {
-  if (state.token) return state.token;
-  const clientId = chrome.runtime.getManifest().oauth2?.client_id || '';
-  if (!clientId || clientId.includes('替换')) {
-    throw new Error('请先在 manifest.json 配置 Chrome 扩展类型的 OAuth Client ID。');
+async function resolveTokenForFile(file, interactive = true) {
+  const owner = file?.ownerAccount || file?.owners?.[0]?.emailAddress || (state.activeAccount !== 'all' ? state.activeAccount : '');
+  return getValidTokenForAccount(owner, interactive);
+}
+
+function getScopedFilesByAccount() {
+  if (state.activeAccount === 'all') return state.files;
+  const target = normalizeEntry(state.activeAccount);
+  return state.files.filter(f => normalizeEntry(f.ownerAccount || f.owners?.[0]?.emailAddress || '') === target);
+}
+
+function renderAccountsBar() {
+  const listNode = $('accounts-list');
+  const clientsInfo = $('oauth-clients-info');
+  clientsInfo.textContent = `已存 OAuth JSON 凭证：${state.oauthClients.length} 个`;
+
+  if (!state.accounts.length) {
+    listNode.innerHTML =
+      '<span class="muted">尚未授权任何账号，请点击右上角「🔑 导入桌面 JSON 授权」选择下载的 OAuth JSON 文件</span>';
+    setStatus('待授权', false);
+    $('scan').disabled = state.oauthClients.length === 0;
+    return;
   }
-  state.token = await getAuthToken(interactive);
-  return state.token;
+
+  setStatus(`已授权 ${state.accounts.length} 个账号`, true);
+  $('scan').disabled = false;
+
+  const allPill = `<button type="button" class="account-pill ${state.activeAccount === 'all' ? 'active' : ''}" data-action="switch-account" data-email="all">
+    🌐 全部已授权账号 (${state.accounts.length})
+  </button>`;
+
+  const accountPills = state.accounts
+    .map(acc => {
+      const isAct = normalizeEntry(state.activeAccount) === normalizeEntry(acc.email);
+      return `<span class="account-pill ${isAct ? 'active' : ''}" data-action="switch-account" data-email="${escapeHtml(acc.email)}">
+        <span>👤 ${escapeHtml(acc.email)}</span>
+        <button type="button" class="remove-acc" data-action="remove-account" data-email="${escapeHtml(acc.email)}" title="移除此账号授权">×</button>
+      </span>`;
+    })
+    .join('');
+
+  listNode.innerHTML = allPill + accountPills;
+  $('account').textContent = `当前已连接 ${state.accounts.length} 个 Google 账号${state.lastScanAt ? ` · 上次扫描：${formatTime(state.lastScanAt)}` : ''}`;
 }
 
 function updateTopBadges() {
+  renderAccountsBar();
+
   const scheduleNode = $('schedule-badge');
   if (state.policy.scheduleEnabled) {
     const modeLabel = state.policy.autoEnforce ? '⚡ 自动守护修正' : '🔔 仅提醒';
@@ -65,7 +103,8 @@ function updateTopBadges() {
     scheduleNode.classList.remove('active');
   }
 
-  const summary = computeSummary(state.files, state.policy, state.email, state.newFileIds);
+  const scopedFiles = getScopedFilesByAccount();
+  const summary = computeSummary(scopedFiles, state.policy, '', state.newFileIds);
   $('stat-total').textContent = summary.total;
   $('stat-shared').textContent = summary.shared;
   $('stat-unauthorized').textContent = summary.unauthorizedFiles;
@@ -74,31 +113,109 @@ function updateTopBadges() {
   $('stat-new').textContent = summary.newFiles;
 
   const enforceBtn = $('quick-enforce-all');
-  enforceBtn.textContent = `⚡ 一键修正全部异常 (${summary.anomalousFiles})`;
+  enforceBtn.textContent = `⚡ 一键修正异常 (${summary.anomalousFiles})`;
   enforceBtn.disabled = summary.anomalousFiles === 0;
 
-  $('export').disabled = state.files.length === 0;
+  $('export').disabled = scopedFiles.length === 0;
   $('clear-new-flags').classList.toggle('hidden', summary.newFiles === 0);
 
-  // 更新标签页数字徽章
-  $('tab-count-files').textContent = state.files.length;
+  $('tab-count-files').textContent = scopedFiles.length;
   $('tab-count-collabs').textContent = buildCollaboratorList().length;
   $('tab-count-policy').textContent = state.policy.writers.length + state.policy.readers.length;
   $('tab-count-logs').textContent = state.logs.length;
 
-  updateExtensionBadge(state.files, state.policy, state.email);
+  updateExtensionBadge(state.files, state.policy, '');
+}
+
+/* ==================== 导入 OAuth 桌面 JSON 凭证与多账号授权 ==================== */
+
+async function handleAuthorizeWithClient(client) {
+  setStatus('等待 Google 登录授权…');
+  try {
+    const account = await authorizeWithOAuthClient(client);
+    state.accounts = await getAuthorizedAccounts();
+    state.oauthClients = await getOAuthClients();
+    renderAll();
+    toast(`✅ 已成功授权账号：${account.email}！正在自动扫描该账号文件…`);
+    await handleScan(account.email);
+  } catch (error) {
+    renderAccountsBar();
+    toast(`授权未完成：${error.message}`);
+  }
+}
+
+async function handleOAuthFilesUpload(fileList) {
+  const files = [...fileList];
+  if (!files.length) return;
+
+  let extractedClients = [];
+  let allowlistImported = false;
+
+  for (const file of files) {
+    try {
+      const parsed = JSON.parse(await file.text());
+      const clients = extractOAuthClientsFromJson(parsed);
+      if (clients.length > 0) {
+        extractedClients.push(...clients);
+      } else {
+        // 如果不是 OAuth JSON，尝试当作白名单 JSON 导入
+        await importAllowlistFromObject(parsed);
+        allowlistImported = true;
+      }
+    } catch (error) {
+      toast(`读取 ${file.name} 失败：${error.message}`);
+    }
+  }
+
+  if (extractedClients.length > 0) {
+    state.oauthClients = await saveOAuthClients(extractedClients);
+    renderAccountsBar();
+    toast(`已成功导入 ${extractedClients.length} 个桌面/Web OAuth 授权凭证，即将打开 Google 授权页…`);
+    // 依次使用新导入的凭证发起授权
+    for (const client of extractedClients) {
+      await handleAuthorizeWithClient(client);
+    }
+  } else if (!allowlistImported) {
+    toast('未在所选 JSON 中识别到有效的 Google OAuth 凭证（installed / web）');
+  }
+}
+
+async function handleAddMoreAccount() {
+  state.oauthClients = await getOAuthClients();
+  if (!state.oauthClients.length) {
+    // 若尚未导入过桌面 JSON，直接触发文件选择框
+    $('oauth-json-file').click();
+    return;
+  }
+
+  let chosenClient = state.oauthClients[state.oauthClients.length - 1];
+  if (state.oauthClients.length > 1) {
+    const listText = state.oauthClients
+      .map((c, idx) => `${idx + 1}. ${c.project_id || '项目'} (${c.client_id.slice(0, 18)}…)`)
+      .join('\n');
+    const input = prompt(
+      `已保存 ${state.oauthClients.length} 个 OAuth 凭证，请输入要使用的序号（1-${state.oauthClients.length}）：\n${listText}`,
+      String(state.oauthClients.length)
+    );
+    if (input === null) return;
+    const idx = Math.max(0, Math.min(state.oauthClients.length - 1, ( Number(input) || 1 ) - 1));
+    chosenClient = state.oauthClients[idx];
+  }
+
+  await handleAuthorizeWithClient(chosenClient);
 }
 
 /* ==================== 筛选与文件表格渲染 (TAB 1) ==================== */
 
 function getFilteredFiles() {
+  const baseFiles = getScopedFilesByAccount();
   const query = ($('file-search')?.value || '').trim().toLowerCase();
   const typeFilter = $('file-type-filter')?.value || 'all';
   const statusFilter = $('file-status-filter')?.value || 'all';
   const hidePrivate = $('hide-private')?.checked || false;
 
-  return state.files.filter(file => {
-    const evalStat = evaluateFile(file, state.policy, state.email);
+  return baseFiles.filter(file => {
+    const evalStat = evaluateFile(file, state.policy, file.ownerAccount);
     const isNew = Boolean(file.isNew || state.newFileIds.has(file.id));
 
     if (hidePrivate && !evalStat.hasNonOwner) return false;
@@ -114,12 +231,14 @@ function getFilteredFiles() {
     if (query) {
       const nameMatch = (file.name || '').toLowerCase().includes(query);
       const idMatch = (file.id || '').toLowerCase().includes(query);
-      const permMatch = (file.permissions || []).some(p =>
-        (p.emailAddress || '').toLowerCase().includes(query) ||
-        (p.displayName || '').toLowerCase().includes(query) ||
-        (p.domain || '').toLowerCase().includes(query)
+      const ownerMatch = (file.ownerAccount || '').toLowerCase().includes(query);
+      const permMatch = (file.permissions || []).some(
+        p =>
+          (p.emailAddress || '').toLowerCase().includes(query) ||
+          (p.displayName || '').toLowerCase().includes(query) ||
+          (p.domain || '').toLowerCase().includes(query)
       );
-      if (!nameMatch && !idMatch && !permMatch) return false;
+      if (!nameMatch && !idMatch && !ownerMatch && !permMatch) return false;
     }
 
     return true;
@@ -127,7 +246,8 @@ function getFilteredFiles() {
 }
 
 function renderPermissionChip(file, p) {
-  const evalResult = evaluatePermission(p, state.policy, state.email);
+  const fileOwner = file.ownerAccount || file.owners?.[0]?.emailAddress || '';
+  const evalResult = evaluatePermission(p, state.policy, fileOwner);
   const inherited = permIsInherited(p);
   const label = permissionLabel(p);
 
@@ -178,7 +298,9 @@ function renderFilesTab() {
   const tbody = $('file-rows');
 
   if (!state.files.length) {
-    tbody.innerHTML = '<tr><td colspan="5" class="empty">尚无扫描数据，请点击顶部「立即扫描全部文件」</td></tr>';
+    tbody.innerHTML = state.accounts.length
+      ? '<tr><td colspan="5" class="empty">点击顶部「立即扫描文件」读取当前已授权账号下的文件与表格</td></tr>'
+      : '<tr><td colspan="5" class="empty">请先点击右上角「🔑 导入桌面 JSON 授权」导入你的 Google OAuth JSON 文件完成授权</td></tr>';
     $('select-all').disabled = true;
     updateBatchButtons();
     return;
@@ -195,7 +317,8 @@ function renderFilesTab() {
 
   tbody.innerHTML = filtered
     .map(file => {
-      const stat = evaluateFile(file, state.policy, state.email);
+      const fileOwner = file.ownerAccount || file.owners?.[0]?.emailAddress || '';
+      const stat = evaluateFile(file, state.policy, fileOwner);
       const cat = fileCategory(file.mimeType);
       const catLabel = fileCategoryLabel(file.mimeType);
       const isNew = Boolean(file.isNew || state.newFileIds.has(file.id));
@@ -245,7 +368,9 @@ function renderFilesTab() {
             ${isNew ? '<span class="badge new-tag">NEW 新增</span>' : ''}
             ${titleLink}
           </div>
-          <div class="file-sub">修改于 ${escapeHtml(formatTime(file.modifiedTime))}</div>
+          <div class="file-sub">
+            ${fileOwner ? `所属账号: ${escapeHtml(fileOwner)} · ` : ''}修改于 ${escapeHtml(formatTime(file.modifiedTime))}
+          </div>
         </td>
         <td>${statusHtml}</td>
         <td>${chipsHtml}${errorHtml}</td>
@@ -264,8 +389,6 @@ function renderFilesTab() {
 
 function updateBatchButtons() {
   const filtered = getFilteredFiles();
-  const filteredIds = new Set(filtered.map(f => f.id));
-  // 清理不在当前列表或已不存在的选择
   const validSelected = [...state.selectedFileIds].filter(id => state.files.some(f => f.id === id));
   state.selectedFileIds = new Set(validSelected);
 
@@ -287,9 +410,10 @@ function updateBatchButtons() {
 
 function buildCollaboratorList() {
   const map = new Map();
-  const ownerNorm = normalizeEntry(state.email);
+  const scopedFiles = getScopedFilesByAccount();
 
-  for (const file of state.files) {
+  for (const file of scopedFiles) {
+    const ownerNorm = normalizeEntry(file.ownerAccount || file.owners?.[0]?.emailAddress || '');
     for (const p of file.permissions || []) {
       if (p.role === 'owner') continue;
       if (p.type !== 'user' && p.type !== 'group') continue;
@@ -305,7 +429,7 @@ function buildCollaboratorList() {
           editableFiles: 0,
           readerFiles: 0,
           inheritedFiles: 0,
-          directRefs: [] // { file, permission }
+          directRefs: []
         });
       }
       const item = map.get(email);
@@ -364,9 +488,10 @@ function renderCollaboratorsTab() {
       if (inWriters) {
         statusBadge = '<span class="status-pill ok">✅ 允许编辑</span>';
       } else if (inReaders) {
-        statusBadge = c.editableFiles > 0
-          ? `<span class="status-pill warning">🟠 越权（有 ${c.editableFiles} 个文件可编辑）</span>`
-          : '<span class="status-pill ok">✅ 合规只读</span>';
+        statusBadge =
+          c.editableFiles > 0
+            ? `<span class="status-pill warning">🟠 越权（有 ${c.editableFiles} 个文件可编辑）</span>`
+            : '<span class="status-pill ok">✅ 合规只读</span>';
       } else {
         statusBadge = '<span class="status-pill danger">🔴 未在白名单</span>';
       }
@@ -380,7 +505,7 @@ function renderCollaboratorsTab() {
           <div class="batch-actions">
             <button type="button" class="btn btn-xs ${inWriters ? 'primary' : ''}" data-action="set-collab-tier" data-email="${escapeHtml(c.email)}" data-tier="writer">✏️ 允许编辑</button>
             <button type="button" class="btn btn-xs ${inReaders ? 'primary' : ''}" data-action="set-collab-tier" data-email="${escapeHtml(c.email)}" data-tier="reader">👁️ 仅限查看</button>
-            ${(inWriters || inReaders) ? `<button type="button" class="btn btn-xs" data-action="set-collab-tier" data-email="${escapeHtml(c.email)}" data-tier="none">移出名单</button>` : ''}
+            ${inWriters || inReaders ? `<button type="button" class="btn btn-xs" data-action="set-collab-tier" data-email="${escapeHtml(c.email)}" data-tier="none">移出名单</button>` : ''}
           </div>
         </td>
         <td>
@@ -505,61 +630,35 @@ function renderAll() {
 
 /* ==================== 核心交互动作实现 ==================== */
 
-async function handleConnect() {
-  $('connect').disabled = true;
-  setStatus('授权中…');
-  try {
-    state.token = null;
-    await ensureToken(true);
-    const about = await fetchAboutUser(state.token);
-    state.email = about.email;
-    $('account').textContent = state.email
-      ? `已授权账号：${state.email}（上次扫描：${formatTime(state.lastScanAt)}）`
-      : '已授权当前账号';
-    $('scan').disabled = false;
-    setStatus('已连接', true);
-    toast('Google Drive 授权成功');
-  } catch (error) {
-    setStatus('未连接');
-    const message = /bad client id|invalid_client/i.test(error.message)
-      ? `OAuth Client ID 无效。请在 Google Cloud 创建 Chrome Extension 类型客户端并绑定扩展 ID：${chrome.runtime.id}`
-      : error.message;
-    toast(message);
-  } finally {
-    $('connect').disabled = false;
-  }
-}
-
-async function handleScan() {
+async function handleScan(targetAccountOverride = null) {
   $('scan').disabled = true;
-  setStatus('扫描中…');
+  setStatus('扫描中…', true);
   $('progress').textContent = '正在准备扫描…';
   try {
+    const targetAcc = targetAccountOverride || state.activeAccount || 'all';
     const result = await runFullScan({
       interactive: true,
       source: 'manual',
+      targetAccount: targetAcc,
       onProgress(info) {
         $('progress').textContent = info.message;
       }
     });
-    state.token = result.token;
-    state.email = result.about.email;
+    state.accounts = result.accounts;
     state.files = result.snapshot.files;
     state.lastScanAt = result.snapshot.lastScanAt;
     state.newFileIds = new Set(result.snapshot.newFileIds || []);
     state.logs = await getAuditLogs();
 
-    $('account').textContent = `已授权账号：${state.email}（上次扫描：${formatTime(state.lastScanAt)}）`;
     const errCount = state.files.filter(f => f.permissionError).length;
     $('progress').textContent = errCount
       ? `扫描完成：共 ${state.files.length} 个文件（新增 ${result.newlyDiscoveredCount} 个），${errCount} 个文件读取权限失败`
       : `扫描完成：共 ${state.files.length} 个文件，发现 ${result.summary.anomalousFiles} 个权限异常文件`;
-    setStatus('已连接', true);
     renderAll();
   } catch (error) {
     $('progress').textContent = `扫描失败：${error.message}`;
-    setStatus('扫描异常');
     toast(`扫描失败：${error.message}`);
+    renderAccountsBar();
   } finally {
     $('scan').disabled = false;
   }
@@ -569,7 +668,6 @@ async function persistSnapshotAndLogs() {
   const prev = await getSnapshot();
   await saveSnapshot({
     ...prev,
-    accountEmail: state.email,
     files: state.files,
     newFileIds: [...state.newFileIds]
   });
@@ -585,7 +683,7 @@ async function handleEnforceFiles(targetFiles, confirmText) {
   let removeTotal = 0;
   let downgradeTotal = 0;
   for (const f of targetFiles) {
-    const st = evaluateFile(f, state.policy, state.email);
+    const st = evaluateFile(f, state.policy, f.ownerAccount);
     removeTotal += st.removeCount;
     downgradeTotal += st.downgradeCount;
   }
@@ -599,12 +697,11 @@ async function handleEnforceFiles(targetFiles, confirmText) {
   if (!confirm(msg)) return;
 
   try {
-    const token = await ensureToken(true);
     const res = await enforceFilesByPolicy(
-      token,
+      null,
       targetFiles,
       state.policy,
-      state.email,
+      '',
       'manual',
       prog => {
         $('progress').textContent = `正在修正权限 ${prog.done}/${prog.total}（已移除 ${prog.removed}，已降级 ${prog.downgraded}）…`;
@@ -626,7 +723,7 @@ async function handleInlineRoleChange(fileId, permId, newRole) {
   if (prevRole === newRole) return;
 
   try {
-    const token = await ensureToken(true);
+    const token = await resolveTokenForFile(file, true);
     await updatePermissionRole(token, fileId, permId, newRole);
     perm.role = newRole;
     await appendAuditLogs({
@@ -634,6 +731,7 @@ async function handleInlineRoleChange(fileId, permId, newRole) {
       timestamp: new Date().toISOString(),
       source: 'manual',
       actionType: 'downgrade',
+      accountEmail: file.ownerAccount || '',
       fileId: file.id,
       fileName: file.name || '(无名称)',
       webViewLink: file.webViewLink || '',
@@ -663,7 +761,7 @@ async function handleRemoveSinglePerm(fileId, permId) {
   if (!confirm(`确定从「${file.name}」移除 ${label}（${roleLabel(perm.role)}）的权限吗？`)) return;
 
   try {
-    const token = await ensureToken(true);
+    const token = await resolveTokenForFile(file, true);
     await deletePermission(token, fileId, permId);
     file.permissions = (file.permissions || []).filter(p => p.id !== permId);
     await appendAuditLogs({
@@ -671,6 +769,7 @@ async function handleRemoveSinglePerm(fileId, permId) {
       timestamp: new Date().toISOString(),
       source: 'manual',
       actionType: 'revoke',
+      accountEmail: file.ownerAccount || '',
       fileId: file.id,
       fileName: file.name || '(无名称)',
       webViewLink: file.webViewLink || '',
@@ -702,7 +801,7 @@ async function handleAddCollaboratorToFile(fileId) {
   const role = roleInput.trim().toLowerCase().startsWith('w') ? 'writer' : 'reader';
 
   try {
-    const token = await ensureToken(true);
+    const token = await resolveTokenForFile(file, true);
     const created = await createPermission(token, fileId, {
       type: 'user',
       role,
@@ -720,6 +819,7 @@ async function handleAddCollaboratorToFile(fileId) {
       timestamp: new Date().toISOString(),
       source: 'manual',
       actionType: 'grant',
+      accountEmail: file.ownerAccount || '',
       fileId: file.id,
       fileName: file.name || '(无名称)',
       webViewLink: file.webViewLink || '',
@@ -751,9 +851,10 @@ async function handleBatchCustomAction(mode) {
 
   const tasks = [];
   for (const file of files) {
+    const ownerNorm = normalizeEntry(file.ownerAccount || file.owners?.[0]?.emailAddress || '');
     for (const p of file.permissions || []) {
       if (p.role === 'owner' || permIsInherited(p)) continue;
-      if (p.emailAddress && normalizeEntry(p.emailAddress) === normalizeEntry(state.email)) continue;
+      if (p.emailAddress && normalizeEntry(p.emailAddress) === ownerNorm) continue;
 
       if (mode === 'downgrade_all' && p.role !== 'reader') {
         tasks.push({ file, permission: p, action: 'downgrade' });
@@ -778,11 +879,11 @@ async function handleBatchCustomAction(mode) {
   if (!confirm(`确定${actionDesc}吗？操作将记录在日志中并支持恢复。`)) return;
 
   try {
-    const token = await ensureToken(true);
     let done = 0;
     const logs = [];
     for (const item of tasks) {
       const { file, permission, action } = item;
+      const token = await resolveTokenForFile(file, true);
       const label = permissionLabel(permission);
       if (action === 'remove') {
         await deletePermission(token, file.id, permission.id);
@@ -792,6 +893,7 @@ async function handleBatchCustomAction(mode) {
           timestamp: new Date().toISOString(),
           source: 'manual',
           actionType: 'revoke',
+          accountEmail: file.ownerAccount || '',
           fileId: file.id,
           fileName: file.name || '(无名称)',
           webViewLink: file.webViewLink || '',
@@ -814,6 +916,7 @@ async function handleBatchCustomAction(mode) {
           timestamp: new Date().toISOString(),
           source: 'manual',
           actionType: 'downgrade',
+          accountEmail: file.ownerAccount || '',
           fileId: file.id,
           fileName: file.name || '(无名称)',
           webViewLink: file.webViewLink || '',
@@ -855,8 +958,9 @@ async function setCollaboratorAllowTier(email, tier) {
 
 async function handleCollabBatchOp(email, opType) {
   const norm = normalizeEntry(email);
+  const scopedFiles = getScopedFilesByAccount();
   const targets = [];
-  for (const file of state.files) {
+  for (const file of scopedFiles) {
     for (const p of file.permissions || []) {
       if (p.role === 'owner' || permIsInherited(p)) continue;
       if (normalizeEntry(p.emailAddress || '') !== norm) continue;
@@ -877,9 +981,9 @@ async function handleCollabBatchOp(email, opType) {
   if (!confirm(promptText)) return;
 
   try {
-    const token = await ensureToken(true);
     const logs = [];
     for (const { file, permission } of targets) {
+      const token = await resolveTokenForFile(file, true);
       if (opType === 'downgrade') {
         const prevRole = permission.role;
         await updatePermissionRole(token, file.id, permission.id, 'reader');
@@ -889,6 +993,7 @@ async function handleCollabBatchOp(email, opType) {
           timestamp: new Date().toISOString(),
           source: 'manual',
           actionType: 'downgrade',
+          accountEmail: file.ownerAccount || '',
           fileId: file.id,
           fileName: file.name || '(无名称)',
           webViewLink: file.webViewLink || '',
@@ -909,6 +1014,7 @@ async function handleCollabBatchOp(email, opType) {
           timestamp: new Date().toISOString(),
           source: 'manual',
           actionType: 'revoke',
+          accountEmail: file.ownerAccount || '',
           fileId: file.id,
           fileName: file.name || '(无名称)',
           webViewLink: file.webViewLink || '',
@@ -938,8 +1044,8 @@ async function handleRestoreLog(logId) {
   if (!log || log.restored) return;
 
   try {
-    const token = await ensureToken(true);
     const file = state.files.find(f => f.id === log.fileId);
+    const token = await getValidTokenForAccount(log.accountEmail || file?.ownerAccount || '', true);
 
     if (log.actionType === 'downgrade' && log.permissionId) {
       await updatePermissionRole(token, log.fileId, log.permissionId, log.previousRole);
@@ -970,6 +1076,7 @@ async function handleRestoreLog(logId) {
       timestamp: new Date().toISOString(),
       source: 'manual',
       actionType: 'grant',
+      accountEmail: log.accountEmail || '',
       fileId: log.fileId,
       fileName: log.fileName,
       webViewLink: log.webViewLink || '',
@@ -989,47 +1096,36 @@ async function handleRestoreLog(logId) {
   }
 }
 
-/* ==================== 白名单 JSON 导入/导出与 CSV 导出 ==================== */
+/* ==================== 白名单 JSON 导入/导出（同时兼容 OAuth JSON） ==================== */
 
-async function handleImportJson(file) {
-  try {
-    const parsed = JSON.parse(await file.text());
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && (parsed.installed || parsed.web)) {
-      const clientType = parsed.installed ? '桌面应用（installed）' : 'Web 应用（web）';
-      toast(`这是 Google OAuth 凭证文件（${clientType}），不是白名单配置文件`);
-      return;
-    }
+async function importAllowlistFromObject(parsed) {
+  let writers = [...state.policy.writers];
+  let readers = [...state.policy.readers];
+  let publicLinkRule = state.policy.publicLinkRule;
 
-    let writers = [...state.policy.writers];
-    let readers = [...state.policy.readers];
-    let publicLinkRule = state.policy.publicLinkRule;
-
-    if (Array.isArray(parsed) || Array.isArray(parsed?.keepEmails)) {
-      const list = normalizeEmailList(Array.isArray(parsed) ? parsed : parsed.keepEmails);
-      const asWriter = confirm(
-        `检测到单列表 JSON（共 ${list.length} 个邮箱）。\n点击「确定」导入到【允许编辑白名单】，点击「取消」导入到【仅限查看白名单】。`
-      );
-      if (asWriter) {
-        writers.push(...list);
-      } else {
-        readers.push(...list);
-      }
-    } else if (parsed && typeof parsed === 'object') {
-      if (Array.isArray(parsed.writers)) writers.push(...parsed.writers);
-      if (Array.isArray(parsed.readers)) readers.push(...parsed.readers);
-      if (['forbid', 'reader_only', 'allow'].includes(parsed.publicLinkRule)) {
-        publicLinkRule = parsed.publicLinkRule;
-      }
+  if (Array.isArray(parsed) || Array.isArray(parsed?.keepEmails)) {
+    const list = normalizeEmailList(Array.isArray(parsed) ? parsed : parsed.keepEmails);
+    const asWriter = confirm(
+      `检测到单列表白名单 JSON（共 ${list.length} 个邮箱）。\n点击「确定」导入到【允许编辑白名单】，点击「取消」导入到【仅限查看白名单】。`
+    );
+    if (asWriter) {
+      writers.push(...list);
     } else {
-      throw new Error('JSON 格式应为 {"writers":[...], "readers":[...]} 或邮箱数组');
+      readers.push(...list);
     }
-
-    state.policy = await savePolicy({ writers, readers, publicLinkRule });
-    renderAll();
-    toast(`白名单导入成功：可编辑 ${state.policy.writers.length} 项，仅查看 ${state.policy.readers.length} 项`);
-  } catch (error) {
-    toast(`JSON 导入失败：${error.message}`);
+  } else if (parsed && typeof parsed === 'object' && (Array.isArray(parsed.writers) || Array.isArray(parsed.readers))) {
+    if (Array.isArray(parsed.writers)) writers.push(...parsed.writers);
+    if (Array.isArray(parsed.readers)) readers.push(...parsed.readers);
+    if (['forbid', 'reader_only', 'allow'].includes(parsed.publicLinkRule)) {
+      publicLinkRule = parsed.publicLinkRule;
+    }
+  } else {
+    throw new Error('未识别的 JSON 格式（既不是 Google OAuth 凭证，也不是白名单列表）');
   }
+
+  state.policy = await savePolicy({ writers, readers, publicLinkRule });
+  renderAll();
+  toast(`白名单导入成功：可编辑 ${state.policy.writers.length} 项，仅查看 ${state.policy.readers.length} 项`);
 }
 
 function handleExportPolicyJson() {
@@ -1049,13 +1145,18 @@ function handleExportPolicyJson() {
 }
 
 function handleExportCsv() {
-  const lines = [['文件名', '文件ID', '分类', '是否新增', '链接', '权限类型', '角色', '邮箱/范围', '是否继承', '合规判定']];
-  for (const file of state.files) {
+  const scopedFiles = getScopedFilesByAccount();
+  const lines = [
+    ['所属账号', '文件名', '文件ID', '分类', '是否新增', '链接', '权限类型', '角色', '邮箱/范围', '是否继承', '合规判定']
+  ];
+  for (const file of scopedFiles) {
+    const fileOwner = file.ownerAccount || file.owners?.[0]?.emailAddress || '';
     const perms = file.permissions?.length ? file.permissions : [null];
     const isNew = Boolean(file.isNew || state.newFileIds.has(file.id));
     for (const p of perms) {
-      const evalRes = p ? evaluatePermission(p, state.policy, state.email) : { reason: '仅自己可见' };
+      const evalRes = p ? evaluatePermission(p, state.policy, fileOwner) : { reason: '仅自己可见' };
       lines.push([
+        fileOwner,
         file.name || '',
         file.id || '',
         fileCategoryLabel(file.mimeType),
@@ -1098,12 +1199,13 @@ function parseBatchInput(inputStr = '') {
 
 async function init() {
   state.policy = await getPolicy();
+  state.accounts = await getAuthorizedAccounts();
+  state.oauthClients = await getOAuthClients();
   const snapshot = await getSnapshot();
   state.logs = await getAuditLogs();
 
   if (snapshot.files?.length) {
     state.files = snapshot.files;
-    state.email = snapshot.accountEmail || '';
     state.lastScanAt = snapshot.lastScanAt || '';
     state.newFileIds = new Set(snapshot.newFileIds || []);
     $('progress').textContent = `已加载上次扫描结果（${formatTime(state.lastScanAt)}，共 ${state.files.length} 个文件）`;
@@ -1111,27 +1213,47 @@ async function init() {
 
   renderAll();
 
-  // 静默检查是否已有授权 Token
-  try {
-    state.token = await getAuthToken(false);
-    if (state.token) {
-      const about = await fetchAboutUser(state.token);
-      state.email = about.email || state.email;
-      $('account').textContent = `已授权账号：${state.email}${state.lastScanAt ? `（上次扫描：${formatTime(state.lastScanAt)}）` : ''}`;
-      $('scan').disabled = false;
-      setStatus('已连接', true);
+  // 顶部导入桌面 OAuth JSON 授权与多账号事件
+  $('oauth-json-file').addEventListener('change', e => {
+    if (e.target.files?.length) {
+      handleOAuthFilesUpload(e.target.files);
+      e.target.value = '';
     }
-  } catch (_e) {
-    // 尚未静默授权时等待用户点击按钮
-  }
+  });
 
-  // 顶部与全局事件
-  $('connect').addEventListener('click', handleConnect);
-  $('scan').addEventListener('click', handleScan);
+  $('add-account-btn').addEventListener('click', handleAddMoreAccount);
+  $('scan').addEventListener('click', () => handleScan());
   $('export').addEventListener('click', handleExportCsv);
+
   $('quick-enforce-all').addEventListener('click', () => {
-    const anomalous = state.files.filter(f => evaluateFile(f, state.policy, state.email).hasActionableViolation);
+    const scopedFiles = getScopedFilesByAccount();
+    const anomalous = scopedFiles.filter(f => evaluateFile(f, state.policy, f.ownerAccount).hasActionableViolation);
     handleEnforceFiles(anomalous);
+  });
+
+  // 多账号栏切换与移除账号
+  $('accounts-list').addEventListener('click', async e => {
+    const removeBtn = e.target.closest('[data-action="remove-account"]');
+    if (removeBtn) {
+      e.stopPropagation();
+      const email = removeBtn.dataset.email;
+      if (!confirm(`确定移除账号 ${email} 的授权记录及本地缓存文件吗？`)) return;
+      state.accounts = await removeAuthorizedAccount(email);
+      state.files = state.files.filter(f => normalizeEntry(f.ownerAccount) !== normalizeEntry(email));
+      if (normalizeEntry(state.activeAccount) === normalizeEntry(email)) {
+        state.activeAccount = 'all';
+      }
+      await persistSnapshotAndLogs();
+      toast(`已移除账号 ${email}`);
+      return;
+    }
+
+    const switchBtn = e.target.closest('[data-action="switch-account"]');
+    if (switchBtn) {
+      state.activeAccount = switchBtn.dataset.email || 'all';
+      state.selectedFileIds.clear();
+      renderAll();
+    }
   });
 
   $('clear-new-flags').addEventListener('click', async () => {
@@ -1293,9 +1415,7 @@ async function init() {
     const entries = parseBatchInput($('add-reader-input').value);
     if (!entries.length) return;
     $('add-reader-input').value = '';
-    const writersSet = new Set(state.policy.writers);
     const filteredReaders = [...state.policy.readers, ...entries];
-    // 如果之前在 writers 中，转入 readers
     const nextWriters = state.policy.writers.filter(w => !entries.includes(w));
     state.policy = await savePolicy({ writers: nextWriters, readers: filteredReaders });
     renderAll();
@@ -1329,9 +1449,10 @@ async function init() {
     }
   });
 
+  // 白名单面板的导入按钮同时兼容 OAuth JSON 与白名单 JSON
   $('json-file').addEventListener('change', e => {
-    if (e.target.files[0]) {
-      handleImportJson(e.target.files[0]);
+    if (e.target.files?.length) {
+      handleOAuthFilesUpload(e.target.files);
       e.target.value = '';
     }
   });
@@ -1356,6 +1477,7 @@ async function init() {
   chrome.runtime.onMessage.addListener(async msg => {
     if (msg?.type === 'SCAN_UPDATED') {
       const snap = await getSnapshot();
+      state.accounts = await getAuthorizedAccounts();
       state.files = snap.files || [];
       state.lastScanAt = snap.lastScanAt || '';
       state.newFileIds = new Set(snap.newFileIds || []);

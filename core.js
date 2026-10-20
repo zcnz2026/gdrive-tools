@@ -18,6 +18,293 @@ function normalizeEmailList(list = []) {
   return [...new Set(list.map(normalizeEntry).filter(Boolean))];
 }
 
+/* ==================== OAuth 桌面 JSON 凭证与多账号存储 ==================== */
+
+function pickRedirectUri(uris = []) {
+  if (Array.isArray(uris)) {
+    const local = uris.find(u => /^http:\/\/(localhost|127\.0\.0\.1)/i.test(u));
+    if (local) return local;
+  }
+  return 'http://localhost';
+}
+
+function extractOAuthClientsFromJson(parsed) {
+  if (!parsed || typeof parsed !== 'object') return [];
+  const items = Array.isArray(parsed) ? parsed : [parsed];
+  const clients = [];
+
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    const raw = item.installed || item.web || (item.client_id && item.client_secret ? item : null);
+    if (raw && raw.client_id && raw.client_secret) {
+      clients.push({
+        client_id: String(raw.client_id).trim(),
+        client_secret: String(raw.client_secret).trim(),
+        project_id: String(raw.project_id || '').trim(),
+        auth_uri: raw.auth_uri || 'https://accounts.google.com/o/oauth2/v2/auth',
+        token_uri: raw.token_uri || 'https://oauth2.googleapis.com/token',
+        redirect_uri: pickRedirectUri(raw.redirect_uris),
+        client_type: item.installed ? 'installed' : item.web ? 'web' : 'custom',
+        importedAt: new Date().toISOString()
+      });
+    }
+  }
+  return clients;
+}
+
+async function getOAuthClients() {
+  const data = await chrome.storage.local.get('oauthClients');
+  return Array.isArray(data.oauthClients) ? data.oauthClients : [];
+}
+
+async function saveOAuthClients(newClients) {
+  const list = Array.isArray(newClients) ? newClients : [newClients];
+  const current = await getOAuthClients();
+  const map = new Map();
+  for (const c of current) map.set(c.client_id, c);
+  for (const c of list) {
+    if (c && c.client_id) map.set(c.client_id, c);
+  }
+  const merged = [...map.values()];
+  await chrome.storage.local.set({ oauthClients: merged });
+  return merged;
+}
+
+async function getAuthorizedAccounts() {
+  const data = await chrome.storage.local.get('authorizedAccounts');
+  return Array.isArray(data.authorizedAccounts) ? data.authorizedAccounts : [];
+}
+
+async function saveAuthorizedAccount(account) {
+  const current = await getAuthorizedAccounts();
+  const normEmail = normalizeEntry(account.email);
+  const existing = current.find(a => normalizeEntry(a.email) === normEmail);
+  const mergedAccount = {
+    ...existing,
+    ...account,
+    email: normEmail,
+    refreshToken: account.refreshToken || existing?.refreshToken || ''
+  };
+  const next = [mergedAccount, ...current.filter(a => normalizeEntry(a.email) !== normEmail)];
+  await chrome.storage.local.set({ authorizedAccounts: next });
+  return mergedAccount;
+}
+
+async function removeAuthorizedAccount(email) {
+  const normEmail = normalizeEntry(email);
+  const current = await getAuthorizedAccounts();
+  const next = current.filter(a => normalizeEntry(a.email) !== normEmail);
+  await chrome.storage.local.set({ authorizedAccounts: next });
+  return next;
+}
+
+async function refreshAccountAccessToken(account) {
+  if (!account.refreshToken || !account.clientId || !account.clientSecret) {
+    throw new Error(`账号 ${account.email} 授权已过期，请重新点击授权`);
+  }
+  const tokenUri = account.tokenUri || 'https://oauth2.googleapis.com/token';
+  const response = await fetch(tokenUri, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: account.clientId,
+      client_secret: account.clientSecret,
+      refresh_token: account.refreshToken,
+      grant_type: 'refresh_token'
+    }).toString()
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.access_token) {
+    throw new Error(data.error_description || data.error || `刷新令牌失败 (${response.status})`);
+  }
+  const updated = await saveAuthorizedAccount({
+    ...account,
+    accessToken: data.access_token,
+    expiresAt: Date.now() + (Number(data.expires_in) || 3500) * 1000
+  });
+  return updated.accessToken;
+}
+
+async function getValidTokenForAccount(email, interactive = false) {
+  const accounts = await getAuthorizedAccounts();
+  const normEmail = normalizeEntry(email);
+  const target = normEmail
+    ? accounts.find(a => normalizeEntry(a.email) === normEmail)
+    : accounts[0];
+
+  if (target) {
+    if (target.accessToken && Date.now() < (target.expiresAt || 0) - 60000) {
+      return target.accessToken;
+    }
+    if (target.refreshToken && target.clientId && target.clientSecret) {
+      return refreshAccountAccessToken(target);
+    }
+    if (interactive && target.clientId && target.clientSecret) {
+      const reauthed = await authorizeWithOAuthClient({
+        client_id: target.clientId,
+        client_secret: target.clientSecret,
+        token_uri: target.tokenUri,
+        redirect_uri: target.redirectUri || 'http://localhost'
+      }, target.email);
+      return reauthed.accessToken;
+    }
+    if (target.accessToken) return target.accessToken;
+  }
+
+  // 兼容：若用户在 manifest.json 配置了 Chrome 扩展 Client ID，也可回退使用 chrome.identity
+  const manifestClientId = chrome.runtime.getManifest().oauth2?.client_id || '';
+  if (manifestClientId && !manifestClientId.includes('替换')) {
+    return getChromeIdentityToken(interactive);
+  }
+
+  throw new Error('尚未授权账号。请先点击「🔑 导入桌面 JSON 授权」导入 Google OAuth JSON 文件完成授权。');
+}
+
+function getChromeIdentityToken(interactive = true) {
+  return new Promise((resolve, reject) => {
+    chrome.identity.getAuthToken({ interactive }, result => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else if (!result) {
+        reject(new Error('未取得 Google 授权令牌'));
+      } else {
+        resolve(typeof result === 'string' ? result : result.token);
+      }
+    });
+  });
+}
+
+/**
+ * 使用导入的桌面端/Web 端 OAuth JSON (installed / web) 发起标准 OAuth2 授权并获取 refresh_token
+ */
+async function authorizeWithOAuthClient(client, loginHint = '') {
+  if (!client || !client.client_id || !client.client_secret) {
+    throw new Error('无效的 OAuth 客户端配置（缺少 client_id 或 client_secret）');
+  }
+
+  const redirectUri = client.redirect_uri || 'http://localhost';
+  const oauthState = `st_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const authEndpoint = client.auth_uri || 'https://accounts.google.com/o/oauth2/v2/auth';
+
+  const authUrl = new URL(authEndpoint);
+  authUrl.searchParams.set('client_id', client.client_id);
+  authUrl.searchParams.set('redirect_uri', redirectUri);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('scope', 'https://www.googleapis.com/auth/drive');
+  authUrl.searchParams.set('access_type', 'offline');
+  authUrl.searchParams.set('prompt', 'consent select_account');
+  authUrl.searchParams.set('state', oauthState);
+  if (loginHint) {
+    authUrl.searchParams.set('login_hint', loginHint);
+  }
+
+  const code = await new Promise((resolve, reject) => {
+    let authTabId = null;
+    let settled = false;
+
+    const cleanup = () => {
+      chrome.tabs.onUpdated.removeListener(onTabUpdated);
+      chrome.tabs.onRemoved.removeListener(onTabRemoved);
+    };
+
+    const tryParseRedirect = urlStr => {
+      if (!urlStr || settled) return false;
+      if (!urlStr.startsWith(redirectUri) && !/^http:\/\/(localhost|127\.0\.0\.1)(\/|:\d+|\?)/i.test(urlStr)) {
+        return false;
+      }
+      try {
+        const parsedUrl = new URL(urlStr);
+        const err = parsedUrl.searchParams.get('error');
+        const authCode = parsedUrl.searchParams.get('code');
+        if (!err && !authCode) return false;
+
+        settled = true;
+        cleanup();
+        if (authTabId !== null) {
+          chrome.tabs.remove(authTabId).catch(() => {});
+        }
+        if (err) {
+          reject(new Error(`Google 授权被拒绝或取消：${err}`));
+        } else {
+          resolve(authCode);
+        }
+        return true;
+      } catch (_e) {
+        return false;
+      }
+    };
+
+    const onTabUpdated = (tabId, changeInfo, tab) => {
+      if (tabId !== authTabId) return;
+      const candidate = changeInfo.url || tab?.pendingUrl || tab?.url || '';
+      tryParseRedirect(candidate);
+    };
+
+    const onTabRemoved = tabId => {
+      if (tabId === authTabId && !settled) {
+        settled = true;
+        cleanup();
+        reject(new Error('授权窗口已关闭，未完成授权'));
+      }
+    };
+
+    chrome.tabs.onUpdated.addListener(onTabUpdated);
+    chrome.tabs.onRemoved.addListener(onTabRemoved);
+
+    chrome.tabs.create({ url: authUrl.toString(), active: true }, tab => {
+      if (chrome.runtime.lastError || !tab) {
+        settled = true;
+        cleanup();
+        reject(new Error(chrome.runtime.lastError?.message || '无法打开授权标签页'));
+        return;
+      }
+      authTabId = tab.id;
+    });
+  });
+
+  // 用授权码换取 access_token 与 refresh_token
+  const tokenUri = client.token_uri || 'https://oauth2.googleapis.com/token';
+  const tokenRes = await fetch(tokenUri, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      code,
+      client_id: client.client_id,
+      client_secret: client.client_secret,
+      redirect_uri: redirectUri,
+      grant_type: 'authorization_code'
+    }).toString()
+  });
+
+  const tokenData = await tokenRes.json().catch(() => ({}));
+  if (!tokenRes.ok || !tokenData.access_token) {
+    throw new Error(tokenData.error_description || tokenData.error || `换取令牌失败 (${tokenRes.status})`);
+  }
+
+  const about = await fetchAboutUser(tokenData.access_token);
+  if (!about.email) {
+    throw new Error('未能获取到当前授权账号的邮箱信息');
+  }
+
+  const savedAccount = await saveAuthorizedAccount({
+    email: about.email,
+    displayName: about.displayName || '',
+    clientId: client.client_id,
+    clientSecret: client.client_secret,
+    projectId: client.project_id || '',
+    tokenUri,
+    redirectUri,
+    accessToken: tokenData.access_token,
+    refreshToken: tokenData.refresh_token || '',
+    expiresAt: Date.now() + (Number(tokenData.expires_in) || 3500) * 1000,
+    authorizedAt: new Date().toISOString()
+  });
+
+  return savedAccount;
+}
+
+/* ==================== 策略、快照与审计日志存储 ==================== */
+
 async function getPolicy() {
   const data = await chrome.storage.local.get('policy');
   const saved = data.policy || {};
@@ -36,7 +323,6 @@ async function savePolicy(partialPolicy) {
     ...partialPolicy
   };
   next.writers = normalizeEmailList(next.writers || []);
-  // 若某邮箱已在 writers 中，则从 readers 中移除避免冲突
   const writerSet = new Set(next.writers);
   next.readers = normalizeEmailList((next.readers || []).filter(item => !writerSet.has(item)));
   await chrome.storage.local.set({ policy: next });
@@ -76,7 +362,9 @@ async function appendAuditLogs(entries) {
 
 async function markAuditLogRestored(logId) {
   const current = await getAuditLogs();
-  const updated = current.map(item => item.id === logId ? { ...item, restored: true, restoredAt: new Date().toISOString() } : item);
+  const updated = current.map(item =>
+    item.id === logId ? { ...item, restored: true, restoredAt: new Date().toISOString() } : item
+  );
   await chrome.storage.local.set({ auditLogs: updated });
   return updated;
 }
@@ -85,20 +373,7 @@ async function clearAuditLogs() {
   await chrome.storage.local.set({ auditLogs: [] });
 }
 
-function getAuthToken(interactive = true) {
-  return new Promise((resolve, reject) => {
-    chrome.identity.getAuthToken({ interactive }, result => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-      } else if (!result) {
-        reject(new Error('未取得 Google 授权令牌'));
-      } else {
-        // 兼容部分 Chrome 版本返回对象 { token } 或字符串
-        resolve(typeof result === 'string' ? result : result.token);
-      }
-    });
-  });
-}
+/* ==================== Drive API 请求封装 ==================== */
 
 async function driveApi(token, path, options = {}, retry = 0) {
   const response = await fetch(`${DRIVE_API}${path}`, {
@@ -132,7 +407,7 @@ async function driveApi(token, path, options = {}, retry = 0) {
 async function fetchAboutUser(token) {
   const data = await driveApi(token, '/about?fields=user(emailAddress,displayName)');
   return {
-    email: data.user?.emailAddress || '',
+    email: normalizeEntry(data.user?.emailAddress || ''),
     displayName: data.user?.displayName || ''
   };
 }
@@ -161,13 +436,21 @@ function permissionLabel(permission) {
 }
 
 function fileCategory(mimeType = '') {
-  if (mimeType === 'application/vnd.google-apps.spreadsheet' || mimeType.includes('spreadsheet') || mimeType.includes('excel')) {
+  if (
+    mimeType === 'application/vnd.google-apps.spreadsheet' ||
+    mimeType.includes('spreadsheet') ||
+    mimeType.includes('excel')
+  ) {
     return 'sheet';
   }
   if (mimeType === 'application/vnd.google-apps.folder') {
     return 'folder';
   }
-  if (mimeType === 'application/vnd.google-apps.document' || mimeType.includes('document') || mimeType.includes('word')) {
+  if (
+    mimeType === 'application/vnd.google-apps.document' ||
+    mimeType.includes('document') ||
+    mimeType.includes('word')
+  ) {
     return 'doc';
   }
   if (mimeType === 'application/vnd.google-apps.presentation' || mimeType.includes('presentation')) {
@@ -203,11 +486,6 @@ function matchesAllowlist(email = '', list = []) {
 
 /**
  * 评估单条权限的合规状态
- * 返回:
- * - status: 'owner' | 'inherited' | 'compliant' | 'violation_downgrade' | 'violation_remove'
- * - desiredAction: null | 'downgrade' | 'remove'
- * - targetRole: 'reader' | null
- * - reason: string
  */
 function evaluatePermission(permission, policy, ownerEmail = '') {
   if (!permission) {
@@ -240,7 +518,9 @@ function evaluatePermission(permission, policy, ownerEmail = '') {
           inheritedViolation: inherited ? 'violation_downgrade' : null,
           desiredAction: inherited ? null : 'downgrade',
           targetRole: 'reader',
-          reason: inherited ? '继承的公开可编辑链接（需在上级文件夹降为只读）' : '越权：公开/域内链接当前可编辑，策略最高仅允许只读'
+          reason: inherited
+            ? '继承的公开可编辑链接（需在上级文件夹降为只读）'
+            : '越权：公开/域内链接当前可编辑，策略最高仅允许只读'
         };
       }
       return {
@@ -303,7 +583,8 @@ function evaluatePermission(permission, policy, ownerEmail = '') {
   return { status: 'compliant', desiredAction: null, targetRole: null, reason: '' };
 }
 
-function evaluateFile(file, policy, ownerEmail = '') {
+function evaluateFile(file, policy, fallbackOwnerEmail = '') {
+  const ownerEmail = file.ownerAccount || file.owners?.[0]?.emailAddress || fallbackOwnerEmail;
   const perms = file.permissions || [];
   let hasNonOwner = false;
   let hasPublic = false;
@@ -346,6 +627,7 @@ function computeSummary(files = [], policy = DEFAULT_POLICY, ownerEmail = '', ne
   let overprivilegedFiles = 0;
   let publicFiles = 0;
   let actionablePermissions = 0;
+  let anomalousFiles = 0;
 
   for (const file of files) {
     if (file.isNew || newFileIdSet.has(file.id)) {
@@ -356,6 +638,7 @@ function computeSummary(files = [], policy = DEFAULT_POLICY, ownerEmail = '', ne
     if (stat.hasPublic) publicFiles++;
     if (stat.removeCount > 0) unauthorizedFiles++;
     if (stat.downgradeCount > 0) overprivilegedFiles++;
+    if (stat.hasActionableViolation) anomalousFiles++;
     actionablePermissions += stat.removeCount + stat.downgradeCount;
   }
 
@@ -365,13 +648,13 @@ function computeSummary(files = [], policy = DEFAULT_POLICY, ownerEmail = '', ne
     newFiles,
     unauthorizedFiles,
     overprivilegedFiles,
-    anomalousFiles: files.filter(f => evaluateFile(f, policy, ownerEmail).hasActionableViolation).length,
+    anomalousFiles,
     publicFiles,
     actionablePermissions
   };
 }
 
-async function updateExtensionBadge(files, policy, ownerEmail) {
+async function updateExtensionBadge(files, policy, ownerEmail = '') {
   try {
     const summary = computeSummary(files, policy, ownerEmail);
     const count = summary.anomalousFiles;
@@ -381,8 +664,8 @@ async function updateExtensionBadge(files, policy, ownerEmail) {
     } else {
       await chrome.action.setBadgeText({ text: '' });
     }
-  } catch (e) {
-    // 忽略 badge 设置异常
+  } catch (_e) {
+    // 忽略 badge 异常
   }
 }
 
@@ -424,16 +707,18 @@ async function createPermission(token, fileId, { type = 'user', role = 'reader',
 }
 
 /**
- * 对指定文件列表按当前白名单与公开策略执行修正（移除非白名单 + 越权降为只读）
+ * 对指定文件列表按当前白名单与公开策略执行修正（自动匹配每个文件所属授权账号的 Token）
  */
-async function enforceFilesByPolicy(token, files, policy, ownerEmail, source = 'manual', onProgress = null) {
+async function enforceFilesByPolicy(fallbackToken, files, policy, fallbackOwnerEmail, source = 'manual', onProgress = null) {
   const queue = [];
   for (const file of files) {
+    const fileOwner = file.ownerAccount || file.owners?.[0]?.emailAddress || fallbackOwnerEmail;
     for (const permission of file.permissions || []) {
-      const evalResult = evaluatePermission(permission, policy, ownerEmail);
+      const evalResult = evaluatePermission(permission, policy, fileOwner);
       if (evalResult.desiredAction === 'remove' || evalResult.desiredAction === 'downgrade') {
         queue.push({
           file,
+          fileOwner,
           permission,
           action: evalResult.desiredAction,
           targetRole: evalResult.targetRole || 'reader',
@@ -449,12 +734,27 @@ async function enforceFilesByPolicy(token, files, policy, ownerEmail, source = '
   const logs = [];
   let cursor = 0;
 
+  const tokenCache = new Map();
+  async function resolveTokenForOwner(ownerEmail) {
+    const key = normalizeEntry(ownerEmail);
+    if (tokenCache.has(key)) return tokenCache.get(key);
+    try {
+      const t = await getValidTokenForAccount(key, false);
+      tokenCache.set(key, t);
+      return t;
+    } catch (_e) {
+      if (fallbackToken) return fallbackToken;
+      throw _e;
+    }
+  }
+
   const workers = Array.from({ length: 4 }, async () => {
     while (cursor < queue.length) {
       const item = queue[cursor++];
-      const { file, permission, action, targetRole, reason } = item;
+      const { file, fileOwner, permission, action, targetRole, reason } = item;
       const targetLabel = permissionLabel(permission);
       try {
+        const token = await resolveTokenForOwner(fileOwner);
         if (action === 'remove') {
           await deletePermission(token, file.id, permission.id);
           file.permissions = (file.permissions || []).filter(p => p.id !== permission.id);
@@ -464,6 +764,7 @@ async function enforceFilesByPolicy(token, files, policy, ownerEmail, source = '
             timestamp: new Date().toISOString(),
             source,
             actionType: 'revoke',
+            accountEmail: fileOwner,
             fileId: file.id,
             fileName: file.name || '(无名称)',
             webViewLink: file.webViewLink || '',
@@ -487,6 +788,7 @@ async function enforceFilesByPolicy(token, files, policy, ownerEmail, source = '
             timestamp: new Date().toISOString(),
             source,
             actionType: 'downgrade',
+            accountEmail: fileOwner,
             fileId: file.id,
             fileName: file.name || '(无名称)',
             webViewLink: file.webViewLink || '',
@@ -508,6 +810,7 @@ async function enforceFilesByPolicy(token, files, policy, ownerEmail, source = '
           timestamp: new Date().toISOString(),
           source,
           actionType: 'error',
+          accountEmail: fileOwner,
           fileId: file.id,
           fileName: file.name || '(无名称)',
           webViewLink: file.webViewLink || '',
@@ -543,22 +846,11 @@ async function enforceFilesByPolicy(token, files, policy, ownerEmail, source = '
 }
 
 /**
- * 执行完整扫描（支持前台交互调用与后台定时任务调用）
+ * 扫描单个账号下的所有文件与权限
  */
-async function runFullScan({ interactive = false, source = 'manual', onProgress = null } = {}) {
-  const token = await getAuthToken(interactive);
-  const about = await fetchAboutUser(token);
-  const policy = await getPolicy();
-  const prevSnapshot = await getSnapshot();
-
-  const knownSet = new Set(prevSnapshot.knownFileIds || []);
-  const prevNewSet = new Set(prevSnapshot.newFileIds || []);
-  const isFirstScan = knownSet.size === 0;
-
+async function scanSingleAccount(accountEmail, token, onProgress = null, accountPrefix = '') {
   let files = [];
   let pageToken = '';
-
-  if (onProgress) onProgress({ phase: 'files', count: 0, message: '正在拉取文件清单…' });
 
   do {
     const params = new URLSearchParams({
@@ -567,29 +859,25 @@ async function runFullScan({ interactive = false, source = 'manual', onProgress 
       pageSize: '1000',
       supportsAllDrives: 'true',
       includeItemsFromAllDrives: 'true',
-      fields: 'nextPageToken,incompleteSearch,files(id,name,mimeType,webViewLink,createdTime,modifiedTime,ownedByMe,owners(emailAddress),parents)'
+      fields:
+        'nextPageToken,incompleteSearch,files(id,name,mimeType,webViewLink,createdTime,modifiedTime,ownedByMe,owners(emailAddress),parents)'
     });
     if (pageToken) params.set('pageToken', pageToken);
     const data = await driveApi(token, `/files?${params}`);
     files.push(...(data.files || []));
     pageToken = data.nextPageToken || '';
     if (onProgress) {
-      onProgress({ phase: 'files', count: files.length, message: `已找到 ${files.length} 个文件…` });
+      onProgress({
+        phase: 'files',
+        count: files.length,
+        message: `${accountPrefix}已找到 ${files.length} 个文件…`
+      });
     }
   } while (pageToken);
 
   files = files.filter(file => file.ownedByMe !== false);
-
-  const newlyDiscoveredIds = [];
   for (const file of files) {
-    if (!isFirstScan && !knownSet.has(file.id)) {
-      file.isNew = true;
-      newlyDiscoveredIds.push(file.id);
-    } else if (prevNewSet.has(file.id)) {
-      file.isNew = true;
-    } else {
-      file.isNew = false;
-    }
+    file.ownerAccount = normalizeEntry(accountEmail || file.owners?.[0]?.emailAddress || '');
   }
 
   let cursor = 0;
@@ -605,7 +893,8 @@ async function runFullScan({ interactive = false, source = 'manual', onProgress 
           const params = new URLSearchParams({
             supportsAllDrives: 'true',
             pageSize: '100',
-            fields: 'nextPageToken,permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(inherited,inheritedFrom,permissionType))'
+            fields:
+              'nextPageToken,permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(inherited,inheritedFrom,permissionType))'
           });
           if (pToken) params.set('pageToken', pToken);
           const data = await driveApi(token, `/files/${encodeURIComponent(file.id)}/permissions?${params}`);
@@ -624,35 +913,102 @@ async function runFullScan({ interactive = false, source = 'manual', onProgress 
           phase: 'permissions',
           finished,
           total: files.length,
-          message: `正在读取文件权限 ${finished}/${files.length}…`
+          message: `${accountPrefix}正在读取权限 ${finished}/${files.length}…`
         });
       }
     }
   });
 
   await Promise.all(workers);
+  return files;
+}
 
-  const updatedKnownIds = [...new Set([...knownSet, ...files.map(f => f.id)])];
+/**
+ * 执行完整扫描（支持多账号并发/顺序扫描、前台交互与后台定时任务调用）
+ */
+async function runFullScan({ interactive = false, source = 'manual', targetAccount = 'all', onProgress = null } = {}) {
+  const policy = await getPolicy();
+  const prevSnapshot = await getSnapshot();
+  const accounts = await getAuthorizedAccounts();
+
+  const knownSet = new Set(prevSnapshot.knownFileIds || []);
+  const prevNewSet = new Set(prevSnapshot.newFileIds || []);
+  const isFirstScan = knownSet.size === 0;
+
+  let targetAccounts = [];
+  if (accounts.length > 0) {
+    if (targetAccount && targetAccount !== 'all') {
+      const found = accounts.find(a => normalizeEntry(a.email) === normalizeEntry(targetAccount));
+      targetAccounts = found ? [found] : accounts;
+    } else {
+      targetAccounts = accounts;
+    }
+  } else {
+    // 尝试回退使用已导入的第一个桌面 OAuth 凭证进行交互式授权，或使用 manifest.json
+    const oauthClients = await getOAuthClients();
+    if (interactive && oauthClients.length > 0) {
+      const newAcc = await authorizeWithOAuthClient(oauthClients[0]);
+      targetAccounts = [newAcc];
+    } else {
+      const token = await getValidTokenForAccount('', interactive);
+      const about = await fetchAboutUser(token);
+      targetAccounts = [{ email: about.email, accessToken: token }];
+    }
+  }
+
+  let scannedFiles = [];
+  for (let i = 0; i < targetAccounts.length; i++) {
+    const acc = targetAccounts[i];
+    const prefix = targetAccounts.length > 1 ? `[账号 ${i + 1}/${targetAccounts.length}: ${acc.email}] ` : '';
+    const token = await getValidTokenForAccount(acc.email, interactive);
+    const accFiles = await scanSingleAccount(acc.email, token, onProgress, prefix);
+    scannedFiles.push(...accFiles);
+  }
+
+  // 如果只扫描了单个账号，保留其它账号已缓存的文件
+  let mergedFiles = scannedFiles;
+  if (targetAccount !== 'all' && prevSnapshot.files?.length) {
+    const scannedAccountSet = new Set(targetAccounts.map(a => normalizeEntry(a.email)));
+    const otherAccountFiles = prevSnapshot.files.filter(
+      f => f.ownerAccount && !scannedAccountSet.has(normalizeEntry(f.ownerAccount))
+    );
+    mergedFiles = [...scannedFiles, ...otherAccountFiles];
+  }
+
+  const newlyDiscoveredIds = [];
+  for (const file of mergedFiles) {
+    if (!isFirstScan && !knownSet.has(file.id)) {
+      file.isNew = true;
+      newlyDiscoveredIds.push(file.id);
+    } else if (prevNewSet.has(file.id)) {
+      file.isNew = true;
+    } else {
+      file.isNew = false;
+    }
+  }
+
+  const updatedKnownIds = [...new Set([...knownSet, ...mergedFiles.map(f => f.id)])];
   const updatedNewIds = [...new Set([...prevNewSet, ...newlyDiscoveredIds])];
+  const primaryEmail = targetAccounts[0]?.email || prevSnapshot.accountEmail || '';
 
   let autoEnforceResult = null;
   if (source === 'schedule' && policy.autoEnforce) {
-    autoEnforceResult = await enforceFilesByPolicy(token, files, policy, about.email, 'auto');
+    autoEnforceResult = await enforceFilesByPolicy(null, mergedFiles, policy, primaryEmail, 'auto');
   }
 
   const snapshot = {
     lastScanAt: new Date().toISOString(),
     lastScanSource: source,
-    accountEmail: about.email,
-    files,
+    accountEmail: primaryEmail,
+    files: mergedFiles,
     knownFileIds: updatedKnownIds,
     newFileIds: updatedNewIds
   };
 
   await saveSnapshot(snapshot);
-  await updateExtensionBadge(files, policy, about.email);
+  await updateExtensionBadge(mergedFiles, policy, primaryEmail);
 
-  const summary = computeSummary(files, policy, about.email, new Set(updatedNewIds));
+  const summary = computeSummary(mergedFiles, policy, primaryEmail, new Set(updatedNewIds));
 
   if (source === 'schedule') {
     await appendAuditLogs({
@@ -661,7 +1017,7 @@ async function runFullScan({ interactive = false, source = 'manual', onProgress 
       source: 'scan',
       actionType: 'scan_summary',
       fileId: '',
-      fileName: '全盘定时巡检',
+      fileName: `全盘定时巡检 (${targetAccounts.length} 个账号)`,
       webViewLink: '',
       permissionId: '',
       targetType: '',
@@ -677,8 +1033,7 @@ async function runFullScan({ interactive = false, source = 'manual', onProgress 
   }
 
   return {
-    token,
-    about,
+    accounts: await getAuthorizedAccounts(),
     policy,
     snapshot,
     summary,

@@ -14,19 +14,36 @@
         <p class="eyebrow">GOOGLE DRIVE ACCESS GUARD</p>
         <div class="title-row">
           <h1>权限管理与自动巡检中心</h1>
-          <span id="status" class="status">未连接</span>
+          <span id="status" class="status">待授权</span>
           <span id="schedule-badge" class="schedule-pill">⏱️ 定时巡检：未开启</span>
         </div>
-        <p id="account" class="muted">授权后自动读取当前账号拥有的全部文件与表格，支持双层白名单与越权自动降级。</p>
+        <p id="account" class="muted">支持直接导入 Google 桌面端 OAuth JSON（installed / web）授权，支持多账号同时管理与定期巡检。</p>
       </div>
 
       <div class="toolbar">
-        <button id="connect" class="btn">授权 / 刷新令牌</button>
-        <button id="scan" class="btn primary" disabled>立即扫描全部文件</button>
-        <button id="quick-enforce-all" class="btn warning" disabled>⚡ 一键修正全部异常 (0)</button>
+        <label class="btn primary file-label" title="导入从 Google Cloud 下载的桌面端 installed 或 web OAuth JSON 凭证文件并立即授权">
+          🔑 导入桌面 JSON 授权
+          <input id="oauth-json-file" type="file" accept="application/json,.json" multiple>
+        </label>
+        <button id="add-account-btn" class="btn" title="使用已导入的 OAuth JSON 凭证继续授权其它 Google 账号">➕ 授权更多账号</button>
+        <button id="scan" class="btn primary" disabled>立即扫描文件</button>
+        <button id="quick-enforce-all" class="btn warning" disabled>⚡ 一键修正异常 (0)</button>
         <button id="export" class="btn" disabled>导出 CSV</button>
       </div>
     </header>
+
+    <!-- 多账号与 OAuth 凭证状态栏 -->
+    <section class="accounts-bar" id="accounts-bar">
+      <div class="accounts-left">
+        <span class="accounts-label">已授权账号：</span>
+        <div id="accounts-list" class="accounts-pills">
+          <span class="muted">尚未授权账号，请点击右上角「🔑 导入桌面 JSON 授权」选择你的 OAuth JSON 文件</span>
+        </div>
+      </div>
+      <div class="accounts-right">
+        <span id="oauth-clients-info" class="muted">OAuth 凭证：0 个</span>
+      </div>
+    </section>
 
     <!-- 扫描进度条与状态提示 -->
     <div id="progress-bar-wrap" class="progress-banner">
@@ -83,7 +100,7 @@
     <!-- ==================== TAB 1: 按文件管理 ==================== -->
     <section id="panel-files" class="tab-panel active">
       <div class="filter-bar">
-        <input id="file-search" type="search" class="input search-input" placeholder="搜索文件名、文件 ID 或协作者邮箱…">
+        <input id="file-search" type="search" class="input search-input" placeholder="搜索文件名、文件 ID、所属账号或协作者邮箱…">
         <select id="file-type-filter" class="select">
           <option value="all">全部文件类型</option>
           <option value="sheet">📊 仅 Google 表格 (Sheets)</option>
@@ -133,14 +150,14 @@
           <thead>
             <tr>
               <th style="width: 36px;"></th>
-              <th style="width: 28%;">文件名称 / 类型</th>
+              <th style="width: 28%;">文件名称 / 类型 / 所属账号</th>
               <th style="width: 14%;">合规状态</th>
               <th>权限明细与行内快捷操作（可直接改角色 / 移除 / 加白名单）</th>
               <th style="width: 150px;">单文件操作</th>
             </tr>
           </thead>
           <tbody id="file-rows">
-            <tr><td colspan="5" class="empty">点击上方「授权」并「立即扫描全部文件」开始管理</td></tr>
+            <tr><td colspan="5" class="empty">请先点击右上角「🔑 导入桌面 JSON 授权」导入 Google OAuth JSON 文件完成授权</td></tr>
           </tbody>
         </table>
       </div>
@@ -189,7 +206,7 @@
           <div class="card-header">
             <div>
               <h2>⏱️ 定期扫描与自动化处置</h2>
-              <p class="muted">自动巡检账号下的所有文件（包括新创建的表格/文档），发现权限偏离白名单时自动提醒或修正。</p>
+              <p class="muted">自动巡检所有已授权账号下的文件（包括新创建的表格/文档），发现权限偏离白名单时自动提醒或修正。</p>
             </div>
           </div>
 
@@ -245,14 +262,14 @@
           <div class="card-header">
             <div>
               <h2>🛡️ 双层权限白名单（可编辑 vs 仅查看）</h2>
-              <p class="muted">支持完整邮箱（如 <code>user@example.com</code>）或域名通配（如 <code>@company.com</code>）。配置自动保存在本地。</p>
+              <p class="muted">支持完整邮箱（如 <code>user@example.com</code>）或域名通配（如 <code>@company.com</code>）。也可在此导入白名单 JSON 或桌面 OAuth JSON。</p>
             </div>
             <div class="json-actions">
               <label class="btn btn-sm file-label">
-                📥 导入 JSON
-                <input id="json-file" type="file" accept="application/json,.json">
+                📥 导入 JSON (白名单/OAuth)
+                <input id="json-file" type="file" accept="application/json,.json" multiple>
               </label>
-              <button id="export-policy-json" type="button" class="btn btn-sm">📤 导出 JSON</button>
+              <button id="export-policy-json" type="button" class="btn btn-sm">📤 导出白名单 JSON</button>
             </div>
           </div>
 
