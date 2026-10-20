@@ -7,493 +7,508 @@
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <main class="app-shell">
-    <!-- 顶部全局状态与操作栏 -->
+  <div class="app-viewport">
+    <!-- 顶部极简全局栏 -->
     <header class="topbar">
-      <div class="brand-group">
-        <p class="eyebrow">GOOGLE DRIVE ACCESS GUARD</p>
-        <div class="title-row">
-          <h1>权限管理与自动巡检中心</h1>
-          <span id="status" class="status">待授权</span>
-          <span id="schedule-badge" class="schedule-pill">⏱️ 定时巡检：未开启</span>
-        </div>
-        <p id="account" class="muted">支持导入桌面 OAuth JSON 多账号授权、从表格导入「A列名称 + B列邮箱」分组对应授权、高级智能搜索与定期巡检。</p>
+      <div class="topbar-left">
+        <h1>Google Drive 权限管理</h1>
+        <span id="status" class="status-badge">待授权</span>
+        <select id="account-switcher" class="select select-sm" title="切换当前查看或扫描的已授权账号">
+          <option value="all">全部已授权账号 (0)</option>
+        </select>
+        <span id="schedule-badge" class="schedule-pill">定时巡检：未开启</span>
       </div>
 
-      <div class="toolbar">
-        <label class="btn primary file-label" title="导入从 Google Cloud 下载的桌面端 installed 或 web OAuth JSON 凭证文件并立即授权">
-          🔑 导入桌面 JSON 授权
-          <input id="oauth-json-file" type="file" accept="application/json,.json" multiple>
-        </label>
-        <button id="add-account-btn" class="btn" title="使用已导入的 OAuth JSON 凭证继续授权其它 Google 账号">➕ 授权更多账号</button>
-        <button id="scan" class="btn primary" disabled>立即扫描文件</button>
-        <button id="quick-enforce-all" class="btn warning" disabled>⚡ 一键修正异常 (0)</button>
-        <button id="export" class="btn" disabled>导出 CSV</button>
+      <div class="topbar-right">
+        <span id="progress" class="progress-text">准备就绪</span>
+        <button id="clear-new-flags" type="button" class="btn-link hidden">清除新增标记</button>
+        <button id="quick-enforce-all" type="button" class="btn warning btn-sm" disabled>一键修正异常 (0)</button>
+        <button id="export" type="button" class="btn btn-sm" disabled>导出 CSV</button>
+        <button id="scan" type="button" class="btn primary btn-sm" disabled>立即扫描</button>
       </div>
     </header>
 
-    <!-- 多账号与 OAuth 凭证状态栏 -->
-    <section class="accounts-bar" id="accounts-bar">
-      <div class="accounts-left">
-        <span class="accounts-label">已授权账号：</span>
-        <div id="accounts-list" class="accounts-pills">
-          <span class="muted">尚未授权账号，请点击右上角「🔑 导入桌面 JSON 授权」选择你的 OAuth JSON 文件</span>
-        </div>
-      </div>
-      <div class="accounts-right">
-        <span id="oauth-clients-info" class="muted">OAuth 凭证：0 个</span>
-      </div>
-    </section>
-
-    <!-- 扫描进度条与状态提示 -->
-    <div id="progress-bar-wrap" class="progress-banner">
-      <span id="progress">等待扫描（若已有上次缓存结果将自动加载）</span>
-      <div class="progress-actions">
-        <button id="clear-new-flags" class="btn-link hidden">已知悉新增文件（清除 NEW 标记）</button>
-      </div>
-    </div>
-
-    <!-- 交互式统计看板（点击卡片快速筛选） -->
-    <section class="summary-grid" id="summary">
-      <button type="button" class="summary-card active" data-card-filter="all">
-        <strong id="stat-total">0</strong>
-        <span>全部文件</span>
-      </button>
-      <button type="button" class="summary-card" data-card-filter="shared">
-        <strong id="stat-shared">0</strong>
-        <span>🔗 已共享文件</span>
-      </button>
-      <button type="button" class="summary-card danger-card" data-card-filter="unauthorized">
-        <strong id="stat-unauthorized">0</strong>
-        <span>🔴 含非白名单 (待移除)</span>
-      </button>
-      <button type="button" class="summary-card warning-card" data-card-filter="overprivileged">
-        <strong id="stat-overprivileged">0</strong>
-        <span>🟠 含越权编辑 (待降只读)</span>
-      </button>
-      <button type="button" class="summary-card" data-card-filter="public">
-        <strong id="stat-public">0</strong>
-        <span>🌐 公开 / 域内共享</span>
-      </button>
-      <button type="button" class="summary-card new-card" data-card-filter="new">
-        <strong id="stat-new">0</strong>
-        <span>🆕 新增文件/表格</span>
-      </button>
-    </section>
-
-    <!-- 四大核心工作区标签切换 -->
-    <nav class="tabs-nav" role="tablist">
-      <button type="button" class="tab-btn active" data-tab="files">
-        📋 按文件管理 & 高级筛选 <span id="tab-count-files" class="tab-badge">0</span>
-      </button>
-      <button type="button" class="tab-btn" data-tab="collaborators">
-        👥 邮箱分组与人员表格 <span id="tab-count-collabs" class="tab-badge">0</span>
-      </button>
-      <button type="button" class="tab-btn" data-tab="policy">
-        🛡️ 白名单与定期扫描设置 <span id="tab-count-policy" class="tab-badge">0</span>
-      </button>
-      <button type="button" class="tab-btn" data-tab="logs">
-        🕒 巡检与操作日志 <span id="tab-count-logs" class="tab-badge">0</span>
-      </button>
-    </nav>
-
-    <!-- ==================== TAB 1: 按文件管理（高级搜索 + 类型排除 + 按组授权） ==================== -->
-    <section id="panel-files" class="tab-panel active">
-      <!-- 高级搜索与智能过滤面板 -->
-      <div class="adv-search-panel">
-        <!-- 第一行：包含关键词、匹配模式、排除关键词、快捷排除词 -->
-        <div class="adv-row">
-          <div class="adv-field grow">
-            <label class="field-label">✅ 包含关键词（多个词用空格或逗号分隔）：</label>
-            <div class="input-with-mode">
-              <input id="file-search" type="search" class="input grow" placeholder="例如：财务 报表 结算（也支持搜邮箱、姓名、组名）…">
-              <select id="search-match-mode" class="select" title="多关键词匹配方式">
-                <option value="or">满足任一词 (OR)</option>
-                <option value="and">同时包含全部词 (AND)</option>
-                <option value="fuzzy">智能模糊 (忽略标点/间隔)</option>
-              </select>
-            </div>
+    <!-- 主体左右分栏（自适应窗口高度，内部独立滚动） -->
+    <main class="split-workspace">
+      <!-- ==================== 左侧：扫描结果板块 ==================== -->
+      <section class="left-results-pane">
+        <!-- 结果表头统计速筛条 -->
+        <div class="results-header-bar">
+          <div class="summary-pills" id="summary">
+            <button type="button" class="summary-card active" data-card-filter="all">
+              <span>全部</span> <strong id="stat-total">0</strong>
+            </button>
+            <button type="button" class="summary-card" data-card-filter="shared">
+              <span>已共享</span> <strong id="stat-shared">0</strong>
+            </button>
+            <button type="button" class="summary-card danger-card" data-card-filter="unauthorized">
+              <span>非白名单</span> <strong id="stat-unauthorized">0</strong>
+            </button>
+            <button type="button" class="summary-card warning-card" data-card-filter="overprivileged">
+              <span>越权编辑</span> <strong id="stat-overprivileged">0</strong>
+            </button>
+            <button type="button" class="summary-card" data-card-filter="public">
+              <span>公开链接</span> <strong id="stat-public">0</strong>
+            </button>
+            <button type="button" class="summary-card new-card" data-card-filter="new">
+              <span>新增</span> <strong id="stat-new">0</strong>
+            </button>
           </div>
 
-          <div class="adv-field grow">
-            <label class="field-label">
-              🚫 排除关键词（名字含这些词的文件将隐藏）：
-              <span class="quick-exclude-group">
-                快捷排除：
-                <button type="button" class="quick-kw-btn" data-ex-kw="副本">副本</button>
-                <button type="button" class="quick-kw-btn" data-ex-kw="copy">Copy</button>
-                <button type="button" class="quick-kw-btn" data-ex-kw="备份">备份</button>
-                <button type="button" class="quick-kw-btn" data-ex-kw="测试">测试</button>
-                <button type="button" class="quick-kw-btn" data-ex-kw="模板">模板</button>
-                <button type="button" class="quick-kw-btn" data-ex-kw="旧">旧/废弃</button>
-              </span>
-            </label>
-            <input id="file-exclude-search" type="search" class="input full-width" placeholder="输入要排除的词，如：副本 备份 测试 废弃…">
-          </div>
-        </div>
-
-        <!-- 第二行：文件类型【包含 / 排除】多选胶囊 -->
-        <div class="adv-row type-filter-row">
-          <div class="type-mode-box">
-            <select id="type-filter-mode" class="select select-sm">
-              <option value="include">📂 仅看勾选类型 (包含模式)</option>
-              <option value="exclude">🚫 排除勾选类型 (排除模式)</option>
-            </select>
-          </div>
-          <div id="type-pills-bar" class="type-pills">
-            <button type="button" class="type-pill" data-type-cat="sheet">📊 Google 表格</button>
-            <button type="button" class="type-pill" data-type-cat="excel">📗 Excel / CSV</button>
-            <button type="button" class="type-pill" data-type-cat="doc">📝 Google 文档</button>
-            <button type="button" class="type-pill" data-type-cat="word_pdf">📕 Word / PDF</button>
-            <button type="button" class="type-pill" data-type-cat="slide">📽️ 幻灯片</button>
-            <button type="button" class="type-pill" data-type-cat="folder">📁 文件夹</button>
-            <button type="button" class="type-pill" data-type-cat="media">🖼️ 图片/音视频</button>
-            <button type="button" class="type-pill" data-type-cat="other">📦 压缩包/其他</button>
-            <button type="button" id="clear-type-pills" class="btn-link">重置类型</button>
-          </div>
-        </div>
-
-        <!-- 第三行：按授权组筛选、不规范文件名智能归并、权限状态筛选与保存预设 -->
-        <div class="adv-row bottom-filter-row">
-          <select id="file-group-filter" class="select">
-            <option value="all">👥 全部邮箱分组状态</option>
-          </select>
-
-          <select id="file-name-pattern" class="select" title="针对文件名不规范、含重复词或同系列多版本的整理工具">
-            <option value="default">📋 默认排序（按修改时间）</option>
-            <option value="cluster_sort">🧩 按核心名称聚合排序（相似/同系列表挨着排）</option>
-            <option value="duplicates_only">🔁 仅看有同名/相似变体的系列文件</option>
-            <option value="messy_only">⚠️ 仅看名字含重复词或「副本/(1)」的文件</option>
-          </select>
-
-          <select id="file-status-filter" class="select">
-            <option value="all">全部权限状态</option>
-            <option value="anomaly">⚠️ 仅看有异常（非白名单 + 越权）</option>
-            <option value="unauthorized">🔴 仅看含非白名单（需移除）</option>
-            <option value="overprivileged">🟠 仅看含越权编辑（需降只读）</option>
-            <option value="public">🌐 仅看公开 / 域内共享</option>
-            <option value="shared">🔗 仅看有共享的文件</option>
-            <option value="new">🆕 仅看新增文件</option>
-          </select>
-
-          <label class="checkbox-inline">
-            <input id="hide-private" type="checkbox"> 隐藏仅自己可见
-          </label>
-
-          <div class="filter-spacer"></div>
-          <button type="button" id="save-filter-preset-btn" class="btn btn-xs">💾 保存当前筛选</button>
-          <button type="button" id="reset-all-filters-btn" class="btn btn-xs">🔄 重置全部筛选</button>
-        </div>
-
-        <!-- 已保存的筛选预设栏 -->
-        <div id="saved-presets-bar" class="presets-bar hidden"></div>
-      </div>
-
-      <!-- 批量操作与【按组授权/清理】控制栏 -->
-      <div class="batch-bar">
-        <div class="batch-left">
-          <label class="checkbox-inline">
-            <input id="select-all" type="checkbox" disabled> 全选当前筛选 (<span id="selected-count">0</span> / <span id="filtered-count">0</span>)
-          </label>
-        </div>
-
-        <!-- 按分组直接授权区 -->
-        <div class="group-grant-bar">
-          <span class="group-bar-title">👥 选择分组批量授权：</span>
-          <div id="batch-group-checkboxes" class="group-check-list"></div>
-          <select id="batch-group-role" class="select select-sm">
-            <option value="group_default">按各组默认角色</option>
-            <option value="writer">✏️ 统一设为可编辑</option>
-            <option value="reader">👁️ 统一设为仅查看</option>
-          </select>
-          <button id="batch-grant-groups" type="button" class="btn primary btn-sm" disabled title="给选中文件开通所勾选分组全部成员的权限">
-            ➕ 给选中文件授此组权限
-          </button>
-          <button id="batch-keep-only-groups" type="button" class="btn warning btn-sm" disabled title="选中文件仅保留所勾选分组的成员权限，并自动移除组外其他人员">
-            🎯 仅保留所选组权限
-          </button>
-          <button id="batch-revoke-groups" type="button" class="btn danger btn-sm" disabled title="从选中文件中移除所勾选分组全部成员的权限">
-            🗑️ 移除所选组权限
-          </button>
-        </div>
-
-        <div class="batch-actions">
-          <button id="batch-enforce" class="btn warning btn-sm" disabled title="自动移除非白名单人员，并将只读白名单中的编辑者降级为只读">
-            ⚡ 按白名单修正
-          </button>
-          <button id="batch-downgrade-all" class="btn btn-sm" disabled>
-            👁️ 全部降只读
-          </button>
-          <button id="batch-remove-public" class="btn btn-sm" disabled>
-            🚫 关公开链接
-          </button>
-          <button id="batch-revoke-all" class="btn danger btn-sm" disabled>
-            🗑️ 清空所有共享
-          </button>
-        </div>
-      </div>
-
-      <div class="table-wrap">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th style="width: 36px;"></th>
-              <th style="width: 27%;">文件名称 / 系列词根 / 所属账号</th>
-              <th style="width: 18%;">已授权分组对应 & 合规状态</th>
-              <th>权限明细（自动匹配【组名 + A列姓名 + B列邮箱】· 可直接改角色/移除）</th>
-              <th style="width: 155px;">单文件快捷操作</th>
-            </tr>
-          </thead>
-          <tbody id="file-rows">
-            <tr><td colspan="5" class="empty">请先点击右上角「🔑 导入桌面 JSON 授权」导入 Google OAuth JSON 文件完成授权</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- ==================== TAB 2: 邮箱分组与人员表格管理 ==================== -->
-    <section id="panel-collaborators" class="tab-panel">
-      <!-- 第一部分：分组卡片管理（1组、2组…） -->
-      <div class="groups-section">
-        <div class="section-header-row">
-          <div>
-            <h2>👥 邮箱分组管理（如：1组、2组、部门组）</h2>
-            <p class="muted">将表格里的邮箱归入不同组后，不仅能一眼看出每个文件给哪几个组开了权限，还能按组一键批量授权或撤权。</p>
-          </div>
-          <div class="add-group-inline">
-            <input id="new-group-name" type="text" class="input" placeholder="新组名称，如：3组 / 财务组">
-            <select id="new-group-role" class="select">
-              <option value="writer">默认：✏️ 可编辑 (计入编辑白名单)</option>
-              <option value="reader">默认：👁️ 仅查看 (计入只读白名单)</option>
-            </select>
-            <button id="create-group-btn" type="button" class="btn primary btn-sm">➕ 新建分组</button>
-          </div>
-        </div>
-        <div id="groups-cards-container" class="groups-cards-grid"></div>
-      </div>
-
-      <!-- 第二部分：从表格导入（A列名称、B列邮箱、可选C列分组） -->
-      <div class="import-sheet-card">
-        <div class="section-header-row">
-          <div>
-            <h2>📊 从表格批量导入人员名单（A列：名称，B列：邮箱，可选C列：分组）</h2>
-            <p class="muted">支持直接从 Excel / Google 表格框选复制粘贴，或上传 CSV，或直接读取已扫描的 Google 表格。</p>
-          </div>
-          <div class="import-target-group">
-            <label>默认归入分组：</label>
-            <select id="import-target-group-select" class="select"></select>
-            <label class="btn btn-sm file-label">
-              📄 上传 CSV/TXT 表格
-              <input id="import-contacts-csv" type="file" accept=".csv,.tsv,.txt,text/csv,text/plain">
+          <div class="results-select-info">
+            <label class="checkbox-inline">
+              <input id="select-all" type="checkbox" disabled>
+              <span>全选当前 (<strong id="selected-count">0</strong>/<span id="filtered-count">0</span>)</span>
             </label>
           </div>
         </div>
 
-        <div class="import-methods-grid">
-          <!-- 方式 1：复制粘贴 A列名称 B列邮箱 -->
-          <div class="import-box">
-            <label class="field-label">📋 方式一：直接从表格复制粘贴（每行：<code>名称 [Tab或逗号] 邮箱 [可选:分组名]</code>）</label>
-            <textarea id="paste-contacts-textarea" class="textarea" rows="4" placeholder="张三	zhangsan@gmail.com	1组&#10;李四	lisi@gmail.com	1组&#10;王五, wangwu@company.com, 2组"></textarea>
-            <div class="import-box-footer">
-              <button id="parse-paste-contacts-btn" type="button" class="btn primary btn-sm">📥 解析并导入到通讯录分组</button>
-            </div>
-          </div>
-
-          <!-- 方式 2：从 Google Drive 里的表格直接读取 -->
-          <div class="import-box">
-            <label class="field-label">📊 方式二：直接从你 Google Drive 里的表格读取（自动读取表内 A列名称、B列邮箱、C列分组）</label>
-            <select id="drive-sheet-picker" class="select full-width" style="margin-bottom: 8px;">
-              <option value="">-- 从已扫描到的 Google 表格中选择 --</option>
-            </select>
-            <input id="drive-sheet-url-input" type="text" class="input full-width" placeholder="或直接粘贴 Google 表格链接 / 文件 ID…">
-            <div class="import-box-footer">
-              <button id="fetch-drive-sheet-contacts-btn" type="button" class="btn primary btn-sm">🔄 从该 Google 表格同步人员名单</button>
-            </div>
-          </div>
+        <!-- 扫描结果固定滚动容器 -->
+        <div class="results-table-scroll">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th style="width: 34px;"></th>
+                <th style="width: 30%;">文件名称 / 类型</th>
+                <th style="width: 18%;">分组状态 / 合规性</th>
+                <th>直接权限明细（组名 · 姓名 · 角色切换）</th>
+                <th style="width: 90px;">快捷操作</th>
+              </tr>
+            </thead>
+            <tbody id="file-rows">
+              <tr>
+                <td colspan="5" class="empty">
+                  请先在右侧「设置」中导入桌面 OAuth JSON 完成账号授权，然后点击右上角「立即扫描」
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
-      </div>
+      </section>
 
-      <!-- 第三部分：人员与分组对应总表 -->
-      <div class="filter-bar" style="margin-top: 16px;">
-        <input id="collab-search" type="search" class="input search-input" placeholder="搜索姓名 (A列)、邮箱 (B列) 或分组名称…">
-        <select id="collab-group-filter" class="select">
-          <option value="all">全部所属分组</option>
-        </select>
-        <select id="collab-filter" class="select">
-          <option value="all">全部人员状态</option>
-          <option value="in_directory">📒 仅看通讯录内成员</option>
-          <option value="stranger">🔴 未在白名单（违规外部人员）</option>
-          <option value="overprivileged">🟠 仅查看名单但拥有编辑权（越权）</option>
-          <option value="writer_list">✏️ 允许编辑白名单成员</option>
-          <option value="reader_list">👁️ 仅限查看白名单成员</option>
-        </select>
-        <div class="filter-spacer"></div>
-        <button id="trust-all-current-writers" class="btn btn-sm" title="将当前所有协作者按其最高权限自动录入白名单">
-          📥 将现有协作者一键导入白名单
-        </button>
-      </div>
+      <!-- ==================== 右侧：操作、筛选与设置面板 ==================== -->
+      <aside class="right-control-pane">
+        <!-- 右侧顶部标签页导航 -->
+        <nav class="tabs-nav" role="tablist">
+          <button type="button" class="tab-btn active" data-tab="ops">
+            筛选与操作
+          </button>
+          <button type="button" class="tab-btn" data-tab="collaborators">
+            人员与分组 <span id="tab-count-collabs" class="tab-badge">0</span>
+          </button>
+          <button type="button" class="tab-btn" data-tab="logs">
+            日志 <span id="tab-count-logs" class="tab-badge">0</span>
+          </button>
+          <button type="button" class="tab-btn" data-tab="settings">
+            设置
+          </button>
+        </nav>
 
-      <div class="table-wrap">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th style="width: 16%;">A列：名称 / 备注</th>
-              <th style="width: 20%;">B列：邮箱</th>
-              <th style="width: 22%;">所属分组（点击可加入/移出组）</th>
-              <th style="width: 18%;">已开权限的文件对应统计</th>
-              <th style="width: 10%;">合规状态</th>
-              <th style="width: 190px;">对此人批量操作</th>
-            </tr>
-          </thead>
-          <tbody id="collab-rows">
-            <tr><td colspan="6" class="empty">导入人员表格或扫描文件后将在此显示「名称 - 邮箱 - 分组 - 关联文件」对应表</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- ==================== TAB 3: 白名单与定期扫描设置 ==================== -->
-    <section id="panel-policy" class="tab-panel">
-      <div class="policy-grid">
-        <!-- 定期扫描与自动化配置 -->
-        <div class="card">
-          <div class="card-header">
-            <div>
-              <h2>⏱️ 定期扫描与自动化处置</h2>
-              <p class="muted">自动巡检所有已授权账号下的文件（包括新创建的表格/文档），发现权限偏离白名单时自动提醒或修正。</p>
-            </div>
-          </div>
-
-          <div class="form-group">
-            <label class="switch-row">
-              <input id="policy-schedule-enabled" type="checkbox">
-              <span class="switch-title">开启后台定期自动扫描</span>
-            </label>
-          </div>
-
-          <div class="form-row">
-            <label for="policy-schedule-minutes">扫描间隔频率：</label>
-            <select id="policy-schedule-minutes" class="select">
-              <option value="15">每 15 分钟</option>
-              <option value="30">每 30 分钟</option>
-              <option value="60">每 1 小时（推荐）</option>
-              <option value="360">每 6 小时</option>
-              <option value="720">每 12 小时</option>
-              <option value="1440">每 24 小时（每天）</option>
-            </select>
-          </div>
-
-          <div class="form-group">
-            <p class="form-label">发现违规/越权权限时的处置方式：</p>
-            <label class="radio-card">
-              <input type="radio" name="auto-enforce-mode" value="alert" checked>
-              <div>
-                <strong>🔔 仅告警提醒模式（人工确认）</strong>
-                <p class="muted">后台发现非白名单人员或越权编辑时，在插件图标显示红色角标并弹出桌面通知，由你打开面板一键确认修正。</p>
+        <div class="right-panel-scroll">
+          <!-- ========== 右侧 TAB 1: 筛选与批量操作（高频日常区） ========== -->
+          <section id="panel-ops" class="tab-panel active">
+            <!-- 板块 1：文件筛选（浅蓝板块） -->
+            <div class="section-block block-blue">
+              <div class="block-header">
+                <h2>筛选左侧文件</h2>
+                <div class="block-header-actions">
+                  <button type="button" id="save-filter-preset-btn" class="btn-text">保存筛选</button>
+                  <button type="button" id="reset-all-filters-btn" class="btn-text">重置</button>
+                </div>
               </div>
-            </label>
-            <label class="radio-card">
-              <input type="radio" name="auto-enforce-mode" value="enforce">
-              <div>
-                <strong>⚡ 后台全自动修正模式（自动撤权 & 越权降只读 + 留存日志）</strong>
-                <p class="muted">定时扫描发现不在白名单的人直接移除；发现「仅限查看」名单的人拥有编辑权自动降级为只读；所有变更记录在日志中并支持一键恢复。</p>
+
+              <!-- 常用筛选预设（仅在有预设时显示） -->
+              <div id="saved-presets-bar" class="presets-bar hidden"></div>
+
+              <div class="field-group">
+                <label class="field-label">包含关键词（支持搜文件名、姓名、邮箱、组名）</label>
+                <div class="row-flex">
+                  <input id="file-search" type="search" class="input grow" placeholder="输入关键词，多词空格分隔…">
+                  <select id="search-match-mode" class="select select-sm">
+                    <option value="or">任一 (OR)</option>
+                    <option value="and">全部 (AND)</option>
+                    <option value="fuzzy">模糊容错</option>
+                  </select>
+                </div>
               </div>
-            </label>
-          </div>
 
-          <div class="form-group">
-            <label class="form-label" for="policy-public-rule">公开链接（任何人 / 域内共享）管控策略：</label>
-            <select id="policy-public-rule" class="select full-width">
-              <option value="forbid">🚫 禁止任何公开/域内链接（发现即标记为违规移除）</option>
-              <option value="reader_only">👁️ 公开/域内链接最高仅允许只读（发现公开可编辑自动降为只读）</option>
-              <option value="allow">⚪ 不限制公开/域内链接（忽略公开链接检查）</option>
-            </select>
-          </div>
-        </div>
+              <div class="field-group">
+                <div class="field-label-between">
+                  <span>排除关键词</span>
+                  <div class="quick-kw-bar">
+                    <button type="button" class="quick-kw-btn" data-ex-kw="副本">副本</button>
+                    <button type="button" class="quick-kw-btn" data-ex-kw="copy">Copy</button>
+                    <button type="button" class="quick-kw-btn" data-ex-kw="备份">备份</button>
+                    <button type="button" class="quick-kw-btn" data-ex-kw="测试">测试</button>
+                    <button type="button" class="quick-kw-btn" data-ex-kw="旧">旧版</button>
+                  </div>
+                </div>
+                <input id="file-exclude-search" type="search" class="input full-width" placeholder="输入不想看到的词，命中即隐藏…">
+              </div>
 
-        <!-- 双层白名单配置 -->
-        <div class="card">
-          <div class="card-header">
-            <div>
-              <h2>🛡️ 双层权限白名单（可编辑 vs 仅查看）</h2>
-              <p class="muted">通讯录分组中的成员会自动同步至此处。支持完整邮箱或域名通配（如 <code>@company.com</code>）。</p>
-            </div>
-            <div class="json-actions">
-              <label class="btn btn-sm file-label">
-                📥 导入 JSON (白名单/OAuth)
-                <input id="json-file" type="file" accept="application/json,.json" multiple>
+              <div class="grid-2col">
+                <!-- 文件类型：下拉勾选框（默认全选 + 反选） -->
+                <div class="field-group">
+                  <label class="field-label">文件类型（勾选显示）</label>
+                  <div class="multi-dropdown" id="type-dropdown">
+                    <button type="button" class="dropdown-trigger" id="type-dropdown-btn">
+                      <span id="type-dropdown-label">全部类型 (8/8)</span>
+                      <span class="caret">▾</span>
+                    </button>
+                    <div class="dropdown-menu hidden" id="type-dropdown-menu">
+                      <div class="dropdown-Menu-head">
+                        <button type="button" class="btn-text" id="type-select-all">全选</button>
+                        <button type="button" class="btn-text" id="type-invert-select">反选</button>
+                      </div>
+                      <div class="dropdown-list" id="type-checkbox-list">
+                        <label class="drop-item"><input type="checkbox" value="sheet" checked> Google 表格</label>
+                        <label class="drop-item"><input type="checkbox" value="excel" checked> Excel / CSV</label>
+                        <label class="drop-item"><input type="checkbox" value="doc" checked> Google 文档</label>
+                        <label class="drop-item"><input type="checkbox" value="word_pdf" checked> Word / PDF</label>
+                        <label class="drop-item"><input type="checkbox" value="slide" checked> 幻灯片</label>
+                        <label class="drop-item"><input type="checkbox" value="folder" checked> 文件夹</label>
+                        <label class="drop-item"><input type="checkbox" value="media" checked> 图片与音视频</label>
+                        <label class="drop-item"><input type="checkbox" value="other" checked> 压缩包与其他</label>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 所属分组筛选：下拉框 -->
+                <div class="field-group">
+                  <label class="field-label">按已授权分组筛选</label>
+                  <select id="file-group-filter" class="select full-width">
+                    <option value="all">全部邮箱分组</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="grid-2col">
+                <div class="field-group">
+                  <label class="field-label">权限状态</label>
+                  <select id="file-status-filter" class="select full-width">
+                    <option value="all">全部状态</option>
+                    <option value="anomaly">有异常（非白名单/越权）</option>
+                    <option value="unauthorized">含非白名单人员</option>
+                    <option value="overprivileged">含越权编辑者</option>
+                    <option value="public">公开或域内共享</option>
+                    <option value="shared">已共享文件</option>
+                    <option value="new">本次新增文件</option>
+                  </select>
+                </div>
+
+                <div class="field-group">
+                  <label class="field-label">名称整理与排序</label>
+                  <select id="file-name-pattern" class="select full-width">
+                    <option value="default">按修改时间排序</option>
+                    <option value="cluster_sort">按核心词根归并排序</option>
+                    <option value="duplicates_only">仅看同系列多变体文件</option>
+                    <option value="messy_only">仅看含重复词/副本文件</option>
+                  </select>
+                </div>
+              </div>
+
+              <label class="checkbox-inline" style="margin-top: 4px;">
+                <input id="hide-private" type="checkbox"> 隐藏仅自己可见的未共享文件
               </label>
-              <button id="export-policy-json" type="button" class="btn btn-sm">📤 导出配置与分组 JSON</button>
-            </div>
-          </div>
-
-          <div class="allowlist-columns">
-            <!-- 允许编辑白名单 -->
-            <div class="allowlist-box writer-box">
-              <div class="box-title">
-                <strong>✏️ 允许编辑白名单 (Writers)</strong>
-                <span id="writers-count" class="badge">0</span>
-              </div>
-              <p class="muted">允许拥有「可编辑」、「可评论」或「仅查看」权限。</p>
-              <div class="add-row">
-                <input id="add-writer-input" type="text" class="input" placeholder="输入邮箱或 @域名，逗号分隔">
-                <button id="add-writer-btn" type="button" class="btn btn-sm primary">添加</button>
-              </div>
-              <div id="writers-list" class="tag-list"></div>
             </div>
 
-            <!-- 仅限查看白名单 -->
-            <div class="allowlist-box reader-box">
-              <div class="box-title">
-                <strong>👁️ 仅限查看白名单 (Readers)</strong>
-                <span id="readers-count" class="badge">0</span>
+            <!-- 板块 2：按邮箱分组批量授权（浅靛紫板块） -->
+            <div class="section-block block-indigo">
+              <div class="block-header">
+                <h2>按分组批量授权（对左侧勾选文件）</h2>
               </div>
-              <p class="muted">最高仅允许「仅查看」。若拥有编辑权将被识别为<strong>越权</strong>并降为只读。</p>
-              <div class="add-row">
-                <input id="add-reader-input" type="text" class="input" placeholder="输入邮箱或 @域名，逗号分隔">
-                <button id="add-reader-btn" type="button" class="btn btn-sm primary">添加</button>
+
+              <div class="grid-2col">
+                <!-- 分组选择：改为下拉多选勾选框（全选/反选） -->
+                <div class="field-group">
+                  <label class="field-label">选择目标分组</label>
+                  <div class="multi-dropdown" id="batch-group-dropdown">
+                    <button type="button" class="dropdown-trigger" id="batch-group-dropdown-btn">
+                      <span id="batch-group-dropdown-label">请选择分组 (0)</span>
+                      <span class="caret">▾</span>
+                    </button>
+                    <div class="dropdown-menu hidden" id="batch-group-dropdown-menu">
+                      <div class="dropdown-Menu-head">
+                        <button type="button" class="btn-text" id="batch-grp-select-all">全选</button>
+                        <button type="button" class="btn-text" id="batch-grp-invert">反选</button>
+                      </div>
+                      <div class="dropdown-list" id="batch-group-checkboxes"></div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="field-group">
+                  <label class="field-label">授予角色</label>
+                  <select id="batch-group-role" class="select full-width">
+                    <option value="group_default">按各组默认角色</option>
+                    <option value="writer">统一设为：可编辑</option>
+                    <option value="reader">统一设为：仅查看</option>
+                  </select>
+                </div>
               </div>
-              <div id="readers-list" class="tag-list"></div>
+
+              <div class="btn-group-vertical">
+                <button id="batch-grant-groups" type="button" class="btn primary full-width" disabled>
+                  为勾选文件开通所选分组权限
+                </button>
+                <div class="grid-2col">
+                  <button id="batch-keep-only-groups" type="button" class="btn warning full-width" disabled title="自动补齐所选组成员权限，并移除不属于这些组的其他协作者">
+                    仅保留所选分组
+                  </button>
+                  <button id="batch-revoke-groups" type="button" class="btn danger full-width" disabled>
+                    移除所选分组权限
+                  </button>
+                </div>
+              </div>
             </div>
-          </div>
+
+            <!-- 板块 3：快捷权限清理（浅暖杏色板块） -->
+            <div class="section-block block-amber">
+              <div class="block-header">
+                <h2>对左侧勾选文件执行快捷清理</h2>
+              </div>
+              <div class="grid-2col">
+                <button id="batch-enforce" type="button" class="btn warning full-width" disabled>
+                  按白名单规则修正
+                </button>
+                <button id="batch-downgrade-all" type="button" class="btn full-width" disabled>
+                  全部协作者降为只读
+                </button>
+                <button id="batch-remove-public" type="button" class="btn full-width" disabled>
+                  关闭公开/域内链接
+                </button>
+                <button id="batch-revoke-all" type="button" class="btn danger full-width" disabled>
+                  清空所有共享权限
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <!-- ========== 右侧 TAB 2: 人员与分组查询管理 ========== -->
+          <section id="panel-collaborators" class="tab-panel">
+            <!-- 分组概览与快捷操作条（下拉选择组，不堆砌全部卡片） -->
+            <div class="section-block block-indigo">
+              <div class="block-header">
+                <h2>按分组查看或操作</h2>
+              </div>
+              <div class="row-flex">
+                <select id="collab-group-filter" class="select grow">
+                  <option value="all">查看全部人员的分组对应</option>
+                </select>
+                <button type="button" id="quick-filter-left-by-group" class="btn btn-sm">在左侧显示该组文件</button>
+              </div>
+              <div id="selected-group-summary" class="group-mini-bar hidden"></div>
+            </div>
+
+            <!-- 人员对应表（A列名称、B列邮箱、所属组下拉） -->
+            <div class="section-block block-blue">
+              <div class="row-flex" style="margin-bottom: 8px;">
+                <input id="collab-search" type="search" class="input grow" placeholder="搜索姓名 (A列)、邮箱 (B列)…">
+                <select id="collab-filter" class="select select-sm">
+                  <option value="all">全部状态</option>
+                  <option value="in_directory">通讯录成员</option>
+                  <option value="stranger">未在白名单</option>
+                  <option value="overprivileged">越权编辑</option>
+                  <option value="writer_list">可编辑白名单</option>
+                  <option value="reader_list">仅查看白名单</option>
+                </select>
+              </div>
+
+              <div class="mini-table-wrap">
+                <table class="data-table compact-table">
+                  <thead>
+                    <tr>
+                      <th>姓名 / 邮箱</th>
+                      <th>分组与状态</th>
+                      <th>文件数</th>
+                      <th style="width: 112px;">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="collab-rows">
+                    <tr><td colspan="4" class="empty">暂无人员数据</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <!-- ========== 右侧 TAB 3: 巡检与操作日志 ========== -->
+          <section id="panel-logs" class="tab-panel">
+            <div class="section-block block-neutral">
+              <div class="row-flex" style="margin-bottom: 8px;">
+                <select id="log-filter" class="select grow">
+                  <option value="all">全部操作与巡检记录</option>
+                  <option value="auto">仅看自动守护修正</option>
+                  <option value="manual">仅看手动变更</option>
+                  <option value="scan">仅看定时巡检汇总</option>
+                </select>
+                <button id="clear-logs-btn" type="button" class="btn btn-sm">清空日志</button>
+              </div>
+
+              <div class="mini-table-wrap">
+                <table class="data-table compact-table">
+                  <thead>
+                    <tr>
+                      <th>时间 / 文件</th>
+                      <th>对象与变更详情</th>
+                      <th style="width: 82px;">回滚</th>
+                    </tr>
+                  </thead>
+                  <tbody id="log-rows">
+                    <tr><td colspan="3" class="empty">暂无日志记录</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <!-- ========== 右侧 TAB 4: 设置（低频配置集中收纳） ========== -->
+          <section id="panel-settings" class="tab-panel">
+            <!-- 设置块 1：Google 账号与桌面 JSON 授权（浅绿板块） -->
+            <div class="section-block block-green">
+              <div class="block-header">
+                <h2>1. 账号与桌面 JSON 授权</h2>
+                <span id="oauth-clients-info" class="meta-tag">已存凭证: 0</span>
+              </div>
+              <p class="muted">直接导入从 Google Cloud 下载的桌面端（installed）或 Web 端 OAuth JSON 文件即可授权，支持多账号。</p>
+              <div class="row-flex" style="margin-top: 8px;">
+                <label class="btn primary btn-sm file-label">
+                  导入桌面 OAuth JSON 授权
+                  <input id="oauth-json-file" type="file" accept="application/json,.json" multiple>
+                </label>
+                <button id="add-account-btn" type="button" class="btn btn-sm">授权更多 Google 账号</button>
+              </div>
+              <div id="accounts-list" class="accounts-pills" style="margin-top: 8px;"></div>
+            </div>
+
+            <!-- 设置块 2：分组管理与表格名单导入（A列名称、B列邮箱）（浅蓝板块） -->
+            <div class="section-block block-blue">
+              <div class="block-header">
+                <h2>2. 邮箱分组与人员表格导入</h2>
+              </div>
+              <p class="muted">新建分组（如 1组、2组），并将表格中的「A列名称、B列邮箱」批量导入对应分组。</p>
+
+              <!-- 新建与管理分组 -->
+              <div class="row-flex" style="margin-top: 8px;">
+                <input id="new-group-name" type="text" class="input grow" placeholder="新分组名，如：3组 / 财务组">
+                <select id="new-group-role" class="select select-sm">
+                  <option value="writer">默认可编辑</option>
+                  <option value="reader">默认仅查看</option>
+                </select>
+                <button id="create-group-btn" type="button" class="btn primary btn-sm">新建组</button>
+              </div>
+              <div id="settings-groups-list" class="settings-tag-list"></div>
+
+              <hr class="hairline">
+
+              <!-- 导入人员表格 -->
+              <div class="row-flex" style="margin-bottom: 6px;">
+                <label class="field-label" style="margin:0;">导入归入分组：</label>
+                <select id="import-target-group-select" class="select select-sm grow"></select>
+                <label class="btn btn-xs file-label">
+                  上传 CSV
+                  <input id="import-contacts-csv" type="file" accept=".csv,.tsv,.txt,text/csv,text/plain">
+                </label>
+              </div>
+
+              <textarea id="paste-contacts-textarea" class="textarea" rows="3" placeholder="直接从 Excel/表格复制粘贴（A列名称  B列邮箱  可选C列组名）：&#10;张三	zhangsan@gmail.com	1组&#10;李四	lisi@gmail.com	2组"></textarea>
+              <div class="row-flex" style="margin-top: 6px;">
+                <button id="parse-paste-contacts-btn" type="button" class="btn primary btn-sm">解析粘贴并导入</button>
+              </div>
+
+              <div class="row-flex" style="margin-top: 8px;">
+                <select id="drive-sheet-picker" class="select select-sm grow">
+                  <option value="">-- 或从已扫描的云端 Google 表格同步名单 --</option>
+                </select>
+                <button id="fetch-drive-sheet-contacts-btn" type="button" class="btn btn-sm">同步表格</button>
+              </div>
+              <input id="drive-sheet-url-input" type="text" class="input full-width" style="margin-top: 5px;" placeholder="也可直接粘贴云端 Google 表格链接或文件 ID">
+            </div>
+
+            <!-- 设置块 3：定时自动扫描与自动化处置（浅紫板块） -->
+            <div class="section-block block-purple">
+              <div class="block-header">
+                <h2>3. 定期扫描与自动化策略</h2>
+              </div>
+              <div class="row-flex" style="justify-content: space-between;">
+                <label class="checkbox-inline">
+                  <input id="policy-schedule-enabled" type="checkbox">
+                  <strong>启用后台定期自动扫描</strong>
+                </label>
+                <select id="policy-schedule-minutes" class="select select-sm">
+                  <option value="15">每 15 分钟</option>
+                  <option value="30">每 30 分钟</option>
+                  <option value="60">每 1 小时</option>
+                  <option value="360">每 6 小时</option>
+                  <option value="720">每 12 小时</option>
+                  <option value="1440">每 24 小时</option>
+                </select>
+              </div>
+
+              <div class="field-group" style="margin-top: 8px;">
+                <label class="field-label">发现违规/越权时的自动处置方式</label>
+                <select id="auto-enforce-select" class="select full-width">
+                  <option value="alert">仅告警提醒（扩展红点 + 桌面通知，人工确认）</option>
+                  <option value="enforce">后台全自动修正（自动撤权与越权降为只读 + 记入日志）</option>
+                </select>
+              </div>
+
+              <div class="field-group" style="margin-top: 8px;">
+                <label class="field-label">公开链接与域内共享策略</label>
+                <select id="policy-public-rule" class="select full-width">
+                  <option value="forbid">禁止任何公开/域内链接（发现即标记移除）</option>
+                  <option value="reader_only">公开/域内链接最高仅允许只读（可编辑自动降只读）</option>
+                  <option value="allow">不限制公开/域内链接</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- 设置块 4：白名单明细与配置备份（浅灰蓝板块） -->
+            <div class="section-block block-neutral">
+              <div class="block-header">
+                <h2>4. 白名单明细与 JSON 备份</h2>
+                <div class="row-flex">
+                  <button id="trust-all-current-writers" type="button" class="btn btn-xs">现有协作者转白名单</button>
+                  <label class="btn btn-xs file-label">
+                    导入 JSON
+                    <input id="json-file" type="file" accept="application/json,.json" multiple>
+                  </label>
+                  <button id="export-policy-json" type="button" class="btn btn-xs">导出备份</button>
+                </div>
+              </div>
+
+              <div class="grid-2col" style="margin-top: 8px;">
+                <div class="allow-mini-box">
+                  <div class="field-label-between">
+                    <strong>允许编辑 (<span id="writers-count">0</span>)</strong>
+                  </div>
+                  <div class="row-flex" style="margin: 4px 0;">
+                    <input id="add-writer-input" type="text" class="input input-xs grow" placeholder="邮箱或 @域名">
+                    <button id="add-writer-btn" type="button" class="btn btn-xs primary">添加</button>
+                  </div>
+                  <div id="writers-list" class="mini-tag-list"></div>
+                </div>
+
+                <div class="allow-mini-box">
+                  <div class="field-label-between">
+                    <strong>仅限查看 (<span id="readers-count">0</span>)</strong>
+                  </div>
+                  <div class="row-flex" style="margin: 4px 0;">
+                    <input id="add-reader-input" type="text" class="input input-xs grow" placeholder="邮箱或 @域名">
+                    <button id="add-reader-btn" type="button" class="btn btn-xs primary">添加</button>
+                  </div>
+                  <div id="readers-list" class="mini-tag-list"></div>
+                </div>
+              </div>
+            </div>
+          </section>
         </div>
-      </div>
-    </section>
-
-    <!-- ==================== TAB 4: 巡检与操作日志 ==================== -->
-    <section id="panel-logs" class="tab-panel">
-      <div class="filter-bar">
-        <select id="log-filter" class="select">
-          <option value="all">全部记录</option>
-          <option value="auto">⚡ 仅看自动守护操作</option>
-          <option value="manual">👆 仅看手动操作</option>
-          <option value="scan">⏱️ 仅看定时巡检汇总</option>
-        </select>
-        <div class="filter-spacer"></div>
-        <button id="clear-logs-btn" class="btn btn-sm">清空历史日志</button>
-      </div>
-
-      <div class="table-wrap">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th style="width: 155px;">时间</th>
-              <th style="width: 110px;">来源</th>
-              <th style="width: 22%;">文件名称</th>
-              <th style="width: 18%;">目标对象</th>
-              <th>变更详情</th>
-              <th style="width: 130px;">回滚操作</th>
-            </tr>
-          </thead>
-          <tbody id="log-rows">
-            <tr><td colspan="6" class="empty">暂无操作与巡检记录</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
+      </aside>
+    </main>
 
     <div id="toast" role="status"></div>
-  </main>
+  </div>
 
   <script src="core.js"></script>
   <script src="popup.js"></script>
