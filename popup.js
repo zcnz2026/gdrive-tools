@@ -1,16 +1,21 @@
 const $ = id => document.getElementById(id);
 
 const state = {
-  accounts: [],        // 已授权账号列表 [{ email, displayName, clientId, ... }]
-  oauthClients: [],    // 已导入的桌面/Web OAuth JSON 凭证列表
-  activeAccount: 'all', // 'all' 或具体 email
+  accounts: [],          // 已授权账号列表
+  oauthClients: [],      // 已保存的桌面/Web OAuth JSON 凭证
+  activeAccount: 'all',  // 'all' 或具体 email
   files: [],
   newFileIds: new Set(),
   policy: { ...DEFAULT_POLICY },
+  directory: JSON.parse(JSON.stringify(DEFAULT_DIRECTORY)), // { groups, contacts }
+  filterPresets: [],
   logs: [],
   lastScanAt: '',
   activeTab: 'files',
-  selectedFileIds: new Set()
+  selectedFileIds: new Set(),
+  selectedTypeCats: new Set(), // 多选的文件类型分类
+  selectedBatchGroups: new Set(), // 批量操作勾选的邮箱分组
+  coreNameFilter: ''     // 点击同系列标签时的特定核心词根过滤
 };
 
 function toast(message) {
@@ -46,7 +51,10 @@ function setStatus(text, ok = false) {
 }
 
 async function resolveTokenForFile(file, interactive = true) {
-  const owner = file?.ownerAccount || file?.owners?.[0]?.emailAddress || (state.activeAccount !== 'all' ? state.activeAccount : '');
+  const owner =
+    file?.ownerAccount ||
+    file?.owners?.[0]?.emailAddress ||
+    (state.activeAccount !== 'all' ? state.activeAccount : '');
   return getValidTokenForAccount(owner, interactive);
 }
 
@@ -55,6 +63,8 @@ function getScopedFilesByAccount() {
   const target = normalizeEntry(state.activeAccount);
   return state.files.filter(f => normalizeEntry(f.ownerAccount || f.owners?.[0]?.emailAddress || '') === target);
 }
+
+/* ==================== 顶部多账号栏与全局看板 ==================== */
 
 function renderAccountsBar() {
   const listNode = $('accounts-list');
@@ -120,7 +130,7 @@ function updateTopBadges() {
   $('clear-new-flags').classList.toggle('hidden', summary.newFiles === 0);
 
   $('tab-count-files').textContent = scopedFiles.length;
-  $('tab-count-collabs').textContent = buildCollaboratorList().length;
+  $('tab-count-collabs').textContent = buildMergedPersonList().length;
   $('tab-count-policy').textContent = state.policy.writers.length + state.policy.readers.length;
   $('tab-count-logs').textContent = state.logs.length;
 
@@ -148,7 +158,7 @@ async function handleOAuthFilesUpload(fileList) {
   const files = [...fileList];
   if (!files.length) return;
 
-  let extractedClients = [];
+  const extractedClients = [];
   let allowlistImported = false;
 
   for (const file of files) {
@@ -158,7 +168,6 @@ async function handleOAuthFilesUpload(fileList) {
       if (clients.length > 0) {
         extractedClients.push(...clients);
       } else {
-        // 如果不是 OAuth JSON，尝试当作白名单 JSON 导入
         await importAllowlistFromObject(parsed);
         allowlistImported = true;
       }
@@ -171,7 +180,6 @@ async function handleOAuthFilesUpload(fileList) {
     state.oauthClients = await saveOAuthClients(extractedClients);
     renderAccountsBar();
     toast(`已成功导入 ${extractedClients.length} 个桌面/Web OAuth 授权凭证，即将打开 Google 授权页…`);
-    // 依次使用新导入的凭证发起授权
     for (const client of extractedClients) {
       await handleAuthorizeWithClient(client);
     }
@@ -183,7 +191,6 @@ async function handleOAuthFilesUpload(fileList) {
 async function handleAddMoreAccount() {
   state.oauthClients = await getOAuthClients();
   if (!state.oauthClients.length) {
-    // 若尚未导入过桌面 JSON，直接触发文件选择框
     $('oauth-json-file').click();
     return;
   }
@@ -198,29 +205,105 @@ async function handleAddMoreAccount() {
       String(state.oauthClients.length)
     );
     if (input === null) return;
-    const idx = Math.max(0, Math.min(state.oauthClients.length - 1, ( Number(input) || 1 ) - 1));
+    const idx = Math.max(0, Math.min(state.oauthClients.length - 1, (Number(input) || 1) - 1));
     chosenClient = state.oauthClients[idx];
   }
 
   await handleAuthorizeWithClient(chosenClient);
 }
 
-/* ==================== 筛选与文件表格渲染 (TAB 1) ==================== */
+/* ==================== 高级搜索、排除词、类型包含/排除 & 核心词根归并 (TAB 1) ==================== */
+
+function parseKeywords(str = '') {
+  return String(str)
+    .toLowerCase()
+    .split(/[\s,，;；]+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+function syncQuickExcludeButtons() {
+  const exTerms = new Set(parseKeywords($('file-exclude-search')?.value || ''));
+  document.querySelectorAll('.quick-kw-btn').forEach(btn => {
+    const kw = (btn.dataset.exKw || '').toLowerCase();
+    btn.classList.toggle('active', exTerms.has(kw));
+  });
+}
+
+function renderTypeFilterPills() {
+  const mode = $('type-filter-mode')?.value || 'include';
+  document.querySelectorAll('.type-pill').forEach(pill => {
+    const cat = pill.dataset.typeCat;
+    const isSel = state.selectedTypeCats.has(cat);
+    pill.classList.toggle('active-include', isSel && mode === 'include');
+    pill.classList.toggle('active-exclude', isSel && mode === 'exclude');
+  });
+}
+
+function renderSavedPresetsBar() {
+  const bar = $('saved-presets-bar');
+  if (!state.filterPresets.length) {
+    bar.classList.add('hidden');
+    bar.innerHTML = '';
+    return;
+  }
+  bar.classList.remove('hidden');
+  bar.innerHTML =
+    '<span class="muted" style="margin:0;">常用筛选：</span>' +
+    state.filterPresets
+      .map(
+        p => `<span class="preset-pill" data-action="apply-preset" data-preset-id="${escapeHtml(p.id)}">
+          <span>🔖 ${escapeHtml(p.name)}</span>
+          <button type="button" class="del-preset" data-action="delete-preset" data-preset-id="${escapeHtml(p.id)}" title="删除此筛选预设">×</button>
+        </span>`
+      )
+      .join('');
+}
+
+function buildCoreNameCounts(files) {
+  const counts = new Map();
+  for (const f of files) {
+    const core = extractCoreFileName(f.name || '');
+    counts.set(core, (counts.get(core) || 0) + 1);
+  }
+  return counts;
+}
 
 function getFilteredFiles() {
   const baseFiles = getScopedFilesByAccount();
-  const query = ($('file-search')?.value || '').trim().toLowerCase();
-  const typeFilter = $('file-type-filter')?.value || 'all';
+  const contactLookup = buildContactLookup(state.directory);
+  const coreCounts = buildCoreNameCounts(baseFiles);
+
+  const includeTerms = parseKeywords($('file-search')?.value || '');
+  const matchMode = $('search-match-mode')?.value || 'or';
+  const excludeTerms = parseKeywords($('file-exclude-search')?.value || '');
+
+  const typeMode = $('type-filter-mode')?.value || 'include';
+  const groupFilter = $('file-group-filter')?.value || 'all';
+  const patternMode = $('file-name-pattern')?.value || 'default';
   const statusFilter = $('file-status-filter')?.value || 'all';
   const hidePrivate = $('hide-private')?.checked || false;
 
-  return baseFiles.filter(file => {
+  let result = baseFiles.filter(file => {
     const evalStat = evaluateFile(file, state.policy, file.ownerAccount);
     const isNew = Boolean(file.isNew || state.newFileIds.has(file.id));
+    const detCat = fileDetailedCategory(file.mimeType, file.name);
+    const coreName = extractCoreFileName(file.name || '');
 
+    // 特定系列词根过滤
+    if (state.coreNameFilter && coreName !== state.coreNameFilter) return false;
+
+    // 隐藏仅自己可见
     if (hidePrivate && !evalStat.hasNonOwner) return false;
-    if (typeFilter !== 'all' && fileCategory(file.mimeType) !== typeFilter) return false;
 
+    // 文件类型包含 / 排除多选过滤
+    if (state.selectedTypeCats.size > 0) {
+      const matchedType = state.selectedTypeCats.has(detCat);
+      if (typeMode === 'include' && !matchedType) return false;
+      if (typeMode === 'exclude' && matchedType) return false;
+    }
+
+    // 权限状态过滤
     if (statusFilter === 'anomaly' && !evalStat.hasActionableViolation) return false;
     if (statusFilter === 'unauthorized' && evalStat.removeCount === 0) return false;
     if (statusFilter === 'overprivileged' && evalStat.downgradeCount === 0) return false;
@@ -228,28 +311,94 @@ function getFilteredFiles() {
     if (statusFilter === 'shared' && !evalStat.hasNonOwner) return false;
     if (statusFilter === 'new' && !isNew) return false;
 
-    if (query) {
-      const nameMatch = (file.name || '').toLowerCase().includes(query);
-      const idMatch = (file.id || '').toLowerCase().includes(query);
-      const ownerMatch = (file.ownerAccount || '').toLowerCase().includes(query);
-      const permMatch = (file.permissions || []).some(
-        p =>
-          (p.emailAddress || '').toLowerCase().includes(query) ||
-          (p.displayName || '').toLowerCase().includes(query) ||
-          (p.domain || '').toLowerCase().includes(query)
-      );
-      if (!nameMatch && !idMatch && !ownerMatch && !permMatch) return false;
+    // 邮箱分组覆盖过滤
+    if (groupFilter !== 'all') {
+      const cov = getFileGroupCoverage(file, state.directory);
+      if (groupFilter === '__partial__') {
+        if (!cov.some(c => c.status === 'partial')) return false;
+      } else if (groupFilter.startsWith('grp:')) {
+        const gName = groupFilter.slice(4);
+        if (!cov.some(c => c.groupName === gName)) return false;
+      }
+    }
+
+    // 不规范文件名与重复系列过滤
+    if (patternMode === 'duplicates_only' && (coreCounts.get(coreName) || 0) < 2) {
+      return false;
+    }
+    if (patternMode === 'messy_only' && !analyzeMessyFileName(file.name || '').isMessy) {
+      return false;
+    }
+
+    const fileNameLower = (file.name || '').toLowerCase();
+
+    // 排除关键词过滤（只要文件名命中任一排除词即隐藏）
+    if (excludeTerms.length > 0) {
+      const hitExclude = excludeTerms.some(term => fileNameLower.includes(term));
+      if (hitExclude) return false;
+    }
+
+    // 包含关键词过滤（匹配文件名、核心词根、ID、所属账号、协作者邮箱、A列姓名、分组名）
+    if (includeTerms.length > 0) {
+      const cov = getFileGroupCoverage(file, state.directory);
+      const searchableChunks = [
+        fileNameLower,
+        coreName,
+        (file.id || '').toLowerCase(),
+        (file.ownerAccount || '').toLowerCase(),
+        ...cov.map(c => c.groupName.toLowerCase()),
+        ...(file.permissions || []).map(p => {
+          const em = normalizeEntry(p.emailAddress || '');
+          const contact = contactLookup.get(em);
+          return [
+            em,
+            (p.displayName || '').toLowerCase(),
+            (p.domain || '').toLowerCase(),
+            (contact?.name || '').toLowerCase(),
+            ...(contact?.groups || []).map(g => g.toLowerCase())
+          ].join(' ');
+        })
+      ];
+      const fullSearchText = searchableChunks.join(' ');
+
+      const checkSingleTerm = term => {
+        if (matchMode === 'fuzzy') {
+          return fuzzyMatchTerm(fullSearchText, term);
+        }
+        return fullSearchText.includes(term);
+      };
+
+      if (matchMode === 'and') {
+        if (!includeTerms.every(checkSingleTerm)) return false;
+      } else {
+        if (!includeTerms.some(checkSingleTerm)) return false;
+      }
     }
 
     return true;
   });
+
+  // 排序：如果开启了按核心名称聚合排序，则将同系列的表排在一起
+  if (patternMode === 'cluster_sort' || patternMode === 'duplicates_only') {
+    result = [...result].sort((a, b) => {
+      const ca = extractCoreFileName(a.name || '');
+      const cb = extractCoreFileName(b.name || '');
+      const countDiff = (coreCounts.get(cb) || 0) - (coreCounts.get(ca) || 0);
+      if (countDiff !== 0) return countDiff;
+      const cmp = ca.localeCompare(cb, 'zh-CN');
+      if (cmp !== 0) return cmp;
+      return String(b.modifiedTime || '').localeCompare(String(a.modifiedTime || ''));
+    });
+  }
+
+  return result;
 }
 
-function renderPermissionChip(file, p) {
+function renderPermissionChip(file, p, contactLookup) {
   const fileOwner = file.ownerAccount || file.owners?.[0]?.emailAddress || '';
   const evalResult = evaluatePermission(p, state.policy, fileOwner);
   const inherited = permIsInherited(p);
-  const label = permissionLabel(p);
+  const label = permissionLabel(p, contactLookup);
 
   if (evalResult.status === 'owner') {
     return `<span class="perm-chip owner" title="文件所有者">👑 ${escapeHtml(label)} · 所有者</span>`;
@@ -273,12 +422,12 @@ function renderPermissionChip(file, p) {
   if ((p.type === 'user' || p.type === 'group') && p.emailAddress) {
     if (evalResult.status === 'violation_remove') {
       quickAllowBtn = `
-        <button type="button" class="chip-btn" data-action="quick-allow-writer" data-email="${escapeHtml(p.emailAddress)}" title="加入「允许编辑」白名单">+可编辑白名单</button>
-        <button type="button" class="chip-btn" data-action="quick-allow-reader" data-email="${escapeHtml(p.emailAddress)}" title="加入「仅限查看」白名单">+只读白名单</button>
+        <button type="button" class="chip-btn" data-action="quick-allow-writer" data-email="${escapeHtml(p.emailAddress)}" title="加入「允许编辑」白名单">+可编辑</button>
+        <button type="button" class="chip-btn" data-action="quick-allow-reader" data-email="${escapeHtml(p.emailAddress)}" title="加入「仅限查看」白名单">+只读</button>
       `;
     } else if (evalResult.status === 'violation_downgrade') {
       quickAllowBtn = `
-        <button type="button" class="chip-btn" data-action="quick-allow-writer" data-email="${escapeHtml(p.emailAddress)}" title="提升至「允许编辑」白名单">升为可编辑白名单</button>
+        <button type="button" class="chip-btn" data-action="quick-allow-writer" data-email="${escapeHtml(p.emailAddress)}" title="提升至「允许编辑」白名单">升为可编辑</button>
       `;
     }
   }
@@ -294,8 +443,17 @@ function renderPermissionChip(file, p) {
 }
 
 function renderFilesTab() {
+  syncQuickExcludeButtons();
+  renderTypeFilterPills();
+  renderSavedPresetsBar();
+
+  const scopedFiles = getScopedFilesByAccount();
+  const coreCounts = buildCoreNameCounts(scopedFiles);
+  const contactLookup = buildContactLookup(state.directory);
   const filtered = getFilteredFiles();
   const tbody = $('file-rows');
+
+  $('filtered-count').textContent = filtered.length;
 
   if (!state.files.length) {
     tbody.innerHTML = state.accounts.length
@@ -307,7 +465,10 @@ function renderFilesTab() {
   }
 
   if (!filtered.length) {
-    tbody.innerHTML = '<tr><td colspan="5" class="empty">当前筛选条件下没有匹配的文件</td></tr>';
+    tbody.innerHTML = `<tr><td colspan="5" class="empty">
+      当前筛选条件下没有匹配的文件
+      ${state.coreNameFilter ? `<button type="button" class="btn btn-xs" id="clear-core-filter-inline">清除系列筛选 (${escapeHtml(state.coreNameFilter)})</button>` : ''}
+    </td></tr>`;
     $('select-all').disabled = true;
     updateBatchButtons();
     return;
@@ -319,10 +480,42 @@ function renderFilesTab() {
     .map(file => {
       const fileOwner = file.ownerAccount || file.owners?.[0]?.emailAddress || '';
       const stat = evaluateFile(file, state.policy, fileOwner);
-      const cat = fileCategory(file.mimeType);
-      const catLabel = fileCategoryLabel(file.mimeType);
+      const detCat = fileDetailedCategory(file.mimeType, file.name);
+      const catLabel = fileCategoryLabel(file.mimeType, file.name);
       const isNew = Boolean(file.isNew || state.newFileIds.has(file.id));
       const checked = state.selectedFileIds.has(file.id) ? 'checked' : '';
+
+      const coreName = extractCoreFileName(file.name || '');
+      const sameCoreCount = coreCounts.get(coreName) || 1;
+      const messyInfo = analyzeMessyFileName(file.name || '');
+
+      let seriesTagHtml = '';
+      if (sameCoreCount > 1 && coreName) {
+        seriesTagHtml = `<span class="core-series-tag" data-action="filter-core-name" data-core="${escapeHtml(coreName)}" title="点击只看此同名/相似系列的 ${sameCoreCount} 个文件">
+          🧩 同系列(${sameCoreCount}): ${escapeHtml(coreName.slice(0, 14))}
+        </span>`;
+      } else if (messyInfo.hasRepeatedToken) {
+        seriesTagHtml = `<span class="core-series-tag" title="文件名包含重复关键词段">🔁 含重复词</span>`;
+      }
+
+      // 分组授权覆盖情况展示
+      const groupCoverages = getFileGroupCoverage(file, state.directory);
+      const groupCovHtml = groupCoverages.length
+        ? `<div class="group-coverage-list">
+            ${groupCoverages
+              .map(cov => {
+                const isPartial = cov.status === 'partial';
+                const fillBtn = isPartial
+                  ? `<button type="button" class="chip-btn" data-action="fill-group-on-file" data-file-id="${escapeHtml(file.id)}" data-group="${escapeHtml(cov.groupName)}" title="为【${escapeHtml(cov.groupName)}】剩余未授权成员补齐权限">+补齐</button>`
+                  : '';
+                return `<span class="group-cov-badge ${isPartial ? 'partial' : ''}">
+                  <span>👥 ${escapeHtml(cov.groupName)}: ${cov.grantedCount}/${cov.totalCount}人</span>
+                  ${fillBtn}
+                </span>`;
+              })
+              .join('')}
+          </div>`
+        : '';
 
       let statusHtml = '';
       if (!stat.hasNonOwner) {
@@ -338,12 +531,12 @@ function renderFilesTab() {
         if (stat.removeCount === 0 && stat.downgradeCount === 0) {
           pills.push('<span class="status-pill ok">✅ 合规共享</span>');
         }
-        statusHtml = pills.join('<br>');
+        statusHtml = pills.join('');
       }
 
       const perms = file.permissions || [];
       const chipsHtml = perms.length
-        ? `<div class="perm-list">${perms.map(p => renderPermissionChip(file, p)).join('')}</div>`
+        ? `<div class="perm-list">${perms.map(p => renderPermissionChip(file, p, contactLookup)).join('')}</div>`
         : '<span class="muted">仅所有者 / 无共享权限</span>';
 
       const errorHtml = file.permissionError
@@ -355,7 +548,7 @@ function renderFilesTab() {
         : `<span class="file-name">${escapeHtml(file.name || '(无名称)')}</span>`;
 
       const enforceBtn = stat.hasActionableViolation
-        ? `<button type="button" class="btn warning btn-xs" data-action="enforce-file" data-file-id="${escapeHtml(file.id)}">⚡ 一键修正此文件</button>`
+        ? `<button type="button" class="btn warning btn-xs" data-action="enforce-file" data-file-id="${escapeHtml(file.id)}">⚡ 一键修正此项</button>`
         : '';
 
       return `<tr>
@@ -364,20 +557,25 @@ function renderFilesTab() {
         </td>
         <td>
           <div class="file-title-row">
-            <span class="badge type-${cat}">${catLabel}</span>
+            <span class="badge type-${detCat}">${catLabel}</span>
             ${isNew ? '<span class="badge new-tag">NEW 新增</span>' : ''}
             ${titleLink}
           </div>
           <div class="file-sub">
-            ${fileOwner ? `所属账号: ${escapeHtml(fileOwner)} · ` : ''}修改于 ${escapeHtml(formatTime(file.modifiedTime))}
+            ${seriesTagHtml}
+            <span>${fileOwner ? `账号: ${escapeHtml(fileOwner)} · ` : ''}${escapeHtml(formatTime(file.modifiedTime))}</span>
           </div>
         </td>
-        <td>${statusHtml}</td>
+        <td>
+          ${groupCovHtml}
+          <div>${statusHtml}</div>
+        </td>
         <td>${chipsHtml}${errorHtml}</td>
         <td>
           <div class="row-actions">
             ${enforceBtn}
-            <button type="button" class="btn btn-xs" data-action="add-collaborator" data-file-id="${escapeHtml(file.id)}">➕ 添加协作者</button>
+            <button type="button" class="btn primary btn-xs" data-action="grant-group-single-file" data-file-id="${escapeHtml(file.id)}">👥 按组授权此文件</button>
+            <button type="button" class="btn btn-xs" data-action="add-collaborator" data-file-id="${escapeHtml(file.id)}">➕ 添加单人邮箱</button>
           </div>
         </td>
       </tr>`;
@@ -393,11 +591,17 @@ function updateBatchButtons() {
   state.selectedFileIds = new Set(validSelected);
 
   const count = state.selectedFileIds.size;
+  const hasGroupChosen = state.selectedBatchGroups.size > 0;
+
   $('selected-count').textContent = count;
   $('batch-enforce').disabled = count === 0;
   $('batch-downgrade-all').disabled = count === 0;
   $('batch-remove-public').disabled = count === 0;
   $('batch-revoke-all').disabled = count === 0;
+
+  $('batch-grant-groups').disabled = count === 0 || !hasGroupChosen;
+  $('batch-keep-only-groups').disabled = count === 0 || !hasGroupChosen;
+  $('batch-revoke-groups').disabled = count === 0 || !hasGroupChosen;
 
   if (filtered.length > 0) {
     $('select-all').checked = filtered.every(f => state.selectedFileIds.has(f.id));
@@ -406,12 +610,97 @@ function updateBatchButtons() {
   }
 }
 
-/* ==================== 按协作者聚合视图 (TAB 2) ==================== */
+/* ==================== TAB 2: 邮箱分组与人员表格管理 ==================== */
 
-function buildCollaboratorList() {
+function renderGroupSelectorsAndBatchBar() {
+  const groups = state.directory.groups || [];
+
+  // 1. 批量栏中的分组多选框
+  const batchGroupNode = $('batch-group-checkboxes');
+  if (!groups.length) {
+    batchGroupNode.innerHTML = '<span class="muted">请先在「邮箱分组」页创建组</span>';
+  } else {
+    batchGroupNode.innerHTML = groups
+      .map(g => {
+        const memberCount = (state.directory.contacts || []).filter(c => (c.groups || []).includes(g.name)).length;
+        const checked = state.selectedBatchGroups.has(g.name) ? 'checked' : '';
+        return `<label class="group-check-pill">
+          <input type="checkbox" class="batch-grp-check" data-group="${escapeHtml(g.name)}" ${checked}>
+          <span>${escapeHtml(g.name)} (${memberCount}人)</span>
+        </label>`;
+      })
+      .join('');
+  }
+
+  // 2. 文件列表页的按分组筛选下拉
+  const fileGroupSelect = $('file-group-filter');
+  const prevVal = fileGroupSelect.value || 'all';
+  fileGroupSelect.innerHTML =
+    '<option value="all">👥 全部邮箱分组状态</option>' +
+    '<option value="__partial__">⚠️ 存在分组未全员覆盖的文件</option>' +
+    groups.map(g => `<option value="grp:${escapeHtml(g.name)}">👥 已授权给【${escapeHtml(g.name)}】的文件</option>`).join('');
+  if ([...fileGroupSelect.options].some(o => o.value === prevVal)) {
+    fileGroupSelect.value = prevVal;
+  }
+
+  // 3. 人员页的按分组筛选下拉
+  const collabGroupSelect = $('collab-group-filter');
+  const prevCollabGrp = collabGroupSelect.value || 'all';
+  collabGroupSelect.innerHTML =
+    '<option value="all">全部所属分组</option>' +
+    '<option value="__ungrouped__">未分组人员</option>' +
+    groups.map(g => `<option value="${escapeHtml(g.name)}">👥 ${escapeHtml(g.name)}</option>`).join('');
+  if ([...collabGroupSelect.options].some(o => o.value === prevCollabGrp)) {
+    collabGroupSelect.value = prevCollabGrp;
+  }
+
+  // 4. 表格导入目标分组下拉
+  const importTargetSelect = $('import-target-group-select');
+  const prevImportGrp = importTargetSelect.value;
+  importTargetSelect.innerHTML =
+    groups.map(g => `<option value="${escapeHtml(g.name)}">导入到：${escapeHtml(g.name)}</option>`).join('') +
+    '<option value="">不预设组（仅按表格C列分组）</option>';
+  if (prevImportGrp && [...importTargetSelect.options].some(o => o.value === prevImportGrp)) {
+    importTargetSelect.value = prevImportGrp;
+  }
+
+  // 5. 已扫描到的 Google 表格下拉选择器（用于直接读取人员名单表）
+  const sheetPicker = $('drive-sheet-picker');
+  const sheets = state.files.filter(f => f.mimeType === 'application/vnd.google-apps.spreadsheet');
+  const prevSheet = sheetPicker.value;
+  sheetPicker.innerHTML =
+    '<option value="">-- 从已扫描到的 Google 表格中选择人员名单表 --</option>' +
+    sheets
+      .map(s => `<option value="${escapeHtml(s.id)}">📊 ${escapeHtml(s.name)} (${escapeHtml(s.ownerAccount || '')})</option>`)
+      .join('');
+  if (prevSheet && [...sheetPicker.options].some(o => o.value === prevSheet)) {
+    sheetPicker.value = prevSheet;
+  }
+}
+
+function buildMergedPersonList() {
   const map = new Map();
   const scopedFiles = getScopedFilesByAccount();
 
+  // 先装入通讯录中的所有联系人（即使暂时还没任何文件权限也能显示和管理！）
+  for (const c of state.directory.contacts || []) {
+    const email = normalizeEntry(c.email);
+    if (!email) continue;
+    map.set(email, {
+      email,
+      name: c.name || '',
+      groups: [...(c.groups || [])],
+      inDirectory: true,
+      type: 'user',
+      totalFiles: 0,
+      editableFiles: 0,
+      readerFiles: 0,
+      inheritedFiles: 0,
+      directRefs: []
+    });
+  }
+
+  // 再合并扫描到的所有文件协作者
   for (const file of scopedFiles) {
     const ownerNorm = normalizeEntry(file.ownerAccount || file.owners?.[0]?.emailAddress || '');
     for (const p of file.permissions || []) {
@@ -423,7 +712,9 @@ function buildCollaboratorList() {
       if (!map.has(email)) {
         map.set(email, {
           email,
-          displayName: p.displayName || '',
+          name: p.displayName || '',
+          groups: [],
+          inDirectory: false,
           type: p.type,
           totalFiles: 0,
           editableFiles: 0,
@@ -433,9 +724,9 @@ function buildCollaboratorList() {
         });
       }
       const item = map.get(email);
+      if (!item.name && p.displayName) item.name = p.displayName;
       item.totalFiles++;
-      const inherited = permIsInherited(p);
-      if (inherited) {
+      if (permIsInherited(p)) {
         item.inheritedFiles++;
       } else {
         item.directRefs.push({ file, permission: p });
@@ -448,34 +739,86 @@ function buildCollaboratorList() {
     }
   }
 
-  return [...map.values()].sort((a, b) => b.totalFiles - a.totalFiles);
+  return [...map.values()].sort((a, b) => {
+    if (b.groups.length !== a.groups.length) return b.groups.length - a.groups.length;
+    return b.totalFiles - a.totalFiles;
+  });
 }
 
 function renderCollaboratorsTab() {
-  const allCollabs = buildCollaboratorList();
+  renderGroupSelectorsAndBatchBar();
+
+  // 渲染分组卡片
+  const groupsContainer = $('groups-cards-container');
+  const groups = state.directory.groups || [];
+  const scopedFiles = getScopedFilesByAccount();
+
+  if (!groups.length) {
+    groupsContainer.innerHTML = '<div class="muted">尚未创建分组，请在右上方输入组名（如：1组、2组）点击「新建分组」。</div>';
+  } else {
+    groupsContainer.innerHTML = groups
+      .map(g => {
+        const members = (state.directory.contacts || []).filter(c => (c.groups || []).includes(g.name));
+        const coveredFiles = scopedFiles.filter(f =>
+          getFileGroupCoverage(f, state.directory).some(cov => cov.groupName === g.name)
+        );
+        const isReaderGrp = g.defaultRole === 'reader';
+        return `<div class="group-card ${isReaderGrp ? 'reader-group' : ''}">
+          <div class="group-card-head">
+            <span class="group-card-title">👥 ${escapeHtml(g.name)}</span>
+            <select class="perm-select" data-action="change-group-role" data-group="${escapeHtml(g.name)}">
+              <option value="writer" ${g.defaultRole === 'writer' ? 'selected' : ''}>默认: ✏️ 可编辑 (白名单)</option>
+              <option value="reader" ${g.defaultRole === 'reader' ? 'selected' : ''}>默认: 👁️ 仅查看 (白名单)</option>
+            </select>
+          </div>
+          <div class="group-card-meta">
+            成员：<strong>${members.length}</strong> 人 · 已关联文件：<strong>${coveredFiles.length}</strong> 个
+          </div>
+          <div class="group-card-actions">
+            <button type="button" class="btn btn-xs" data-action="view-group-members" data-group="${escapeHtml(g.name)}">👤 看组员</button>
+            <button type="button" class="btn btn-xs" data-action="view-group-files" data-group="${escapeHtml(g.name)}">📋 看本组文件</button>
+            <button type="button" class="btn warning btn-xs" data-action="downgrade-whole-group" data-group="${escapeHtml(g.name)}" ${coveredFiles.length === 0 ? 'disabled' : ''}>👁️ 全组降只读</button>
+            <button type="button" class="btn danger btn-xs" data-action="revoke-whole-group" data-group="${escapeHtml(g.name)}" ${coveredFiles.length === 0 ? 'disabled' : ''}>🗑️ 清空本组权限</button>
+            <button type="button" class="btn btn-xs" data-action="delete-group" data-group="${escapeHtml(g.name)}" title="删除此分组">×</button>
+          </div>
+        </div>`;
+      })
+      .join('');
+  }
+
+  // 渲染人员与分组对应总表
+  const allPersons = buildMergedPersonList();
   const query = ($('collab-search')?.value || '').trim().toLowerCase();
-  const filter = $('collab-filter')?.value || 'all';
+  const groupFilter = $('collab-group-filter')?.value || 'all';
+  const statusFilter = $('collab-filter')?.value || 'all';
   const tbody = $('collab-rows');
 
-  const filtered = allCollabs.filter(c => {
+  const filtered = allPersons.filter(c => {
     const inWriters = matchesAllowlist(c.email, state.policy.writers);
     const inReaders = matchesAllowlist(c.email, state.policy.readers);
     const isStranger = !inWriters && !inReaders;
     const isOverprivileged = inReaders && c.editableFiles > 0;
 
-    if (filter === 'stranger' && !isStranger) return false;
-    if (filter === 'overprivileged' && !isOverprivileged) return false;
-    if (filter === 'writer_list' && !inWriters) return false;
-    if (filter === 'reader_list' && !inReaders) return false;
+    if (groupFilter === '__ungrouped__' && c.groups.length > 0) return false;
+    if (groupFilter !== 'all' && groupFilter !== '__ungrouped__' && !c.groups.includes(groupFilter)) return false;
 
-    if (query && !c.email.includes(query) && !(c.displayName || '').toLowerCase().includes(query)) {
-      return false;
+    if (statusFilter === 'in_directory' && !c.inDirectory) return false;
+    if (statusFilter === 'stranger' && !isStranger) return false;
+    if (statusFilter === 'overprivileged' && !isOverprivileged) return false;
+    if (statusFilter === 'writer_list' && !inWriters) return false;
+    if (statusFilter === 'reader_list' && !inReaders) return false;
+
+    if (query) {
+      const matchEmail = c.email.includes(query);
+      const matchName = (c.name || '').toLowerCase().includes(query);
+      const matchGrp = c.groups.some(g => g.toLowerCase().includes(query));
+      if (!matchEmail && !matchName && !matchGrp) return false;
     }
     return true;
   });
 
   if (!filtered.length) {
-    tbody.innerHTML = '<tr><td colspan="5" class="empty">没有匹配的协作者</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">没有匹配的人员记录（可在上方从表格粘贴或导入 A列名称、B列邮箱）</td></tr>';
     return;
   }
 
@@ -486,38 +829,54 @@ function renderCollaboratorsTab() {
 
       let statusBadge = '';
       if (inWriters) {
-        statusBadge = '<span class="status-pill ok">✅ 允许编辑</span>';
+        statusBadge = '<span class="status-pill ok">✏️ 允许编辑</span>';
       } else if (inReaders) {
         statusBadge =
           c.editableFiles > 0
-            ? `<span class="status-pill warning">🟠 越权（有 ${c.editableFiles} 个文件可编辑）</span>`
-            : '<span class="status-pill ok">✅ 合规只读</span>';
+            ? `<span class="status-pill warning">🟠 越权 (${c.editableFiles}可编辑)</span>`
+            : '<span class="status-pill ok">👁️ 合规只读</span>';
       } else {
         statusBadge = '<span class="status-pill danger">🔴 未在白名单</span>';
       }
 
+      const groupTogglesHtml = groups
+        .map(g => {
+          const inGrp = c.groups.includes(g.name);
+          return `<button type="button" class="group-toggle-chip ${inGrp ? 'in-group' : ''}" data-action="toggle-person-group" data-email="${escapeHtml(c.email)}" data-name="${escapeHtml(c.name || '')}" data-group="${escapeHtml(g.name)}" title="点击将此人加入或移出【${escapeHtml(g.name)}】">
+            ${inGrp ? '✓ ' : '+ '}${escapeHtml(g.name)}
+          </button>`;
+        })
+        .join('');
+
       return `<tr>
         <td>
-          <div class="file-name">${escapeHtml(c.email)}</div>
-          <div class="file-sub">${escapeHtml(c.displayName || (c.type === 'group' ? '群组' : '个人账号'))}</div>
-        </td>
-        <td>
-          <div class="batch-actions">
-            <button type="button" class="btn btn-xs ${inWriters ? 'primary' : ''}" data-action="set-collab-tier" data-email="${escapeHtml(c.email)}" data-tier="writer">✏️ 允许编辑</button>
-            <button type="button" class="btn btn-xs ${inReaders ? 'primary' : ''}" data-action="set-collab-tier" data-email="${escapeHtml(c.email)}" data-tier="reader">👁️ 仅限查看</button>
-            ${inWriters || inReaders ? `<button type="button" class="btn btn-xs" data-action="set-collab-tier" data-email="${escapeHtml(c.email)}" data-tier="none">移出名单</button>` : ''}
+          <div class="file-title-row">
+            <strong>${escapeHtml(c.name || '—')}</strong>
+            <button type="button" class="chip-btn" data-action="edit-person-name" data-email="${escapeHtml(c.email)}" data-name="${escapeHtml(c.name || '')}" title="修改名称/备注">✎</button>
           </div>
         </td>
         <td>
-          共 <strong>${c.totalFiles}</strong> 个文件<br>
-          <span class="muted">可编辑/评论: ${c.editableFiles} · 只读: ${c.readerFiles}${c.inheritedFiles ? ` · 继承: ${c.inheritedFiles}` : ''}</span>
+          <div class="file-name">${escapeHtml(c.email)}</div>
         </td>
-        <td>${statusBadge}</td>
+        <td>
+          ${groupTogglesHtml || '<span class="muted">暂无分组</span>'}
+        </td>
+        <td>
+          共 <strong>${c.totalFiles}</strong> 个文件<br>
+          <span class="muted">可编辑: ${c.editableFiles} · 只读: ${c.readerFiles}${c.inheritedFiles ? ` · 继承: ${c.inheritedFiles}` : ''}</span>
+        </td>
+        <td>
+          ${statusBadge}
+          <div style="margin-top:4px;">
+            <button type="button" class="chip-btn" data-action="set-collab-tier" data-email="${escapeHtml(c.email)}" data-tier="writer">设为可编辑</button>
+            <button type="button" class="chip-btn" data-action="set-collab-tier" data-email="${escapeHtml(c.email)}" data-tier="reader">设为只读</button>
+          </div>
+        </td>
         <td>
           <div class="batch-actions">
-            <button type="button" class="btn btn-xs" data-action="filter-by-collab" data-email="${escapeHtml(c.email)}">🔍 查看文件</button>
-            <button type="button" class="btn warning btn-xs" data-action="downgrade-collab-all" data-email="${escapeHtml(c.email)}" ${c.editableFiles === 0 ? 'disabled' : ''}>👁️ 全部降为只读</button>
-            <button type="button" class="btn danger btn-xs" data-action="revoke-collab-all" data-email="${escapeHtml(c.email)}" ${c.directRefs.length === 0 ? 'disabled' : ''}>🗑️ 移除全部权限</button>
+            <button type="button" class="btn btn-xs" data-action="filter-by-collab" data-email="${escapeHtml(c.email)}">🔍 看文件</button>
+            <button type="button" class="btn warning btn-xs" data-action="downgrade-collab-all" data-email="${escapeHtml(c.email)}" ${c.editableFiles === 0 ? 'disabled' : ''}>👁️ 降只读</button>
+            <button type="button" class="btn danger btn-xs" data-action="revoke-collab-all" data-email="${escapeHtml(c.email)}" ${c.directRefs.length === 0 ? 'disabled' : ''}>🗑️ 撤权限</button>
           </div>
         </td>
       </tr>`;
@@ -528,6 +887,8 @@ function renderCollaboratorsTab() {
 /* ==================== 白名单与自动化配置视图 (TAB 3) ==================== */
 
 function renderPolicyTab() {
+  const contactLookup = buildContactLookup(state.directory);
+
   $('policy-schedule-enabled').checked = Boolean(state.policy.scheduleEnabled);
   $('policy-schedule-minutes').value = String(state.policy.scheduleMinutes || 60);
   $('policy-public-rule').value = state.policy.publicLinkRule || 'forbid';
@@ -541,29 +902,31 @@ function renderPolicyTab() {
 
   $('writers-list').innerHTML = state.policy.writers.length
     ? state.policy.writers
-        .map(
-          item => `<div class="allow-item">
-          <span>${escapeHtml(item)}</span>
-          <div class="allow-item-actions">
-            <button type="button" class="chip-btn" data-action="move-to-reader" data-entry="${escapeHtml(item)}" title="转为仅限查看">👁️ 转只读</button>
-            <button type="button" class="chip-btn remove" data-action="remove-writer" data-entry="${escapeHtml(item)}" title="移除">×</button>
-          </div>
-        </div>`
-        )
+        .map(item => {
+          const disp = formatCollaboratorDisplay(item, '', contactLookup);
+          return `<div class="allow-item">
+            <span>${escapeHtml(disp)}</span>
+            <div class="allow-item-actions">
+              <button type="button" class="chip-btn" data-action="move-to-reader" data-entry="${escapeHtml(item)}" title="转为仅限查看">👁️ 转只读</button>
+              <button type="button" class="chip-btn remove" data-action="remove-writer" data-entry="${escapeHtml(item)}" title="移除">×</button>
+            </div>
+          </div>`;
+        })
         .join('')
     : '<div class="muted">暂无条目。添加后，这些邮箱可拥有编辑或只读权限。</div>';
 
   $('readers-list').innerHTML = state.policy.readers.length
     ? state.policy.readers
-        .map(
-          item => `<div class="allow-item">
-          <span>${escapeHtml(item)}</span>
-          <div class="allow-item-actions">
-            <button type="button" class="chip-btn" data-action="move-to-writer" data-entry="${escapeHtml(item)}" title="转为允许编辑">✏️ 转可编辑</button>
-            <button type="button" class="chip-btn remove" data-action="remove-reader" data-entry="${escapeHtml(item)}" title="移除">×</button>
-          </div>
-        </div>`
-        )
+        .map(item => {
+          const disp = formatCollaboratorDisplay(item, '', contactLookup);
+          return `<div class="allow-item">
+            <span>${escapeHtml(disp)}</span>
+            <div class="allow-item-actions">
+              <button type="button" class="chip-btn" data-action="move-to-writer" data-entry="${escapeHtml(item)}" title="转为允许编辑">✏️ 转可编辑</button>
+              <button type="button" class="chip-btn remove" data-action="remove-reader" data-entry="${escapeHtml(item)}" title="移除">×</button>
+            </div>
+          </div>`;
+        })
         .join('')
     : '<div class="muted">暂无条目。添加后，若这些人拥有编辑权限将被识别为越权并可自动降为只读。</div>';
 }
@@ -622,6 +985,7 @@ function renderLogsTab() {
 
 function renderAll() {
   updateTopBadges();
+  renderGroupSelectorsAndBatchBar();
   renderFilesTab();
   renderCollaboratorsTab();
   renderPolicyTab();
@@ -697,16 +1061,9 @@ async function handleEnforceFiles(targetFiles, confirmText) {
   if (!confirm(msg)) return;
 
   try {
-    const res = await enforceFilesByPolicy(
-      null,
-      targetFiles,
-      state.policy,
-      '',
-      'manual',
-      prog => {
-        $('progress').textContent = `正在修正权限 ${prog.done}/${prog.total}（已移除 ${prog.removed}，已降级 ${prog.downgraded}）…`;
-      }
-    );
+    const res = await enforceFilesByPolicy(null, targetFiles, state.policy, '', 'manual', prog => {
+      $('progress').textContent = `正在修正权限 ${prog.done}/${prog.total}（已移除 ${prog.removed}，已降级 ${prog.downgraded}）…`;
+    });
     await persistSnapshotAndLogs();
     $('progress').textContent = `修正完成：移除 ${res.removed} 项，降级为只读 ${res.downgraded} 项，失败 ${res.failed} 项`;
     toast(`处理完成：移除 ${res.removed} 项，降为只读 ${res.downgraded} 项`);
@@ -714,6 +1071,74 @@ async function handleEnforceFiles(targetFiles, confirmText) {
     toast(`执行失败：${error.message}`);
   }
 }
+
+/* ==================== 按邮箱分组批量授权 / 对齐 / 撤权 ==================== */
+
+async function handleGroupOperationOnFiles(targetFiles, groupNames, mode, roleOption = 'group_default') {
+  if (!targetFiles.length) return toast('请先选择文件');
+  if (!groupNames.length) return toast('请先选择至少一个邮箱分组');
+
+  const membersCount = (state.directory.contacts || []).filter(c =>
+    (c.groups || []).some(g => groupNames.includes(g))
+  ).length;
+  if (membersCount === 0 && mode !== 'keep_only_groups') {
+    return toast(`所选分组【${groupNames.join('、')}】中还没有成员，请先在「邮箱分组与人员表格」页导入成员`);
+  }
+
+  const groupTitle = groupNames.join('、');
+  const modeConfirmText = {
+    grant: `确定为 ${targetFiles.length} 个文件开通分组【${groupTitle}】（共 ${membersCount} 名成员）的访问权限吗？`,
+    keep_only_groups: `确定对 ${targetFiles.length} 个文件执行「仅保留【${groupTitle}】分组权限」吗？\n• 自动为组内成员补齐/对齐权限\n• 自动移除不属于所选分组的其他协作者直接权限`,
+    revoke_groups: `确定从 ${targetFiles.length} 个文件中移除分组【${groupTitle}】所有成员的权限吗？`
+  }[mode];
+
+  if (!confirm(modeConfirmText)) return;
+
+  try {
+    $('progress').textContent = `正在按分组【${groupTitle}】处理权限…`;
+    const res = await executeGroupBatchOnFiles({
+      files: targetFiles,
+      groupNames,
+      mode,
+      roleOption,
+      directory: state.directory,
+      onProgress(p) {
+        $('progress').textContent = `按组处理中 ${p.done}/${p.total}（新增 ${p.createdCount}，调整 ${p.updatedCount}，移除 ${p.removedCount}）…`;
+      }
+    });
+    await persistSnapshotAndLogs();
+    $('progress').textContent = `按组【${groupTitle}】处理完成：新增授权 ${res.createdCount} 项，角色调整 ${res.updatedCount} 项，移除 ${res.removedCount} 项`;
+    toast(`按组处理完成：新增 ${res.createdCount} 项，调整 ${res.updatedCount} 项，移除 ${res.removedCount} 项`);
+  } catch (error) {
+    toast(`按组操作失败：${error.message}`);
+  }
+}
+
+/* ==================== 导入人员表格（A列名称、B列邮箱、可选C列分组） ==================== */
+
+async function importParsedContacts(rows) {
+  if (!rows.length) {
+    toast('未识别到有效的人员邮箱行，请确认包含有效邮箱地址');
+    return;
+  }
+  const contacts = [...(state.directory.contacts || [])];
+  for (const r of rows) {
+    contacts.push({
+      email: r.email,
+      name: r.name,
+      groups: r.group ? [r.group] : []
+    });
+  }
+  state.directory = await saveDirectory({
+    groups: state.directory.groups,
+    contacts
+  });
+  state.policy = await getPolicy();
+  renderAll();
+  toast(`✅ 已成功导入 ${rows.length} 条人员记录（自动按组同步白名单）！`);
+}
+
+/* ==================== 单文件行内与其它操作 ==================== */
 
 async function handleInlineRoleChange(fileId, permId, newRole) {
   const file = state.files.find(f => f.id === fileId);
@@ -739,7 +1164,7 @@ async function handleInlineRoleChange(fileId, permId, newRole) {
       targetType: perm.type,
       targetEmail: perm.emailAddress || '',
       domain: perm.domain || '',
-      targetLabel: permissionLabel(perm),
+      targetLabel: permissionLabel(perm, buildContactLookup(state.directory)),
       previousRole: prevRole,
       newRole,
       restored: false,
@@ -757,7 +1182,7 @@ async function handleRemoveSinglePerm(fileId, permId) {
   const file = state.files.find(f => f.id === fileId);
   const perm = file?.permissions?.find(p => p.id === permId);
   if (!file || !perm) return;
-  const label = permissionLabel(perm);
+  const label = permissionLabel(perm, buildContactLookup(state.directory));
   if (!confirm(`确定从「${file.name}」移除 ${label}（${roleLabel(perm.role)}）的权限吗？`)) return;
 
   try {
@@ -839,8 +1264,6 @@ async function handleAddCollaboratorToFile(fileId) {
   }
 }
 
-/* ==================== 批量特殊操作 ==================== */
-
 async function handleBatchCustomAction(mode) {
   const files = state.files.filter(f => state.selectedFileIds.has(f.id));
   if (!files.length) return toast('请先勾选文件');
@@ -884,7 +1307,7 @@ async function handleBatchCustomAction(mode) {
     for (const item of tasks) {
       const { file, permission, action } = item;
       const token = await resolveTokenForFile(file, true);
-      const label = permissionLabel(permission);
+      const label = permissionLabel(permission, buildContactLookup(state.directory));
       if (action === 'remove') {
         await deletePermission(token, file.id, permission.id);
         file.permissions = (file.permissions || []).filter(x => x.id !== permission.id);
@@ -942,12 +1365,10 @@ async function handleBatchCustomAction(mode) {
   }
 }
 
-/* ==================== 协作者维度一键操作 ==================== */
-
 async function setCollaboratorAllowTier(email, tier) {
   const norm = normalizeEntry(email);
-  let writers = state.policy.writers.filter(x => x !== norm);
-  let readers = state.policy.readers.filter(x => x !== norm);
+  const writers = state.policy.writers.filter(x => x !== norm);
+  const readers = state.policy.readers.filter(x => x !== norm);
   if (tier === 'writer') writers.push(norm);
   if (tier === 'reader') readers.push(norm);
   state.policy = await savePolicy({ writers, readers });
@@ -972,7 +1393,7 @@ async function handleCollabBatchOp(email, opType) {
     }
   }
   if (!targets.length) {
-    return toast('该协作者没有可操作的目标直接权限');
+    return toast('该人员没有可操作的目标直接权限');
   }
   const promptText =
     opType === 'downgrade'
@@ -1096,36 +1517,41 @@ async function handleRestoreLog(logId) {
   }
 }
 
-/* ==================== 白名单 JSON 导入/导出（同时兼容 OAuth JSON） ==================== */
+/* ==================== 白名单/分组 JSON 导入导出与 CSV 导出 ==================== */
 
 async function importAllowlistFromObject(parsed) {
   let writers = [...state.policy.writers];
   let readers = [...state.policy.readers];
   let publicLinkRule = state.policy.publicLinkRule;
 
+  if (parsed?.directory) {
+    state.directory = await saveDirectory(parsed.directory);
+  }
+
   if (Array.isArray(parsed) || Array.isArray(parsed?.keepEmails)) {
     const list = normalizeEmailList(Array.isArray(parsed) ? parsed : parsed.keepEmails);
     const asWriter = confirm(
       `检测到单列表白名单 JSON（共 ${list.length} 个邮箱）。\n点击「确定」导入到【允许编辑白名单】，点击「取消」导入到【仅限查看白名单】。`
     );
-    if (asWriter) {
-      writers.push(...list);
-    } else {
-      readers.push(...list);
-    }
-  } else if (parsed && typeof parsed === 'object' && (Array.isArray(parsed.writers) || Array.isArray(parsed.readers))) {
+    if (asWriter) writers.push(...list);
+    else readers.push(...list);
+  } else if (
+    parsed &&
+    typeof parsed === 'object' &&
+    (Array.isArray(parsed.writers) || Array.isArray(parsed.readers) || parsed.directory)
+  ) {
     if (Array.isArray(parsed.writers)) writers.push(...parsed.writers);
     if (Array.isArray(parsed.readers)) readers.push(...parsed.readers);
     if (['forbid', 'reader_only', 'allow'].includes(parsed.publicLinkRule)) {
       publicLinkRule = parsed.publicLinkRule;
     }
   } else {
-    throw new Error('未识别的 JSON 格式（既不是 Google OAuth 凭证，也不是白名单列表）');
+    throw new Error('未识别的 JSON 格式（既不是 Google OAuth 凭证，也不是白名单/分组配置）');
   }
 
   state.policy = await savePolicy({ writers, readers, publicLinkRule });
   renderAll();
-  toast(`白名单导入成功：可编辑 ${state.policy.writers.length} 项，仅查看 ${state.policy.readers.length} 项`);
+  toast(`配置导入成功：可编辑 ${state.policy.writers.length} 项，仅查看 ${state.policy.readers.length} 项`);
 }
 
 function handleExportPolicyJson() {
@@ -1133,38 +1559,67 @@ function handleExportPolicyJson() {
     writers: state.policy.writers,
     readers: state.policy.readers,
     publicLinkRule: state.policy.publicLinkRule,
+    directory: state.directory,
     exportedAt: new Date().toISOString()
   };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
-  link.download = 'drive-allowlist-policy.json';
+  link.download = 'drive-allowlist-and-groups.json';
   link.click();
   URL.revokeObjectURL(url);
 }
 
 function handleExportCsv() {
   const scopedFiles = getScopedFilesByAccount();
+  const contactLookup = buildContactLookup(state.directory);
   const lines = [
-    ['所属账号', '文件名', '文件ID', '分类', '是否新增', '链接', '权限类型', '角色', '邮箱/范围', '是否继承', '合规判定']
+    [
+      '所属账号',
+      '文件名',
+      '核心词根',
+      '文件ID',
+      '分类',
+      '已授权分组',
+      '是否新增',
+      '链接',
+      '权限类型',
+      '角色',
+      'A列姓名',
+      'B列邮箱/范围',
+      '所属分组',
+      '是否继承',
+      '合规判定'
+    ]
   ];
   for (const file of scopedFiles) {
     const fileOwner = file.ownerAccount || file.owners?.[0]?.emailAddress || '';
     const perms = file.permissions?.length ? file.permissions : [null];
     const isNew = Boolean(file.isNew || state.newFileIds.has(file.id));
+    const coreName = extractCoreFileName(file.name || '');
+    const fileGroups = getFileGroupCoverage(file, state.directory)
+      .map(c => `${c.groupName}(${c.grantedCount}/${c.totalCount})`)
+      .join('; ');
+
     for (const p of perms) {
       const evalRes = p ? evaluatePermission(p, state.policy, fileOwner) : { reason: '仅自己可见' };
+      const em = normalizeEntry(p?.emailAddress || '');
+      const contact = contactLookup.get(em);
       lines.push([
         fileOwner,
         file.name || '',
+        coreName,
         file.id || '',
-        fileCategoryLabel(file.mimeType),
+        fileCategoryLabel(file.mimeType, file.name),
+        fileGroups,
         isNew ? '是' : '否',
         file.webViewLink || '',
         p?.type || '',
         p ? roleLabel(p.role) : '',
-        p ? permissionLabel(p) : '',
+        contact?.name || p?.displayName || '',
+        p ? p.emailAddress || permissionLabel(p) : '',
+        contact?.groups?.join('/') || '',
         p ? (permIsInherited(p) ? '是' : '否') : '',
         evalRes.reason || ''
       ]);
@@ -1199,6 +1654,8 @@ function parseBatchInput(inputStr = '') {
 
 async function init() {
   state.policy = await getPolicy();
+  state.directory = await getDirectory();
+  state.filterPresets = await getFilterPresets();
   state.accounts = await getAuthorizedAccounts();
   state.oauthClients = await getOAuthClients();
   const snapshot = await getSnapshot();
@@ -1280,10 +1737,111 @@ async function init() {
     btn.addEventListener('click', () => switchTab(btn.dataset.tab));
   });
 
-  // 文件列表筛选器
-  ['file-search', 'file-type-filter', 'file-status-filter', 'hide-private'].forEach(id => {
+  /* ==================== TAB 1 高级搜索与筛选器事件 ==================== */
+  [
+    'file-search',
+    'search-match-mode',
+    'file-exclude-search',
+    'type-filter-mode',
+    'file-group-filter',
+    'file-name-pattern',
+    'file-status-filter',
+    'hide-private'
+  ].forEach(id => {
     $(id).addEventListener('input', renderFilesTab);
     $(id).addEventListener('change', renderFilesTab);
+  });
+
+  // 快捷排除关键词按钮
+  document.querySelectorAll('.quick-kw-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const kw = (btn.dataset.exKw || '').toLowerCase();
+      const current = parseKeywords($('file-exclude-search').value);
+      const next = current.includes(kw) ? current.filter(x => x !== kw) : [...current, kw];
+      $('file-exclude-search').value = next.join(' ');
+      renderFilesTab();
+    });
+  });
+
+  // 文件类型多选胶囊（包含/排除）
+  $('type-pills-bar').addEventListener('click', e => {
+    const pill = e.target.closest('.type-pill');
+    if (pill) {
+      const cat = pill.dataset.typeCat;
+      if (state.selectedTypeCats.has(cat)) state.selectedTypeCats.delete(cat);
+      else state.selectedTypeCats.add(cat);
+      renderFilesTab();
+    }
+  });
+
+  $('clear-type-pills').addEventListener('click', () => {
+    state.selectedTypeCats.clear();
+    renderFilesTab();
+  });
+
+  $('reset-all-filters-btn').addEventListener('click', () => {
+    $('file-search').value = '';
+    $('search-match-mode').value = 'or';
+    $('file-exclude-search').value = '';
+    $('type-filter-mode').value = 'include';
+    state.selectedTypeCats.clear();
+    $('file-group-filter').value = 'all';
+    $('file-name-pattern').value = 'default';
+    $('file-status-filter').value = 'all';
+    $('hide-private').checked = false;
+    state.coreNameFilter = '';
+    renderFilesTab();
+    toast('已重置所有筛选条件');
+  });
+
+  // 保存常用筛选预设
+  $('save-filter-preset-btn').addEventListener('click', async () => {
+    const name = prompt('为当前筛选条件输入一个预设名称（如：核心财务表、待清理副本）：');
+    if (!name || !name.trim()) return;
+    const preset = {
+      id: `pre_${Date.now()}`,
+      name: name.trim(),
+      search: $('file-search').value,
+      matchMode: $('search-match-mode').value,
+      excludeSearch: $('file-exclude-search').value,
+      typeMode: $('type-filter-mode').value,
+      selectedTypes: [...state.selectedTypeCats],
+      groupFilter: $('file-group-filter').value,
+      namePattern: $('file-name-pattern').value,
+      statusFilter: $('file-status-filter').value,
+      hidePrivate: $('hide-private').checked
+    };
+    state.filterPresets = await saveFilterPresets([...state.filterPresets, preset]);
+    renderSavedPresetsBar();
+    toast(`已保存筛选预设「${preset.name}」`);
+  });
+
+  $('saved-presets-bar').addEventListener('click', async e => {
+    const delBtn = e.target.closest('[data-action="delete-preset"]');
+    if (delBtn) {
+      e.stopPropagation();
+      const id = delBtn.dataset.presetId;
+      state.filterPresets = await saveFilterPresets(state.filterPresets.filter(p => p.id !== id));
+      renderSavedPresetsBar();
+      return;
+    }
+    const applyBtn = e.target.closest('[data-action="apply-preset"]');
+    if (applyBtn) {
+      const p = state.filterPresets.find(x => x.id === applyBtn.dataset.presetId);
+      if (!p) return;
+      $('file-search').value = p.search || '';
+      $('search-match-mode').value = p.matchMode || 'or';
+      $('file-exclude-search').value = p.excludeSearch || '';
+      $('type-filter-mode').value = p.typeMode || 'include';
+      state.selectedTypeCats = new Set(p.selectedTypes || []);
+      $('file-group-filter').value = p.groupFilter || 'all';
+      $('file-name-pattern').value = p.namePattern || 'default';
+      $('file-status-filter').value = p.statusFilter || 'all';
+      $('hide-private').checked = Boolean(p.hidePrivate);
+      state.coreNameFilter = '';
+      renderFilesTab();
+      toast(`已应用筛选预设「${p.name}」`);
+    }
   });
 
   // 全选当前筛选
@@ -1296,7 +1854,34 @@ async function init() {
     renderFilesTab();
   });
 
-  // 批量按钮
+  // 批量分组选择与按组批量按钮
+  $('batch-group-checkboxes').addEventListener('change', e => {
+    const chk = e.target.closest('.batch-grp-check');
+    if (!chk) return;
+    const grp = chk.dataset.group;
+    if (chk.checked) state.selectedBatchGroups.add(grp);
+    else state.selectedBatchGroups.delete(grp);
+    updateBatchButtons();
+  });
+
+  $('batch-grant-groups').addEventListener('click', () => {
+    const files = state.files.filter(f => state.selectedFileIds.has(f.id));
+    const roleOpt = $('batch-group-role').value || 'group_default';
+    handleGroupOperationOnFiles(files, [...state.selectedBatchGroups], 'grant', roleOpt);
+  });
+
+  $('batch-keep-only-groups').addEventListener('click', () => {
+    const files = state.files.filter(f => state.selectedFileIds.has(f.id));
+    const roleOpt = $('batch-group-role').value || 'group_default';
+    handleGroupOperationOnFiles(files, [...state.selectedBatchGroups], 'keep_only_groups', roleOpt);
+  });
+
+  $('batch-revoke-groups').addEventListener('click', () => {
+    const files = state.files.filter(f => state.selectedFileIds.has(f.id));
+    handleGroupOperationOnFiles(files, [...state.selectedBatchGroups], 'revoke_groups');
+  });
+
+  // 常规批量按钮
   $('batch-enforce').addEventListener('click', () => handleBatchCustomAction('enforce'));
   $('batch-downgrade-all').addEventListener('click', () => handleBatchCustomAction('downgrade_all'));
   $('batch-remove-public').addEventListener('click', () => handleBatchCustomAction('remove_public'));
@@ -1316,6 +1901,11 @@ async function init() {
   });
 
   $('file-rows').addEventListener('click', e => {
+    if (e.target.id === 'clear-core-filter-inline') {
+      state.coreNameFilter = '';
+      renderFilesTab();
+      return;
+    }
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
     const action = btn.dataset.action;
@@ -1330,19 +1920,156 @@ async function init() {
       if (file) handleEnforceFiles([file]);
     } else if (action === 'add-collaborator') {
       handleAddCollaboratorToFile(btn.dataset.fileId);
+    } else if (action === 'fill-group-on-file') {
+      const file = state.files.find(f => f.id === btn.dataset.fileId);
+      if (file) handleGroupOperationOnFiles([file], [btn.dataset.group], 'grant', 'group_default');
+    } else if (action === 'grant-group-single-file') {
+      const file = state.files.find(f => f.id === btn.dataset.fileId);
+      if (!file) return;
+      const groups = state.directory.groups || [];
+      if (!groups.length) return toast('请先在「邮箱分组与人员表格」页创建分组');
+      const groupListStr = groups.map((g, idx) => `${idx + 1}. ${g.name} (默认:${roleLabel(g.defaultRole)})`).join('\n');
+      const choice = prompt(
+        `为「${file.name}」按组开通权限，请输入组名或序号（多个用逗号分隔）：\n${groupListStr}`,
+        groups[0].name
+      );
+      if (!choice) return;
+      const inputs = choice.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
+      const chosenNames = [];
+      for (const inp of inputs) {
+        const idx = Number(inp);
+        if (!Number.isNaN(idx) && idx >= 1 && idx <= groups.length) {
+          chosenNames.push(groups[idx - 1].name);
+        } else if (groups.some(g => g.name === inp)) {
+          chosenNames.push(inp);
+        }
+      }
+      if (!chosenNames.length) return toast('未匹配到有效分组名称');
+      handleGroupOperationOnFiles([file], chosenNames, 'grant', 'group_default');
+    } else if (action === 'filter-core-name') {
+      const core = btn.dataset.core;
+      state.coreNameFilter = state.coreNameFilter === core ? '' : core;
+      renderFilesTab();
+      toast(state.coreNameFilter ? `已筛选同系列词根：${core}（再次点击标签可取消）` : '已恢复显示全部系列');
     }
   });
 
-  // 协作者面板筛选与事件
-  ['collab-search', 'collab-filter'].forEach(id => {
+  /* ==================== TAB 2: 邮箱分组与人员表格事件 ==================== */
+
+  $('create-group-btn').addEventListener('click', async () => {
+    const name = ($('new-group-name').value || '').trim();
+    if (!name) return toast('请输入新分组名称（如：1组、2组）');
+    const role = $('new-group-role').value === 'writer' ? 'writer' : 'reader';
+    $('new-group-name').value = '';
+    const groups = [...(state.directory.groups || []), { name, defaultRole: role, policyTier: role }];
+    state.directory = await saveDirectory({ groups, contacts: state.directory.contacts });
+    state.policy = await getPolicy();
+    renderAll();
+    toast(`已创建分组「${name}」`);
+  });
+
+  $('groups-cards-container').addEventListener('change', async e => {
+    const sel = e.target.closest('[data-action="change-group-role"]');
+    if (!sel) return;
+    const grpName = sel.dataset.group;
+    const newRole = sel.value === 'writer' ? 'writer' : 'reader';
+    const groups = (state.directory.groups || []).map(g =>
+      g.name === grpName ? { ...g, defaultRole: newRole, policyTier: newRole } : g
+    );
+    state.directory = await saveDirectory({ groups, contacts: state.directory.contacts });
+    state.policy = await getPolicy();
+    renderAll();
+    toast(`已将分组「${grpName}」默认权限设为：${roleLabel(newRole)}`);
+  });
+
+  $('groups-cards-container').addEventListener('click', async e => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const { action, group } = btn.dataset;
+    if (action === 'view-group-members') {
+      $('collab-group-filter').value = group;
+      renderCollaboratorsTab();
+    } else if (action === 'view-group-files') {
+      switchTab('files');
+      $('file-group-filter').value = `grp:${group}`;
+      renderFilesTab();
+    } else if (action === 'downgrade-whole-group') {
+      const scopedFiles = getScopedFilesByAccount();
+      handleGroupOperationOnFiles(scopedFiles, [group], 'grant', 'reader');
+    } else if (action === 'revoke-whole-group') {
+      const scopedFiles = getScopedFilesByAccount();
+      handleGroupOperationOnFiles(scopedFiles, [group], 'revoke_groups');
+    } else if (action === 'delete-group') {
+      if (!confirm(`确定删除分组「${group}」吗？（组内联系人的邮箱记录仍会保留）`)) return;
+      const groups = (state.directory.groups || []).filter(g => g.name !== group);
+      const contacts = (state.directory.contacts || []).map(c => ({
+        ...c,
+        groups: (c.groups || []).filter(g => g !== group)
+      }));
+      state.directory = await saveDirectory({ groups, contacts });
+      renderAll();
+      toast(`已删除分组「${group}」`);
+    }
+  });
+
+  // 方式 1：粘贴表格文本导入（A列名称、B列邮箱、可选C列分组）
+  $('parse-paste-contacts-btn').addEventListener('click', async () => {
+    const raw = $('paste-contacts-textarea').value;
+    if (!raw || !raw.trim()) return toast('请先粘贴表格中的「名称 + 邮箱」内容');
+    const fallbackGroup = $('import-target-group-select').value || '';
+    const rows = parseTabularContactsText(raw, fallbackGroup);
+    await importParsedContacts(rows);
+    if (rows.length) $('paste-contacts-textarea').value = '';
+  });
+
+  // 上传 CSV/TSV 表格文件导入
+  $('import-contacts-csv').addEventListener('change', async e => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const fallbackGroup = $('import-target-group-select').value || '';
+      const rows = parseTabularContactsText(text, fallbackGroup);
+      await importParsedContacts(rows);
+    } catch (error) {
+      toast(`读取表格文件失败：${error.message}`);
+    } finally {
+      e.target.value = '';
+    }
+  });
+
+  // 方式 2：直接从 Google Drive 的 Google 表格读取 A列名称、B列邮箱
+  $('drive-sheet-picker').addEventListener('change', e => {
+    if (e.target.value) $('drive-sheet-url-input').value = e.target.value;
+  });
+
+  $('fetch-drive-sheet-contacts-btn').addEventListener('click', async () => {
+    const sheetInput = ($('drive-sheet-url-input').value || $('drive-sheet-picker').value || '').trim();
+    if (!sheetInput) return toast('请先选择一个 Google 表格或输入表格链接/ID');
+    const fallbackGroup = $('import-target-group-select').value || '';
+    try {
+      const fileId = extractDriveFileId(sheetInput);
+      const matchedFile = state.files.find(f => f.id === fileId);
+      const token = await resolveTokenForFile(matchedFile, true);
+      $('progress').textContent = '正在从 Google 表格读取人员名单（A列名称、B列邮箱）…';
+      const rows = await fetchContactsFromGoogleSheet(token, sheetInput, fallbackGroup);
+      await importParsedContacts(rows);
+      $('progress').textContent = `已从 Google 表格同步 ${rows.length} 条人员名单`;
+    } catch (error) {
+      toast(`从 Google 表格读取失败：${error.message}`);
+    }
+  });
+
+  // 人员列表筛选与行内交互
+  ['collab-search', 'collab-group-filter', 'collab-filter'].forEach(id => {
     $(id).addEventListener('input', renderCollaboratorsTab);
     $(id).addEventListener('change', renderCollaboratorsTab);
   });
 
   $('trust-all-current-writers').addEventListener('click', async () => {
-    const collabs = buildCollaboratorList();
-    if (!collabs.length) return toast('当前没有协作者可导入');
-    if (!confirm(`确定将当前扫描出的 ${collabs.length} 名协作者按其现有权限录入白名单吗？`)) return;
+    const collabs = buildMergedPersonList();
+    if (!collabs.length) return toast('当前没有人员可导入');
+    if (!confirm(`确定将当前 ${collabs.length} 名人员按其现有权限录入白名单吗？`)) return;
     const writers = [...state.policy.writers];
     const readers = [...state.policy.readers];
     for (const c of collabs) {
@@ -1351,14 +2078,44 @@ async function init() {
     }
     state.policy = await savePolicy({ writers, readers });
     renderAll();
-    toast(`已将 ${collabs.length} 名协作者导入白名单`);
+    toast(`已将 ${collabs.length} 名人员同步至白名单`);
   });
 
-  $('collab-rows').addEventListener('click', e => {
+  $('collab-rows').addEventListener('click', async e => {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
-    const { action, email, tier } = btn.dataset;
-    if (action === 'set-collab-tier') {
+    const { action, email, name, group, tier } = btn.dataset;
+
+    if (action === 'toggle-person-group') {
+      const norm = normalizeEntry(email);
+      const contacts = [...(state.directory.contacts || [])];
+      const existing = contacts.find(c => normalizeEntry(c.email) === norm);
+      if (existing) {
+        const hasGrp = (existing.groups || []).includes(group);
+        existing.groups = hasGrp
+          ? existing.groups.filter(g => g !== group)
+          : [...(existing.groups || []), group];
+      } else {
+        contacts.push({ email: norm, name: name || '', groups: [group] });
+      }
+      state.directory = await saveDirectory({ groups: state.directory.groups, contacts });
+      state.policy = await getPolicy();
+      renderAll();
+    } else if (action === 'edit-person-name') {
+      const newName = prompt(`修改 ${email} 的名称/备注（对应表格 A列）：`, name || '');
+      if (newName === null) return;
+      const norm = normalizeEntry(email);
+      const contacts = [...(state.directory.contacts || [])];
+      const existing = contacts.find(c => normalizeEntry(c.email) === norm);
+      if (existing) {
+        existing.name = newName.trim();
+      } else {
+        contacts.push({ email: norm, name: newName.trim(), groups: [] });
+      }
+      state.directory = await saveDirectory({ groups: state.directory.groups, contacts });
+      renderAll();
+      toast(`已更新 ${email} 的名称为「${newName.trim()}」`);
+    } else if (action === 'set-collab-tier') {
       setCollaboratorAllowTier(email, tier);
     } else if (action === 'filter-by-collab') {
       switchTab('files');
@@ -1372,7 +2129,7 @@ async function init() {
     }
   });
 
-  // 白名单与定期扫描设置事件
+  /* ==================== TAB 3: 白名单与定期扫描设置事件 ==================== */
   $('policy-schedule-enabled').addEventListener('change', async e => {
     state.policy = await savePolicy({ scheduleEnabled: e.target.checked });
     chrome.runtime.sendMessage({ type: 'SYNC_ALARM' }).catch(() => {});
@@ -1449,7 +2206,6 @@ async function init() {
     }
   });
 
-  // 白名单面板的导入按钮同时兼容 OAuth JSON 与白名单 JSON
   $('json-file').addEventListener('change', e => {
     if (e.target.files?.length) {
       handleOAuthFilesUpload(e.target.files);
@@ -1458,7 +2214,7 @@ async function init() {
   });
   $('export-policy-json').addEventListener('click', handleExportPolicyJson);
 
-  // 日志页事件
+  /* ==================== TAB 4: 日志页事件 ==================== */
   $('log-filter').addEventListener('change', renderLogsTab);
   $('clear-logs-btn').addEventListener('click', async () => {
     if (!confirm('确定清空所有历史巡检与操作日志吗？')) return;

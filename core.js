@@ -10,12 +10,405 @@ const DEFAULT_POLICY = {
   autoEnforce: false    // false = 仅提醒, true = 后台自动撤权/降级
 };
 
+const DEFAULT_DIRECTORY = {
+  groups: [
+    { name: '1组', defaultRole: 'writer', policyTier: 'writer' },
+    { name: '2组', defaultRole: 'reader', policyTier: 'reader' }
+  ],
+  contacts: [] // { email, name, groups: ['1组'] }
+};
+
 function normalizeEntry(value = '') {
   return String(value).trim().toLowerCase();
 }
 
 function normalizeEmailList(list = []) {
   return [...new Set(list.map(normalizeEntry).filter(Boolean))];
+}
+
+/* ==================== 通讯录与邮箱分组（A列名称 / B列邮箱 / 分组） ==================== */
+
+async function getDirectory() {
+  const data = await chrome.storage.local.get('directory');
+  const saved = data.directory;
+  if (!saved || typeof saved !== 'object') {
+    return JSON.parse(JSON.stringify(DEFAULT_DIRECTORY));
+  }
+  const groups = Array.isArray(saved.groups) ? saved.groups : DEFAULT_DIRECTORY.groups;
+  const contacts = Array.isArray(saved.contacts) ? saved.contacts : [];
+  return { groups, contacts };
+}
+
+async function saveDirectory(directory) {
+  const cleanGroups = [];
+  const seenGroup = new Set();
+  for (const g of directory.groups || []) {
+    const name = String(g.name || '').trim();
+    if (!name || seenGroup.has(name)) continue;
+    seenGroup.add(name);
+    cleanGroups.push({
+      name,
+      defaultRole: g.defaultRole === 'writer' ? 'writer' : 'reader',
+      policyTier: ['writer', 'reader', 'none'].includes(g.policyTier) ? g.policyTier : 'writer'
+    });
+  }
+
+  const contactMap = new Map();
+  for (const c of directory.contacts || []) {
+    const email = normalizeEntry(c.email);
+    if (!email || !email.includes('@')) continue;
+    const prev = contactMap.get(email);
+    const mergedGroups = [...new Set([...(prev?.groups || []), ...(c.groups || [])].map(x => String(x).trim()).filter(Boolean))];
+    contactMap.set(email, {
+      email,
+      name: String(c.name || prev?.name || '').trim(),
+      groups: mergedGroups
+    });
+    for (const gName of mergedGroups) {
+      if (!seenGroup.has(gName)) {
+        seenGroup.add(gName);
+        cleanGroups.push({ name: gName, defaultRole: 'reader', policyTier: 'reader' });
+      }
+    }
+  }
+
+  const nextDir = {
+    groups: cleanGroups,
+    contacts: [...contactMap.values()]
+  };
+  await chrome.storage.local.set({ directory: nextDir });
+  await syncDirectoryToPolicy(nextDir);
+  return nextDir;
+}
+
+/**
+ * 将分组中设置了白名单策略（policyTier: writer / reader）的成员同步到白名单
+ */
+async function syncDirectoryToPolicy(directory) {
+  const currentPolicy = await getPolicy();
+  const writerGroupNames = new Set(
+    (directory.groups || []).filter(g => g.policyTier === 'writer').map(g => g.name)
+  );
+  const readerGroupNames = new Set(
+    (directory.groups || []).filter(g => g.policyTier === 'reader').map(g => g.name)
+  );
+
+  const writers = new Set(currentPolicy.writers || []);
+  const readers = new Set(currentPolicy.readers || []);
+
+  for (const c of directory.contacts || []) {
+    const inW = (c.groups || []).some(g => writerGroupNames.has(g));
+    const inR = (c.groups || []).some(g => readerGroupNames.has(g));
+    if (inW) {
+      writers.add(c.email);
+      readers.delete(c.email);
+    } else if (inR && !writers.has(c.email)) {
+      readers.add(c.email);
+    }
+  }
+
+  const nextPolicy = {
+    ...currentPolicy,
+    writers: [...writers],
+    readers: [...readers]
+  };
+  await chrome.storage.local.set({ policy: nextPolicy });
+  return nextPolicy;
+}
+
+/**
+ * 解析从表格复制粘贴或 CSV 导入的文本
+ * 默认支持：A列 = 名称，B列 = 邮箱，可选 C列 = 分组名
+ * 同时智能识别如果某列含 @ 则自动作为邮箱列
+ */
+function parseTabularContactsText(rawText = '', fallbackGroup = '') {
+  const lines = String(rawText)
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(Boolean);
+
+  const results = [];
+  for (const line of lines) {
+    // 支持制表符(Excel/Sheets复制)、逗号、分号分隔
+    const cells = line.includes('\t')
+      ? line.split('\t').map(s => s.trim().replace(/^"|"$/g, ''))
+      : line.split(/[,;，；]/).map(s => s.trim().replace(/^"|"$/g, ''));
+
+    if (!cells.length) continue;
+
+    // 寻找包含 @ 的单元格作为邮箱
+    const emailIdx = cells.findIndex(c => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(c));
+    if (emailIdx === -1) {
+      // 可能是表头行（如：名称, 邮箱, 分组），自动跳过
+      continue;
+    }
+
+    const email = normalizeEntry(cells[emailIdx]);
+    let name = '';
+    let group = fallbackGroup ? String(fallbackGroup).trim() : '';
+
+    if (emailIdx === 1) {
+      // 标准情况：A列是名称 (index 0)，B列是邮箱 (index 1)，C列可选是分组 (index 2)
+      name = cells[0] || '';
+      if (cells[2]) group = cells[2];
+    } else if (emailIdx === 0) {
+      // A列直接是邮箱，B列可能是名称或分组
+      name = cells[1] || '';
+      if (cells[2]) group = cells[2];
+    } else {
+      name = cells[0] || '';
+      if (cells[emailIdx + 1]) group = cells[emailIdx + 1];
+    }
+
+    results.push({
+      name: name.trim(),
+      email,
+      group: group.trim()
+    });
+  }
+  return results;
+}
+
+function extractDriveFileId(input = '') {
+  const str = String(input).trim();
+  const match = str.match(/\/d\/([a-zA-Z0-9_-]{15,})/);
+  if (match) return match[1];
+  const idParam = str.match(/[?&]id=([a-zA-Z0-9_-]{15,})/);
+  if (idParam) return idParam[1];
+  return str;
+}
+
+async function fetchContactsFromGoogleSheet(token, sheetIdOrUrl, fallbackGroup = '') {
+  const fileId = extractDriveFileId(sheetIdOrUrl);
+  if (!fileId) throw new Error('请输入有效的 Google 表格链接或文件 ID');
+  const response = await fetch(
+    `${DRIVE_API}/files/${encodeURIComponent(fileId)}/export?mimeType=text/csv`,
+    {
+      headers: { Authorization: `Bearer ${token}` }
+    }
+  );
+  if (!response.ok) {
+    const errBody = await response.json().catch(() => ({}));
+    throw new Error(errBody?.error?.message || `读取 Google 表格失败 (${response.status})`);
+  }
+  const csvText = await response.text();
+  return parseTabularContactsText(csvText, fallbackGroup);
+}
+
+function buildContactLookup(directory) {
+  const byEmail = new Map();
+  for (const c of directory?.contacts || []) {
+    byEmail.set(normalizeEntry(c.email), c);
+  }
+  return byEmail;
+}
+
+function formatCollaboratorDisplay(email, displayName, contactLookup) {
+  const norm = normalizeEntry(email);
+  const contact = contactLookup ? contactLookup.get(norm) : null;
+  if (contact) {
+    const groupPrefix = contact.groups?.length ? `[${contact.groups.join('/')}] ` : '';
+    const namePart = contact.name ? `${contact.name} (${norm})` : norm;
+    return `${groupPrefix}${namePart}`;
+  }
+  if (displayName && normalizeEntry(displayName) !== norm) {
+    return `${displayName} (${norm})`;
+  }
+  return norm;
+}
+
+/**
+ * 计算某个文件上各个邮箱分组的授权覆盖情况
+ * 返回数组: [{ groupName, grantedCount, totalCount, roles: Set, status: 'full' | 'partial' }]
+ */
+function getFileGroupCoverage(file, directory) {
+  if (!directory?.groups?.length || !directory?.contacts?.length) return [];
+  const fileUserRoles = new Map();
+  for (const p of file.permissions || []) {
+    if (p.type === 'user' || p.type === 'group') {
+      const em = normalizeEntry(p.emailAddress || '');
+      if (em) fileUserRoles.set(em, p.role);
+    }
+  }
+
+  const ownerNorm = normalizeEntry(file.ownerAccount || file.owners?.[0]?.emailAddress || '');
+  const result = [];
+
+  for (const grp of directory.groups) {
+    const members = directory.contacts.filter(c => (c.groups || []).includes(grp.name));
+    if (!members.length) continue;
+
+    let grantedCount = 0;
+    const roles = new Set();
+    for (const m of members) {
+      const em = normalizeEntry(m.email);
+      if (em === ownerNorm) {
+        grantedCount++;
+        roles.add('owner');
+      } else if (fileUserRoles.has(em)) {
+        grantedCount++;
+        roles.add(fileUserRoles.get(em));
+      }
+    }
+
+    if (grantedCount > 0) {
+      result.push({
+        groupName: grp.name,
+        grantedCount,
+        totalCount: members.length,
+        roles: [...roles],
+        status: grantedCount === members.length ? 'full' : 'partial'
+      });
+    }
+  }
+  return result;
+}
+
+/* ==================== 高级文件名搜索、不规范名称归并 & 类型过滤 ==================== */
+
+function fileDetailedCategory(mimeType = '', fileName = '') {
+  const m = String(mimeType).toLowerCase();
+  const n = String(fileName).toLowerCase();
+
+  if (m === 'application/vnd.google-apps.spreadsheet') return 'sheet';
+  if (
+    m.includes('spreadsheet') ||
+    m.includes('excel') ||
+    m === 'text/csv' ||
+    /\.(xlsx|xls|csv|tsv|ods)$/.test(n)
+  ) {
+    return 'excel';
+  }
+  if (m === 'application/vnd.google-apps.folder') return 'folder';
+  if (m === 'application/vnd.google-apps.document') return 'doc';
+  if (
+    m.includes('word') ||
+    m === 'application/pdf' ||
+    m === 'text/plain' ||
+    /\.(docx|doc|pdf|txt|md|rtf)$/.test(n)
+  ) {
+    return 'word_pdf';
+  }
+  if (m.includes('presentation') || m.includes('powerpoint') || /\.(pptx|ppt|key)$/.test(n)) {
+    return 'slide';
+  }
+  if (m.startsWith('image/') || m.startsWith('video/') || m.startsWith('audio/')) {
+    return 'media';
+  }
+  return 'other';
+}
+
+function fileCategory(mimeType = '', fileName = '') {
+  const det = fileDetailedCategory(mimeType, fileName);
+  if (det === 'excel') return 'sheet';
+  if (det === 'word_pdf') return 'doc';
+  return det;
+}
+
+function fileCategoryLabel(mimeType = '', fileName = '') {
+  const det = fileDetailedCategory(mimeType, fileName);
+  const labels = {
+    sheet: '📊 Google 表格',
+    excel: '📗 Excel/CSV',
+    folder: '📁 文件夹',
+    doc: '📝 Google 文档',
+    word_pdf: '📕 Word/PDF',
+    slide: '📽️ 幻灯片',
+    media: '🖼️ 媒体/图片',
+    other: '📦 其他文件'
+  };
+  return labels[det] || '📄 文件';
+}
+
+/**
+ * 提取不规范文件名的「核心词根」（剥离日期、版本号、副本、(1)、扩展名和标点）
+ * 用于将相似/同系列的表聚合在一起
+ */
+function extractCoreFileName(rawName = '') {
+  let s = String(rawName).trim().toLowerCase();
+  // 去掉常见扩展名
+  s = s.replace(/\.(xlsx|xls|csv|tsv|docx|doc|pdf|pptx|ppt|txt|zip|rar|7z|png|jpg|jpeg|mp4)$/i, '');
+  // 去掉 Copy of / 的副本 / 副本 / 备份 / 模板 / 测试 / 旧版
+  s = s.replace(/^(copy of\s+|副本\s*[-_]?)/i, '');
+  s = s.replace(/([-_\s]*(的副本|副本|备份|backup|bak|copy|最终版|定稿|修改版|旧版|测试|test))+\d*$/gi, '');
+  // 去掉括号编号如 (1), （2）, [1]
+  s = s.replace(/[\(（\[]\s*\d+\s*[\)）\]]/g, '');
+  // 去掉版本号如 v1, v2.1
+  s = s.replace(/\bv\d+(\.\d+)?\b/gi, '');
+  // 去掉常见日期如 2026-10-20, 20261020, 10月20日
+  s = s.replace(/\b20\d{2}[-_./年]?\d{1,2}([-_./月]?\d{1,2}日?)?\b/g, '');
+  s = s.replace(/\b\d{1,2}月(\d{1,2}日)?\b/g, '');
+  // 去掉标点与多余空白
+  s = s.replace(/[-_—·\s()（）【】\[\]《》<>.,，。、/\\]+/g, '');
+  return s || String(rawName).trim().toLowerCase();
+}
+
+/**
+ * 检测文件名是否不规范（包含重复词段，或者带有 副本/(1)/Copy 等冗余后缀）
+ */
+function analyzeMessyFileName(rawName = '') {
+  const name = String(rawName).trim();
+  const hasCopySuffix = /(的副本|副本|copy of|\(\d+\)|（\d+）|备份|bak)/i.test(name);
+
+  // 按标点或空白切分词段，看是否有重复出现的词段（如 "财务报表-财务报表"）
+  const tokens = name
+    .toLowerCase()
+    .replace(/\.[a-z0-9]{2,5}$/i, '')
+    .split(/[-_—·\s()（）【】\[\].,，。/\\]+/)
+    .filter(t => t.length >= 2);
+  const seen = new Set();
+  let hasRepeatedToken = false;
+  for (const t of tokens) {
+    if (seen.has(t)) {
+      hasRepeatedToken = true;
+      break;
+    }
+    seen.add(t);
+  }
+
+  // 检测连续重复子串（如 "日报表日报表"）
+  if (!hasRepeatedToken && /(.{2,})\1/.test(name.replace(/\s+/g, ''))) {
+    hasRepeatedToken = true;
+  }
+
+  return {
+    hasCopySuffix,
+    hasRepeatedToken,
+    isMessy: hasCopySuffix || hasRepeatedToken
+  };
+}
+
+/**
+ * 模糊规范化字符串（忽略标点、空格、大小写）
+ */
+function normalizeForFuzzy(str = '') {
+  return String(str)
+    .toLowerCase()
+    .replace(/[-_—·\s()（）【】\[\]《》<>.,，。、/\\'":;：；!！?？]+/g, '');
+}
+
+function fuzzyMatchTerm(targetText = '', term = '') {
+  const normTarget = normalizeForFuzzy(targetText);
+  const normTerm = normalizeForFuzzy(term);
+  if (!normTerm) return true;
+  if (normTarget.includes(normTerm)) return true;
+
+  // 子序列模糊匹配（例如搜 "财务月报" 可匹配 "财务2026年10月报表"）
+  let tIdx = 0;
+  for (let i = 0; i < normTarget.length && tIdx < normTerm.length; i++) {
+    if (normTarget[i] === normTerm[tIdx]) tIdx++;
+  }
+  return tIdx === normTerm.length;
+}
+
+async function getFilterPresets() {
+  const data = await chrome.storage.local.get('filterPresets');
+  return Array.isArray(data.filterPresets) ? data.filterPresets : [];
+}
+
+async function saveFilterPresets(presets) {
+  await chrome.storage.local.set({ filterPresets: presets });
+  return presets;
 }
 
 /* ==================== OAuth 桌面 JSON 凭证与多账号存储 ==================== */
@@ -140,18 +533,20 @@ async function getValidTokenForAccount(email, interactive = false) {
       return refreshAccountAccessToken(target);
     }
     if (interactive && target.clientId && target.clientSecret) {
-      const reauthed = await authorizeWithOAuthClient({
-        client_id: target.clientId,
-        client_secret: target.clientSecret,
-        token_uri: target.tokenUri,
-        redirect_uri: target.redirectUri || 'http://localhost'
-      }, target.email);
+      const reauthed = await authorizeWithOAuthClient(
+        {
+          client_id: target.clientId,
+          client_secret: target.clientSecret,
+          token_uri: target.tokenUri,
+          redirect_uri: target.redirectUri || 'http://localhost'
+        },
+        target.email
+      );
       return reauthed.accessToken;
     }
     if (target.accessToken) return target.accessToken;
   }
 
-  // 兼容：若用户在 manifest.json 配置了 Chrome 扩展 Client ID，也可回退使用 chrome.identity
   const manifestClientId = chrome.runtime.getManifest().oauth2?.client_id || '';
   if (manifestClientId && !manifestClientId.includes('替换')) {
     return getChromeIdentityToken(interactive);
@@ -174,9 +569,6 @@ function getChromeIdentityToken(interactive = true) {
   });
 }
 
-/**
- * 使用导入的桌面端/Web 端 OAuth JSON (installed / web) 发起标准 OAuth2 授权并获取 refresh_token
- */
 async function authorizeWithOAuthClient(client, loginHint = '') {
   if (!client || !client.client_id || !client.client_secret) {
     throw new Error('无效的 OAuth 客户端配置（缺少 client_id 或 client_secret）');
@@ -262,7 +654,6 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
     });
   });
 
-  // 用授权码换取 access_token 与 refresh_token
   const tokenUri = client.token_uri || 'https://oauth2.googleapis.com/token';
   const tokenRes = await fetch(tokenUri, {
     method: 'POST',
@@ -428,47 +819,15 @@ function roleLabel(role) {
   return map[role] || role || '未知';
 }
 
-function permissionLabel(permission) {
+function permissionLabel(permission, contactLookup = null) {
   if (!permission) return '';
   if (permission.type === 'anyone') return '公开链接 (任何人)';
   if (permission.type === 'domain') return `域内共享 (${permission.domain || '未知域'})`;
-  return permission.emailAddress || permission.displayName || permission.type;
-}
-
-function fileCategory(mimeType = '') {
-  if (
-    mimeType === 'application/vnd.google-apps.spreadsheet' ||
-    mimeType.includes('spreadsheet') ||
-    mimeType.includes('excel')
-  ) {
-    return 'sheet';
+  const email = permission.emailAddress || '';
+  if (email && contactLookup) {
+    return formatCollaboratorDisplay(email, permission.displayName, contactLookup);
   }
-  if (mimeType === 'application/vnd.google-apps.folder') {
-    return 'folder';
-  }
-  if (
-    mimeType === 'application/vnd.google-apps.document' ||
-    mimeType.includes('document') ||
-    mimeType.includes('word')
-  ) {
-    return 'doc';
-  }
-  if (mimeType === 'application/vnd.google-apps.presentation' || mimeType.includes('presentation')) {
-    return 'slide';
-  }
-  return 'other';
-}
-
-function fileCategoryLabel(mimeType = '') {
-  const cat = fileCategory(mimeType);
-  const labels = {
-    sheet: '📊 表格',
-    folder: '📁 文件夹',
-    doc: '📝 文档',
-    slide: '📽️ 幻灯片',
-    other: '📄 文件'
-  };
-  return labels[cat] || '📄 文件';
+  return email || permission.displayName || permission.type;
 }
 
 function matchesAllowlist(email = '', list = []) {
@@ -707,7 +1066,250 @@ async function createPermission(token, fileId, { type = 'user', role = 'reader',
 }
 
 /**
- * 对指定文件列表按当前白名单与公开策略执行修正（自动匹配每个文件所属授权账号的 Token）
+ * 按选定的「邮箱分组」对多个文件批量执行授权 / 对齐 / 撤权
+ * mode:
+ * - 'grant': 给所选组全体成员开通指定角色（若写成 'group_default' 则按各组默认角色）
+ * - 'keep_only_groups': 仅保留所选组成员权限（同时为组内未授权成员补齐权限），移除组外其他直接协作者
+ * - 'revoke_groups': 从所选文件中移除所选组全部成员的直接权限
+ */
+async function executeGroupBatchOnFiles({
+  files,
+  groupNames,
+  mode = 'grant',
+  roleOption = 'group_default',
+  directory,
+  onProgress = null
+}) {
+  const groupSet = new Set(groupNames);
+  const groupRoleMap = new Map();
+  for (const g of directory.groups || []) {
+    groupRoleMap.set(g.name, g.defaultRole || 'reader');
+  }
+
+  // 计算目标成员及其目标角色（若一人在多个选中组，writer 优先于 reader）
+  const targetMemberRole = new Map();
+  const targetMemberName = new Map();
+  for (const c of directory.contacts || []) {
+    const matchedGroups = (c.groups || []).filter(g => groupSet.has(g));
+    if (!matchedGroups.length) continue;
+    const email = normalizeEntry(c.email);
+    targetMemberName.set(email, c.name || email);
+
+    let desiredRole = 'reader';
+    if (roleOption === 'writer' || roleOption === 'reader') {
+      desiredRole = roleOption;
+    } else {
+      // 按组默认角色，只要有一个组是 writer 即给 writer
+      if (matchedGroups.some(g => groupRoleMap.get(g) === 'writer')) {
+        desiredRole = 'writer';
+      }
+    }
+    if (targetMemberRole.get(email) === 'writer') {
+      desiredRole = 'writer';
+    }
+    targetMemberRole.set(email, desiredRole);
+  }
+
+  const operations = [];
+  for (const file of files) {
+    const fileOwner = normalizeEntry(file.ownerAccount || file.owners?.[0]?.emailAddress || '');
+    const perms = file.permissions || [];
+    const existingByEmail = new Map();
+    for (const p of perms) {
+      if (p.type === 'user' || p.type === 'group') {
+        const em = normalizeEntry(p.emailAddress || '');
+        if (em) existingByEmail.set(em, p);
+      }
+    }
+
+    if (mode === 'grant' || mode === 'keep_only_groups') {
+      for (const [email, desiredRole] of targetMemberRole.entries()) {
+        if (email === fileOwner) continue;
+        const existing = existingByEmail.get(email);
+        if (!existing) {
+          operations.push({
+            type: 'create',
+            file,
+            fileOwner,
+            email,
+            name: targetMemberName.get(email),
+            role: desiredRole
+          });
+        } else if (!permIsInherited(existing) && existing.role !== 'owner' && existing.role !== desiredRole) {
+          operations.push({
+            type: 'update',
+            file,
+            fileOwner,
+            permission: existing,
+            email,
+            name: targetMemberName.get(email),
+            role: desiredRole
+          });
+        }
+      }
+    }
+
+    if (mode === 'keep_only_groups') {
+      for (const p of perms) {
+        if (p.role === 'owner' || permIsInherited(p)) continue;
+        const em = normalizeEntry(p.emailAddress || '');
+        if (em && em === fileOwner) continue;
+        if (!em || !targetMemberRole.has(em)) {
+          operations.push({
+            type: 'delete',
+            file,
+            fileOwner,
+            permission: p,
+            email: em,
+            name: permissionLabel(p)
+          });
+        }
+      }
+    } else if (mode === 'revoke_groups') {
+      for (const p of perms) {
+        if (p.role === 'owner' || permIsInherited(p)) continue;
+        const em = normalizeEntry(p.emailAddress || '');
+        if (em && targetMemberRole.has(em)) {
+          operations.push({
+            type: 'delete',
+            file,
+            fileOwner,
+            permission: p,
+            email: em,
+            name: targetMemberName.get(em) || em
+          });
+        }
+      }
+    }
+  }
+
+  let createdCount = 0;
+  let updatedCount = 0;
+  let removedCount = 0;
+  let failedCount = 0;
+  const logs = [];
+  let cursor = 0;
+
+  const tokenCache = new Map();
+  async function getToken(owner) {
+    if (tokenCache.has(owner)) return tokenCache.get(owner);
+    const t = await getValidTokenForAccount(owner, true);
+    tokenCache.set(owner, t);
+    return t;
+  }
+
+  const groupTitle = groupNames.join('、');
+
+  const workers = Array.from({ length: 4 }, async () => {
+    while (cursor < operations.length) {
+      const op = operations[cursor++];
+      const { file, fileOwner } = op;
+      try {
+        const token = await getToken(fileOwner);
+        if (op.type === 'create') {
+          const created = await createPermission(token, file.id, {
+            type: 'user',
+            role: op.role,
+            emailAddress: op.email
+          });
+          file.permissions = file.permissions || [];
+          file.permissions.push({
+            id: created?.id || `grp-${Date.now()}-${Math.random()}`,
+            type: 'user',
+            role: op.role,
+            emailAddress: op.email,
+            displayName: op.name
+          });
+          createdCount++;
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'manual',
+            actionType: 'grant',
+            accountEmail: fileOwner,
+            fileId: file.id,
+            fileName: file.name || '(无名称)',
+            webViewLink: file.webViewLink || '',
+            permissionId: created?.id || '',
+            targetType: 'user',
+            targetEmail: op.email,
+            targetLabel: `[${groupTitle}] ${op.name} (${op.email})`,
+            previousRole: '',
+            newRole: op.role,
+            restored: false,
+            message: `按组【${groupTitle}】批量授予「${roleLabel(op.role)}」权限`
+          });
+        } else if (op.type === 'update') {
+          const prevRole = op.permission.role;
+          await updatePermissionRole(token, file.id, op.permission.id, op.role);
+          op.permission.role = op.role;
+          updatedCount++;
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'manual',
+            actionType: 'downgrade',
+            accountEmail: fileOwner,
+            fileId: file.id,
+            fileName: file.name || '(无名称)',
+            webViewLink: file.webViewLink || '',
+            permissionId: op.permission.id,
+            targetType: op.permission.type,
+            targetEmail: op.email,
+            targetLabel: `[${groupTitle}] ${op.name} (${op.email})`,
+            previousRole: prevRole,
+            newRole: op.role,
+            restored: false,
+            message: `按组【${groupTitle}】调整角色：${roleLabel(prevRole)} → ${roleLabel(op.role)}`
+          });
+        } else if (op.type === 'delete') {
+          await deletePermission(token, file.id, op.permission.id);
+          file.permissions = (file.permissions || []).filter(x => x.id !== op.permission.id);
+          removedCount++;
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'manual',
+            actionType: 'revoke',
+            accountEmail: fileOwner,
+            fileId: file.id,
+            fileName: file.name || '(无名称)',
+            webViewLink: file.webViewLink || '',
+            permissionId: op.permission.id,
+            targetType: op.permission.type,
+            targetEmail: op.email,
+            domain: op.permission.domain || '',
+            targetLabel: op.name,
+            previousRole: op.permission.role,
+            newRole: '',
+            restored: false,
+            message: `按组【${groupTitle}】操作移除权限（原角色：${roleLabel(op.permission.role)}）`
+          });
+        }
+      } catch (error) {
+        failedCount++;
+      }
+
+      if (onProgress) {
+        onProgress({
+          done: createdCount + updatedCount + removedCount + failedCount,
+          total: operations.length,
+          createdCount,
+          updatedCount,
+          removedCount,
+          failedCount
+        });
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  if (logs.length) await appendAuditLogs(logs);
+  return { createdCount, updatedCount, removedCount, failedCount, total: operations.length };
+}
+
+/**
+ * 对指定文件列表按当前白名单与公开策略执行修正
  */
 async function enforceFilesByPolicy(fallbackToken, files, policy, fallbackOwnerEmail, source = 'manual', onProgress = null) {
   const queue = [];
@@ -924,7 +1526,7 @@ async function scanSingleAccount(accountEmail, token, onProgress = null, account
 }
 
 /**
- * 执行完整扫描（支持多账号并发/顺序扫描、前台交互与后台定时任务调用）
+ * 执行完整扫描
  */
 async function runFullScan({ interactive = false, source = 'manual', targetAccount = 'all', onProgress = null } = {}) {
   const policy = await getPolicy();
@@ -944,7 +1546,6 @@ async function runFullScan({ interactive = false, source = 'manual', targetAccou
       targetAccounts = accounts;
     }
   } else {
-    // 尝试回退使用已导入的第一个桌面 OAuth 凭证进行交互式授权，或使用 manifest.json
     const oauthClients = await getOAuthClients();
     if (interactive && oauthClients.length > 0) {
       const newAcc = await authorizeWithOAuthClient(oauthClients[0]);
@@ -965,7 +1566,6 @@ async function runFullScan({ interactive = false, source = 'manual', targetAccou
     scannedFiles.push(...accFiles);
   }
 
-  // 如果只扫描了单个账号，保留其它账号已缓存的文件
   let mergedFiles = scannedFiles;
   if (targetAccount !== 'all' && prevSnapshot.files?.length) {
     const scannedAccountSet = new Set(targetAccounts.map(a => normalizeEntry(a.email)));
