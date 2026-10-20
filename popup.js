@@ -17,6 +17,7 @@ const state = {
   selectedFileIds: new Set(),
   selectedTypeCats: new Set(ALL_TYPE_CATS), // 默认全选所有文件类型
   selectedBatchGroups: new Set(),
+  expandedPermFileIds: new Set(), // 记录哪些文件展开了完整权限明细（默认全部收起为单行统计）
   coreNameFilter: ''
 };
 
@@ -81,25 +82,57 @@ function renderAccountsUI() {
     state.activeAccount = 'all';
   }
 
-  $('oauth-clients-info').textContent = `已存凭证: ${state.oauthClients.length}`;
+  $('oauth-clients-info').textContent = `已存凭证: ${state.oauthClients.length} · 已授权账号: ${state.accounts.length}`;
 
   const listNode = $('accounts-list');
-  if (!state.accounts.length) {
-    listNode.innerHTML = '<span class="muted">尚未授权任何账号</span>';
+  if (!state.accounts.length && !state.oauthClients.length) {
+    listNode.innerHTML = '<span class="muted">尚未导入 JSON 凭证或授权账号</span>';
     setStatus('待授权', false);
-    $('scan').disabled = state.oauthClients.length === 0;
-  } else {
+    $('scan').disabled = true;
+    return;
+  }
+
+  if (state.accounts.length > 0) {
     setStatus(`已授权 ${state.accounts.length} 个账号`, true);
     $('scan').disabled = false;
-    listNode.innerHTML = state.accounts
-      .map(
-        acc => `<span class="account-pill">
-          <span>${escapeHtml(acc.email)}</span>
-          <button type="button" class="remove-acc" data-action="remove-account" data-email="${escapeHtml(acc.email)}" title="移除此账号">×</button>
-        </span>`
-      )
-      .join('');
+  } else {
+    setStatus(`已导入 ${state.oauthClients.length} 个凭证 (待授权)`, false);
+    $('scan').disabled = false;
   }
+
+  const clientRowsHtml = state.oauthClients
+    .map((c, idx) => {
+      const uid = c.uid || c.client_id;
+      const name = c.fileName || `凭证 #${idx + 1}`;
+      const bound = c.boundEmail ? `已绑: ${c.boundEmail}` : '未授权';
+      const statusCls = c.boundEmail ? 'ok' : 'warning';
+      return `<div class="allow-item" style="width:100%;display:flex;align-items:center;justify-content:space-between;gap:6px;">
+        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(c.client_id)}">
+          📄 <strong>${escapeHtml(name)}</strong>
+          <span class="status-pill ${statusCls}" style="margin-left:4px;">${escapeHtml(bound)}</span>
+        </span>
+        <span class="row-flex" style="flex-shrink:0;">
+          <button type="button" class="btn btn-xs primary" data-action="auth-oauth-client" data-uid="${escapeHtml(uid)}">${c.boundEmail ? '重新授权' : '点击授权'}</button>
+          <button type="button" class="btn-text" style="color:#dc2626;" data-action="remove-oauth-client" data-uid="${escapeHtml(uid)}" title="删除此 JSON 凭证">×</button>
+        </span>
+      </div>`;
+    })
+    .join('');
+
+  const accountPillsHtml = state.accounts.length
+    ? `<div style="width:100%;margin-top:4px;display:flex;flex-wrap:wrap;gap:5px;">` +
+      state.accounts
+        .map(
+          acc => `<span class="account-pill">
+            <span>✅ ${escapeHtml(acc.email)}</span>
+            <button type="button" class="remove-acc" data-action="remove-account" data-email="${escapeHtml(acc.email)}" title="移除此账号">×</button>
+          </span>`
+        )
+        .join('') +
+      `</div>`
+    : '';
+
+  listNode.innerHTML = clientRowsHtml + accountPillsHtml;
 }
 
 function updateTopBadges() {
@@ -139,18 +172,24 @@ function updateTopBadges() {
 
 /* ==================== 导入 OAuth 桌面 JSON 凭证与多账号授权 ==================== */
 
-async function handleAuthorizeWithClient(client) {
-  setStatus('等待授权…');
+async function handleAuthorizeWithClient(client, prefixLabel = '') {
+  setStatus(`${prefixLabel}等待 Google 授权…`);
+  $('progress').textContent = `${prefixLabel}请在弹出的 Google 页面完成登录授权（${client.fileName || client.client_id.slice(0, 12)}）…`;
   try {
     const account = await authorizeWithOAuthClient(client);
     state.accounts = await getAuthorizedAccounts();
     state.oauthClients = await getOAuthClients();
     renderAll();
-    toast(`已授权账号：${account.email}，正在自动扫描…`);
-    await handleScan(account.email);
+    $('progress').textContent = `已授权账号：${account.email}（请点击右上角「立即扫描」开始扫描）`;
+    toast(`${prefixLabel}已成功授权账号：${account.email}`);
+    return account;
   } catch (error) {
+    state.accounts = await getAuthorizedAccounts();
+    state.oauthClients = await getOAuthClients();
     renderAccountsUI();
-    toast(`授权未完成：${error.message}`);
+    $('progress').textContent = `${prefixLabel}授权未完成：${error.message}`;
+    toast(`${prefixLabel}授权未完成：${error.message}`);
+    return null;
   }
 }
 
@@ -164,7 +203,7 @@ async function handleOAuthFilesUpload(fileList) {
   for (const file of files) {
     try {
       const parsed = JSON.parse(await file.text());
-      const clients = extractOAuthClientsFromJson(parsed);
+      const clients = extractOAuthClientsFromJson(parsed, file.name);
       if (clients.length > 0) {
         extractedClients.push(...clients);
       } else {
@@ -179,10 +218,14 @@ async function handleOAuthFilesUpload(fileList) {
   if (extractedClients.length > 0) {
     state.oauthClients = await saveOAuthClients(extractedClients);
     renderAccountsUI();
-    toast(`已导入 ${extractedClients.length} 个 OAuth 凭证，正在打开 Google 授权页…`);
-    for (const client of extractedClients) {
-      await handleAuthorizeWithClient(client);
+    toast(`已导入 ${extractedClients.length} 个 JSON 授权文件，开始逐一打开 Google 授权页…`);
+    let successCount = 0;
+    for (let i = 0; i < extractedClients.length; i++) {
+      const prefix = extractedClients.length > 1 ? `[${i + 1}/${extractedClients.length}] ` : '';
+      const acc = await handleAuthorizeWithClient(extractedClients[i], prefix);
+      if (acc) successCount++;
     }
+    $('progress').textContent = `已完成 ${successCount}/${extractedClients.length} 个凭证授权。请点击右上角「立即扫描」开始扫描。`;
   } else if (!allowlistImported) {
     toast('未识别到有效的 Google OAuth 凭证');
   }
@@ -194,7 +237,9 @@ async function handleAddMoreAccount() {
     $('oauth-json-file').click();
     return;
   }
-  const chosenClient = state.oauthClients[state.oauthClients.length - 1];
+  // 优先找尚未绑定账号的凭证，否则使用最后一个凭证
+  const unboundClient = state.oauthClients.find(c => !c.boundEmail);
+  const chosenClient = unboundClient || state.oauthClients[state.oauthClients.length - 1];
   await handleAuthorizeWithClient(chosenClient);
 }
 
@@ -435,77 +480,128 @@ function renderFilesTab() {
   tbody.innerHTML = filtered
     .map(file => {
       const ownerEmail = file.ownerAccount || file.owners?.[0]?.emailAddress || '';
-      const stat = evaluateFile(file, state.policy, ownerEmail);
       const isSelected = state.selectedFileIds.has(file.id);
       const isNew = Boolean(file.isNew || state.newFileIds.has(file.id));
       const detCat = fileDetailedCategory(file.mimeType, file.name);
       const coreName = extractCoreFileName(file.name || '');
       const seriesCount = coreCounts.get(coreName) || 1;
+      const isExpanded = state.expandedPermFileIds.has(file.id);
+
+      const seriesTag =
+        seriesCount >= 2
+          ? `<span class="core-series-tag" data-action="filter-core" data-core="${escapeHtml(coreName)}" title="点击仅看同词根系列 (${seriesCount}个)">×${seriesCount}${state.coreNameFilter === coreName ? '✓' : ''}</span>`
+          : '';
+
+      const fullHoverTitle = [
+        file.name || '(无名称)',
+        ownerEmail ? `所属账号: ${ownerEmail}` : '',
+        file.modifiedTime ? `修改时间: ${formatTime(file.modifiedTime)}` : ''
+      ]
+        .filter(Boolean)
+        .join(' | ');
+
+      if (file.permissionsLoading) {
+        return `<tr class="compact-row">
+          <td>
+            <input type="checkbox" class="row-check" data-file-id="${escapeHtml(file.id)}" ${isSelected ? 'checked' : ''}>
+          </td>
+          <td>
+            <div class="single-line-cell" title="${escapeHtml(fullHoverTitle)}">
+              <span class="badge type-${escapeHtml(detCat)}">${escapeHtml(fileCategoryLabel(file.mimeType, file.name))}</span>
+              ${isNew ? '<span class="badge new-tag">新</span>' : ''}
+              <a class="file-name-nowrap" href="${escapeHtml(file.webViewLink || '#')}" target="_blank" rel="noreferrer">${escapeHtml(file.name || '(无名称)')}</a>
+              ${seriesTag}
+            </div>
+          </td>
+          <td><span class="status-pill private">⏳ 待扫描权限</span></td>
+          <td><span class="muted">正在读取权限明细…</span></td>
+          <td><span class="muted">-</span></td>
+        </tr>`;
+      }
+
+      const stat = evaluateFile(file, state.policy, ownerEmail);
       const coverages = getFileGroupCoverage(file, state.directory);
 
-      const groupBadgesHtml = coverages.length
-        ? `<div class="group-coverage-list">${coverages
-            .map(
-              c =>
-                `<span class="group-cov-badge ${c.status === 'partial' ? 'partial' : ''}" title="${escapeHtml(c.groupName)}: 已授权 ${c.grantedCount}/${c.totalCount} 人">👥 ${escapeHtml(c.groupName)} (${c.grantedCount}/${c.totalCount})</span>`
-            )
-            .join('')}</div>`
-        : '';
+      const groupBadgesHtml = coverages
+        .map(
+          c =>
+            `<span class="group-cov-badge ${c.status === 'partial' ? 'partial' : ''}" title="${escapeHtml(c.groupName)}: 已授权 ${c.grantedCount}/${c.totalCount} 人">${escapeHtml(c.groupName)}(${c.grantedCount}/${c.totalCount})</span>`
+        )
+        .join('');
 
       let statusBadges = '';
       if (!stat.hasNonOwner) {
-        statusBadges = '<span class="status-pill private">仅自己可见</span>';
+        statusBadges = '<span class="status-pill private">仅自己</span>';
       } else {
         const pills = [];
-        if (stat.removeCount > 0) pills.push(`<span class="status-pill danger">非白名单 ${stat.removeCount}</span>`);
-        if (stat.downgradeCount > 0) pills.push(`<span class="status-pill warning">越权编辑 ${stat.downgradeCount}</span>`);
+        if (stat.removeCount > 0) pills.push(`<span class="status-pill danger">违规 ${stat.removeCount}</span>`);
+        if (stat.downgradeCount > 0) pills.push(`<span class="status-pill warning">越权 ${stat.downgradeCount}</span>`);
         if (!stat.hasActionableViolation) pills.push(`<span class="status-pill ok">✓ 合规</span>`);
         statusBadges = pills.join('');
       }
 
-      const seriesTag =
-        seriesCount >= 2
-          ? `<span class="core-series-tag" data-action="filter-core" data-core="${escapeHtml(coreName)}" title="点击仅看同词根系列 (${seriesCount}个)">同系列×${seriesCount}${state.coreNameFilter === coreName ? ' (已筛·点此取消)' : ''}</span>`
+      const perms = file.permissions || [];
+      const nonOwnerPerms = perms.filter(
+        p => p.role !== 'owner' && normalizeEntry(p.emailAddress || '') !== normalizeEntry(ownerEmail)
+      );
+      let writerCount = 0;
+      let readerCount = 0;
+      let publicCount = 0;
+      for (const p of nonOwnerPerms) {
+        if (p.type === 'anyone' || p.type === 'domain') publicCount++;
+        if (p.role === 'reader' || p.role === 'commenter') readerCount++;
+        else writerCount++;
+      }
+
+      let permsCellHtml = '';
+      if (file.permissionError) {
+        permsCellHtml = `<span class="muted">${escapeHtml(file.permissionError)}</span>`;
+      } else if (nonOwnerPerms.length === 0) {
+        permsCellHtml = `<span class="muted">未共享 (仅所有者 1 人)</span>`;
+      } else {
+        const summaryLine = `<div class="perm-summary-line">
+          <span class="perm-count-badge">共 <strong>${nonOwnerPerms.length}</strong> 个授权</span>
+          <span class="muted">（编辑 ${writerCount} · 查看 ${readerCount}${publicCount > 0 ? ` · 公开 ${publicCount}` : ''}）</span>
+          <button type="button" class="btn-link" data-action="toggle-file-perms" data-file-id="${escapeHtml(file.id)}">${
+            isExpanded ? '收起 ▴' : `展开明细 (${nonOwnerPerms.length}) ▾`
+          }</button>
+        </div>`;
+
+        const expandedChips = isExpanded
+          ? `<div class="perm-list" style="margin-top:6px;">${perms.map(p => renderPermissionChip(file.id, p, ownerEmail)).join('')}</div>`
           : '';
 
-      const perms = file.permissions || [];
-      const chipsHtml = perms.length
-        ? `<div class="perm-list">${perms.map(p => renderPermissionChip(file.id, p, ownerEmail)).join('')}</div>`
-        : `<span class="muted">${escapeHtml(file.permissionError || '无直接权限明细')}</span>`;
+        permsCellHtml = summaryLine + expandedChips;
+      }
 
       const rowActions = [];
       if (stat.hasActionableViolation) {
         rowActions.push(
-          `<button type="button" class="btn warning btn-xs" data-action="enforce-single" data-file-id="${escapeHtml(file.id)}">一键合规</button>`
+          `<button type="button" class="btn warning btn-xs" data-action="enforce-single" data-file-id="${escapeHtml(file.id)}">合规</button>`
         );
       }
       rowActions.push(
         `<button type="button" class="btn btn-xs" data-action="add-single-perm" data-file-id="${escapeHtml(file.id)}">+加人</button>`
       );
 
-      return `<tr>
+      return `<tr class="compact-row">
         <td>
           <input type="checkbox" class="row-check" data-file-id="${escapeHtml(file.id)}" ${isSelected ? 'checked' : ''}>
         </td>
         <td>
-          <div class="file-title-row">
+          <div class="single-line-cell" title="${escapeHtml(fullHoverTitle)}">
             <span class="badge type-${escapeHtml(detCat)}">${escapeHtml(fileCategoryLabel(file.mimeType, file.name))}</span>
-            ${isNew ? '<span class="badge new-tag">新增</span>' : ''}
-            <a class="file-name" href="${escapeHtml(file.webViewLink || '#')}" target="_blank" rel="noreferrer">${escapeHtml(file.name || '(无名称)')}</a>
-          </div>
-          <div class="file-sub">
-            ${ownerEmail && state.accounts.length > 1 ? `<span>账号: ${escapeHtml(ownerEmail)}</span>` : ''}
-            <span>修改: ${escapeHtml(formatTime(file.modifiedTime))}</span>
+            ${isNew ? '<span class="badge new-tag">新</span>' : ''}
+            <a class="file-name-nowrap" href="${escapeHtml(file.webViewLink || '#')}" target="_blank" rel="noreferrer">${escapeHtml(file.name || '(无名称)')}</a>
             ${seriesTag}
           </div>
         </td>
         <td>
-          ${groupBadgesHtml}
-          <div>${statusBadges}</div>
+          <div class="single-line-cell">${groupBadgesHtml}${statusBadges}</div>
         </td>
-        <td>${chipsHtml}</td>
+        <td>${permsCellHtml}</td>
         <td>
-          <div class="row-actions">${rowActions.join('')}</div>
+          <div class="row-actions-inline">${rowActions.join('')}</div>
         </td>
       </tr>`;
     })
@@ -961,9 +1057,15 @@ async function handleScan(targetAccount = state.activeAccount) {
       targetAccount: targetAccount || 'all',
       onProgress(info) {
         if (info?.message) $('progress').textContent = info.message;
+      },
+      onPartialFiles(liveFiles) {
+        state.files = liveFiles;
+        updateTopBadges();
+        renderFilesTab();
       }
     });
     state.accounts = res.accounts;
+    state.oauthClients = await getOAuthClients();
     state.policy = res.policy;
     state.files = res.snapshot.files || [];
     state.newFileIds = new Set(res.snapshot.newFileIds || []);
@@ -1648,7 +1750,15 @@ async function init() {
     if (!elNode) return;
     const action = elNode.dataset.action;
 
-    if (action === 'filter-core') {
+    if (action === 'toggle-file-perms') {
+      const fid = elNode.dataset.fileId;
+      if (state.expandedPermFileIds.has(fid)) {
+        state.expandedPermFileIds.delete(fid);
+      } else {
+        state.expandedPermFileIds.add(fid);
+      }
+      renderFilesTab();
+    } else if (action === 'filter-core') {
       const core = elNode.dataset.core;
       state.coreNameFilter = state.coreNameFilter === core ? '' : core;
       renderFilesTab();
@@ -1975,7 +2085,18 @@ async function init() {
     if (!btn) return;
     const action = btn.dataset.action;
 
-    if (action === 'remove-account') {
+    if (action === 'auth-oauth-client') {
+      const uid = btn.dataset.uid;
+      const client = state.oauthClients.find(c => (c.uid || c.client_id) === uid);
+      if (client) {
+        await handleAuthorizeWithClient(client);
+      }
+    } else if (action === 'remove-oauth-client') {
+      const uid = btn.dataset.uid;
+      state.oauthClients = await removeOAuthClient(uid);
+      renderAll();
+      toast('已移除该 OAuth JSON 凭证');
+    } else if (action === 'remove-account') {
       state.accounts = await removeAuthorizedAccount(btn.dataset.email);
       if (state.activeAccount === btn.dataset.email) state.activeAccount = 'all';
       renderAll();

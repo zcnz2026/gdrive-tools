@@ -421,23 +421,28 @@ function pickRedirectUri(uris = []) {
   return 'http://localhost';
 }
 
-function extractOAuthClientsFromJson(parsed) {
+function extractOAuthClientsFromJson(parsed, fileName = '') {
   if (!parsed || typeof parsed !== 'object') return [];
   const items = Array.isArray(parsed) ? parsed : [parsed];
   const clients = [];
 
-  for (const item of items) {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
     if (!item || typeof item !== 'object') continue;
     const raw = item.installed || item.web || (item.client_id && item.client_secret ? item : null);
     if (raw && raw.client_id && raw.client_secret) {
+      const clientId = String(raw.client_id).trim();
       clients.push({
-        client_id: String(raw.client_id).trim(),
+        uid: `cred_${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${i}`,
+        fileName: fileName || `oauth_${i + 1}.json`,
+        client_id: clientId,
         client_secret: String(raw.client_secret).trim(),
         project_id: String(raw.project_id || '').trim(),
         auth_uri: raw.auth_uri || 'https://accounts.google.com/o/oauth2/v2/auth',
         token_uri: raw.token_uri || 'https://oauth2.googleapis.com/token',
         redirect_uri: pickRedirectUri(raw.redirect_uris),
         client_type: item.installed ? 'installed' : item.web ? 'web' : 'custom',
+        boundEmail: '',
         importedAt: new Date().toISOString()
       });
     }
@@ -453,14 +458,27 @@ async function getOAuthClients() {
 async function saveOAuthClients(newClients) {
   const list = Array.isArray(newClients) ? newClients : [newClients];
   const current = await getOAuthClients();
-  const map = new Map();
-  for (const c of current) map.set(c.client_id, c);
+  const merged = [...current];
+
   for (const c of list) {
-    if (c && c.client_id) map.set(c.client_id, c);
+    if (!c || !c.client_id) continue;
+    const uid = c.uid || `cred_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const idx = merged.findIndex(x => (x.uid && x.uid === uid) || (!x.uid && x.client_id === c.client_id && x.fileName === c.fileName));
+    if (idx >= 0) {
+      merged[idx] = { ...merged[idx], ...c, uid: merged[idx].uid || uid };
+    } else {
+      merged.push({ ...c, uid });
+    }
   }
-  const merged = [...map.values()];
   await chrome.storage.local.set({ oauthClients: merged });
   return merged;
+}
+
+async function removeOAuthClient(uidOrClientId) {
+  const current = await getOAuthClients();
+  const next = current.filter(c => (c.uid || c.client_id) !== uidOrClientId);
+  await chrome.storage.local.set({ oauthClients: next });
+  return next;
 }
 
 async function getAuthorizedAccounts() {
@@ -680,6 +698,7 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
   const savedAccount = await saveAuthorizedAccount({
     email: about.email,
     displayName: about.displayName || '',
+    clientUid: client.uid || '',
     clientId: client.client_id,
     clientSecret: client.client_secret,
     projectId: client.project_id || '',
@@ -690,6 +709,15 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
     expiresAt: Date.now() + (Number(tokenData.expires_in) || 3500) * 1000,
     authorizedAt: new Date().toISOString()
   });
+
+  if (client.uid) {
+    const allClients = await getOAuthClients();
+    const targetClient = allClients.find(c => c.uid === client.uid);
+    if (targetClient) {
+      targetClient.boundEmail = savedAccount.email;
+      await chrome.storage.local.set({ oauthClients: allClients });
+    }
+  }
 
   return savedAccount;
 }
@@ -1448,9 +1476,9 @@ async function enforceFilesByPolicy(fallbackToken, files, policy, fallbackOwnerE
 }
 
 /**
- * 扫描单个账号下的所有文件与权限
+ * 扫描单个账号下的所有文件与权限（支持流式边扫边展示回调 onPartialFiles）
  */
-async function scanSingleAccount(accountEmail, token, onProgress = null, accountPrefix = '') {
+async function scanSingleAccount(accountEmail, token, onProgress = null, accountPrefix = '', onPartialFiles = null) {
   let files = [];
   let pageToken = '';
 
@@ -1458,7 +1486,7 @@ async function scanSingleAccount(accountEmail, token, onProgress = null, account
     const params = new URLSearchParams({
       q: "'me' in owners and trashed = false",
       corpora: 'user',
-      pageSize: '1000',
+      pageSize: '200',
       supportsAllDrives: 'true',
       includeItemsFromAllDrives: 'true',
       fields:
@@ -1466,25 +1494,31 @@ async function scanSingleAccount(accountEmail, token, onProgress = null, account
     });
     if (pageToken) params.set('pageToken', pageToken);
     const data = await driveApi(token, `/files?${params}`);
-    files.push(...(data.files || []));
+    const pageItems = (data.files || []).filter(file => file.ownedByMe !== false);
+    for (const file of pageItems) {
+      file.ownerAccount = normalizeEntry(accountEmail || file.owners?.[0]?.emailAddress || '');
+      file.permissions = [];
+      file.permissionsLoading = true;
+    }
+    files.push(...pageItems);
     pageToken = data.nextPageToken || '';
     if (onProgress) {
       onProgress({
         phase: 'files',
         count: files.length,
-        message: `${accountPrefix}已找到 ${files.length} 个文件…`
+        message: `${accountPrefix}已发现 ${files.length} 个文件，正在边读边展示…`
       });
+    }
+    if (onPartialFiles) {
+      onPartialFiles(files);
     }
   } while (pageToken);
 
-  files = files.filter(file => file.ownedByMe !== false);
-  for (const file of files) {
-    file.ownerAccount = normalizeEntry(accountEmail || file.owners?.[0]?.emailAddress || '');
-  }
-
   let cursor = 0;
   let finished = 0;
-  const workers = Array.from({ length: 8 }, async () => {
+  let lastEmitAt = 0;
+
+  const workers = Array.from({ length: 10 }, async () => {
     while (cursor < files.length) {
       const index = cursor++;
       const file = files[index];
@@ -1508,15 +1542,25 @@ async function scanSingleAccount(accountEmail, token, onProgress = null, account
       } catch (error) {
         file.permissions = [];
         file.permissionError = error.message;
+      } finally {
+        file.permissionsLoading = false;
       }
       finished++;
-      if (onProgress && (finished % 15 === 0 || finished === files.length)) {
-        onProgress({
-          phase: 'permissions',
-          finished,
-          total: files.length,
-          message: `${accountPrefix}正在读取权限 ${finished}/${files.length}…`
-        });
+
+      const now = Date.now();
+      if (finished % 5 === 0 || finished === files.length || now - lastEmitAt >= 300) {
+        lastEmitAt = now;
+        if (onProgress) {
+          onProgress({
+            phase: 'permissions',
+            finished,
+            total: files.length,
+            message: `${accountPrefix}正在读取权限 ${finished}/${files.length}…`
+          });
+        }
+        if (onPartialFiles) {
+          onPartialFiles(files);
+        }
       }
     }
   });
@@ -1526,9 +1570,15 @@ async function scanSingleAccount(accountEmail, token, onProgress = null, account
 }
 
 /**
- * 执行完整扫描
+ * 执行完整扫描（支持多账号并发 & 边扫边展示 onPartialFiles）
  */
-async function runFullScan({ interactive = false, source = 'manual', targetAccount = 'all', onProgress = null } = {}) {
+async function runFullScan({
+  interactive = false,
+  source = 'manual',
+  targetAccount = 'all',
+  onProgress = null,
+  onPartialFiles = null
+} = {}) {
   const policy = await getPolicy();
   const prevSnapshot = await getSnapshot();
   const accounts = await getAuthorizedAccounts();
@@ -1557,23 +1607,42 @@ async function runFullScan({ interactive = false, source = 'manual', targetAccou
     }
   }
 
-  let scannedFiles = [];
-  for (let i = 0; i < targetAccounts.length; i++) {
-    const acc = targetAccounts[i];
-    const prefix = targetAccounts.length > 1 ? `[账号 ${i + 1}/${targetAccounts.length}: ${acc.email}] ` : '';
-    const token = await getValidTokenForAccount(acc.email, interactive);
-    const accFiles = await scanSingleAccount(acc.email, token, onProgress, prefix);
-    scannedFiles.push(...accFiles);
-  }
+  const scannedAccountSet = new Set(targetAccounts.map(a => normalizeEntry(a.email)));
+  const otherAccountFiles =
+    targetAccount !== 'all' && prevSnapshot.files?.length
+      ? prevSnapshot.files.filter(f => f.ownerAccount && !scannedAccountSet.has(normalizeEntry(f.ownerAccount)))
+      : [];
 
-  let mergedFiles = scannedFiles;
-  if (targetAccount !== 'all' && prevSnapshot.files?.length) {
-    const scannedAccountSet = new Set(targetAccounts.map(a => normalizeEntry(a.email)));
-    const otherAccountFiles = prevSnapshot.files.filter(
-      f => f.ownerAccount && !scannedAccountSet.has(normalizeEntry(f.ownerAccount))
-    );
-    mergedFiles = [...scannedFiles, ...otherAccountFiles];
-  }
+  const perAccountFiles = new Map();
+
+  const emitPartialCombined = () => {
+    if (!onPartialFiles) return;
+    const combined = [];
+    for (const list of perAccountFiles.values()) combined.push(...list);
+    combined.push(...otherAccountFiles);
+    for (const file of combined) {
+      file.isNew = (!isFirstScan && !knownSet.has(file.id)) || prevNewSet.has(file.id);
+    }
+    onPartialFiles(combined);
+  };
+
+  // 多账号多线程并发扫描
+  await Promise.all(
+    targetAccounts.map(async (acc, i) => {
+      const prefix = targetAccounts.length > 1 ? `[${acc.email}] ` : '';
+      const token = await getValidTokenForAccount(acc.email, interactive);
+      const accFiles = await scanSingleAccount(acc.email, token, onProgress, prefix, partialList => {
+        perAccountFiles.set(acc.email, partialList);
+        emitPartialCombined();
+      });
+      perAccountFiles.set(acc.email, accFiles);
+      emitPartialCombined();
+    })
+  );
+
+  let mergedFiles = [];
+  for (const list of perAccountFiles.values()) mergedFiles.push(...list);
+  mergedFiles.push(...otherAccountFiles);
 
   const newlyDiscoveredIds = [];
   for (const file of mergedFiles) {
