@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Google Drive 权限管理中心</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="app-shell">
+    <!-- 顶部全局状态与操作栏 -->
+    <header class="topbar">
+      <div class="brand-group">
+        <p class="eyebrow">GOOGLE DRIVE ACCESS GUARD</p>
+        <div class="title-row">
+          <h1>权限管理与自动巡检中心</h1>
+          <span id="status" class="status">未连接</span>
+          <span id="schedule-badge" class="schedule-pill">⏱️ 定时巡检：未开启</span>
+        </div>
+        <p id="account" class="muted">授权后自动读取当前账号拥有的全部文件与表格，支持双层白名单与越权自动降级。</p>
+      </div>
+
+      <div class="toolbar">
+        <button id="connect" class="btn">授权 / 刷新令牌</button>
+        <button id="scan" class="btn primary" disabled>立即扫描全部文件</button>
+        <button id="quick-enforce-all" class="btn warning" disabled>⚡ 一键修正全部异常 (0)</button>
+        <button id="export" class="btn" disabled>导出 CSV</button>
+      </div>
+    </header>
+
+    <!-- 扫描进度条与状态提示 -->
+    <div id="progress-bar-wrap" class="progress-banner">
+      <span id="progress">等待扫描（若已有上次缓存结果将自动加载）</span>
+      <div class="progress-actions">
+        <button id="clear-new-flags" class="btn-link hidden">已知悉新增文件（清除 NEW 标记）</button>
+      </div>
+    </div>
+
+    <!-- 交互式统计看板（点击卡片快速筛选） -->
+    <section class="summary-grid" id="summary">
+      <button type="button" class="summary-card active" data-card-filter="all">
+        <strong id="stat-total">0</strong>
+        <span>全部文件</span>
+      </button>
+      <button type="button" class="summary-card" data-card-filter="shared">
+        <strong id="stat-shared">0</strong>
+        <span>🔗 已共享文件</span>
+      </button>
+      <button type="button" class="summary-card danger-card" data-card-filter="unauthorized">
+        <strong id="stat-unauthorized">0</strong>
+        <span>🔴 含非白名单 (待移除)</span>
+      </button>
+      <button type="button" class="summary-card warning-card" data-card-filter="overprivileged">
+        <strong id="stat-overprivileged">0</strong>
+        <span>🟠 含越权编辑 (待降只读)</span>
+      </button>
+      <button type="button" class="summary-card" data-card-filter="public">
+        <strong id="stat-public">0</strong>
+        <span>🌐 公开 / 域内共享</span>
+      </button>
+      <button type="button" class="summary-card new-card" data-card-filter="new">
+        <strong id="stat-new">0</strong>
+        <span>🆕 新增文件/表格</span>
+      </button>
+    </section>
+
+    <!-- 四大核心工作区标签切换 -->
+    <nav class="tabs-nav" role="tablist">
+      <button type="button" class="tab-btn active" data-tab="files">
+        📋 按文件管理 <span id="tab-count-files" class="tab-badge">0</span>
+      </button>
+      <button type="button" class="tab-btn" data-tab="collaborators">
+        👤 按协作者管理 <span id="tab-count-collabs" class="tab-badge">0</span>
+      </button>
+      <button type="button" class="tab-btn" data-tab="policy">
+        🛡️ 白名单与定期扫描设置 <span id="tab-count-policy" class="tab-badge">0</span>
+      </button>
+      <button type="button" class="tab-btn" data-tab="logs">
+        🕒 巡检与操作日志 <span id="tab-count-logs" class="tab-badge">0</span>
+      </button>
+    </nav>
+
+    <!-- ==================== TAB 1: 按文件管理 ==================== -->
+    <section id="panel-files" class="tab-panel active">
+      <div class="filter-bar">
+        <input id="file-search" type="search" class="input search-input" placeholder="搜索文件名、文件 ID 或协作者邮箱…">
+        <select id="file-type-filter" class="select">
+          <option value="all">全部文件类型</option>
+          <option value="sheet">📊 仅 Google 表格 (Sheets)</option>
+          <option value="folder">📁 仅文件夹 (Folders)</option>
+          <option value="doc">📝 仅 Google 文档 (Docs)</option>
+          <option value="slide">📽️ 仅幻灯片 (Slides)</option>
+          <option value="other">📄 其他类型文件</option>
+        </select>
+        <select id="file-status-filter" class="select">
+          <option value="all">全部权限状态</option>
+          <option value="anomaly">⚠️ 仅看有异常（非白名单 + 越权）</option>
+          <option value="unauthorized">🔴 仅看含非白名单（需移除）</option>
+          <option value="overprivileged">🟠 仅看含越权编辑（需降只读）</option>
+          <option value="public">🌐 仅看公开 / 域内共享</option>
+          <option value="shared">🔗 仅看有共享的文件</option>
+          <option value="new">🆕 仅看新增文件</option>
+        </select>
+        <label class="checkbox-inline">
+          <input id="hide-private" type="checkbox"> 隐藏仅自己可见的文件
+        </label>
+      </div>
+
+      <div class="batch-bar">
+        <div class="batch-left">
+          <label class="checkbox-inline">
+            <input id="select-all" type="checkbox" disabled> 全选当前筛选 (<span id="selected-count">0</span>)
+          </label>
+        </div>
+        <div class="batch-actions">
+          <button id="batch-enforce" class="btn warning btn-sm" disabled title="自动移除非白名单人员，并将只读白名单中的编辑者降级为只读">
+            ⚡ 按白名单规则修正选中文件
+          </button>
+          <button id="batch-downgrade-all" class="btn btn-sm" disabled title="将选中文件中所有可管理的编辑者/评论者统一降为只读">
+            👁️ 全部协作者降为只读
+          </button>
+          <button id="batch-remove-public" class="btn btn-sm" disabled title="仅移除公开链接与域内链接，保留指定协作者">
+            🚫 关闭公开/域内链接
+          </button>
+          <button id="batch-revoke-all" class="btn danger btn-sm" disabled title="移除选中文件中所有非所有者的直接权限">
+            🗑️ 清空所有共享权限
+          </button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th style="width: 36px;"></th>
+              <th style="width: 28%;">文件名称 / 类型</th>
+              <th style="width: 14%;">合规状态</th>
+              <th>权限明细与行内快捷操作（可直接改角色 / 移除 / 加白名单）</th>
+              <th style="width: 150px;">单文件操作</th>
+            </tr>
+          </thead>
+          <tbody id="file-rows">
+            <tr><td colspan="5" class="empty">点击上方「授权」并「立即扫描全部文件」开始管理</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 2: 按协作者管理 ==================== -->
+    <section id="panel-collaborators" class="tab-panel">
+      <div class="filter-bar">
+        <input id="collab-search" type="search" class="input search-input" placeholder="搜索协作者邮箱或名称…">
+        <select id="collab-filter" class="select">
+          <option value="all">全部协作者</option>
+          <option value="stranger">🔴 未在白名单（违规）</option>
+          <option value="overprivileged">🟠 仅查看白名单但拥有编辑权（越权）</option>
+          <option value="writer_list">✏️ 允许编辑白名单成员</option>
+          <option value="reader_list">👁️ 仅限查看白名单成员</option>
+        </select>
+        <div class="filter-spacer"></div>
+        <button id="trust-all-current-writers" class="btn btn-sm" title="将当前所有协作者按其最高权限自动录入白名单">
+          📥 将当前协作者一键导入白名单
+        </button>
+      </div>
+
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>协作者邮箱 / 标识</th>
+              <th>白名单身份（点击可直接切换）</th>
+              <th>访问文件统计</th>
+              <th>当前合规状态</th>
+              <th style="width: 280px;">对此人批量操作</th>
+            </tr>
+          </thead>
+          <tbody id="collab-rows">
+            <tr><td colspan="5" class="empty">扫描后将在此按人员汇总所有协作者</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 3: 白名单与定期扫描设置 ==================== -->
+    <section id="panel-policy" class="tab-panel">
+      <div class="policy-grid">
+        <!-- 定期扫描与自动化配置 -->
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h2>⏱️ 定期扫描与自动化处置</h2>
+              <p class="muted">自动巡检账号下的所有文件（包括新创建的表格/文档），发现权限偏离白名单时自动提醒或修正。</p>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="switch-row">
+              <input id="policy-schedule-enabled" type="checkbox">
+              <span class="switch-title">开启后台定期自动扫描</span>
+            </label>
+          </div>
+
+          <div class="form-row">
+            <label for="policy-schedule-minutes">扫描间隔频率：</label>
+            <select id="policy-schedule-minutes" class="select">
+              <option value="15">每 15 分钟</option>
+              <option value="30">每 30 分钟</option>
+              <option value="60">每 1 小时（推荐）</option>
+              <option value="360">每 6 小时</option>
+              <option value="720">每 12 小时</option>
+              <option value="1440">每 24 小时（每天）</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <p class="form-label">发现违规/越权权限时的处置方式：</p>
+            <label class="radio-card">
+              <input type="radio" name="auto-enforce-mode" value="alert" checked>
+              <div>
+                <strong>🔔 仅告警提醒模式（人工确认）</strong>
+                <p class="muted">后台发现非白名单人员或越权编辑时，在插件图标显示红色角标并弹出桌面通知，由你打开面板一键确认修正。</p>
+              </div>
+            </label>
+            <label class="radio-card">
+              <input type="radio" name="auto-enforce-mode" value="enforce">
+              <div>
+                <strong>⚡ 后台全自动修正模式（自动撤权 & 越权降只读 + 留存日志）</strong>
+                <p class="muted">定时扫描发现不在白名单的人直接移除；发现「仅限查看」名单的人拥有编辑权自动降级为只读；所有变更记录在日志中并支持一键恢复。</p>
+              </div>
+            </label>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="policy-public-rule">公开链接（任何人 / 域内共享）管控策略：</label>
+            <select id="policy-public-rule" class="select full-width">
+              <option value="forbid">🚫 禁止任何公开/域内链接（发现即标记为违规移除）</option>
+              <option value="reader_only">👁️ 公开/域内链接最高仅允许只读（发现公开可编辑自动降为只读）</option>
+              <option value="allow">⚪ 不限制公开/域内链接（忽略公开链接检查）</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- 双层白名单配置 -->
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h2>🛡️ 双层权限白名单（可编辑 vs 仅查看）</h2>
+              <p class="muted">支持完整邮箱（如 <code>user@example.com</code>）或域名通配（如 <code>@company.com</code>）。配置自动保存在本地。</p>
+            </div>
+            <div class="json-actions">
+              <label class="btn btn-sm file-label">
+                📥 导入 JSON
+                <input id="json-file" type="file" accept="application/json,.json">
+              </label>
+              <button id="export-policy-json" type="button" class="btn btn-sm">📤 导出 JSON</button>
+            </div>
+          </div>
+
+          <div class="allowlist-columns">
+            <!-- 允许编辑白名单 -->
+            <div class="allowlist-box writer-box">
+              <div class="box-title">
+                <strong>✏️ 允许编辑白名单 (Writers)</strong>
+                <span id="writers-count" class="badge">0</span>
+              </div>
+              <p class="muted">此名单成员允许拥有「可编辑」、「可评论」或「仅查看」权限。</p>
+              <div class="add-row">
+                <input id="add-writer-input" type="text" class="input" placeholder="输入邮箱或 @域名，多个用逗号分隔">
+                <button id="add-writer-btn" type="button" class="btn btn-sm primary">添加</button>
+              </div>
+              <div id="writers-list" class="tag-list"></div>
+            </div>
+
+            <!-- 仅限查看白名单 -->
+            <div class="allowlist-box reader-box">
+              <div class="box-title">
+                <strong>👁️ 仅限查看白名单 (Readers)</strong>
+                <span id="readers-count" class="badge">0</span>
+              </div>
+              <p class="muted">此名单成员最高仅允许「仅查看」。若拥有编辑权将被自动识别为<strong>越权</strong>并降为只读。</p>
+              <div class="add-row">
+                <input id="add-reader-input" type="text" class="input" placeholder="输入邮箱或 @域名，多个用逗号分隔">
+                <button id="add-reader-btn" type="button" class="btn btn-sm primary">添加</button>
+              </div>
+              <div id="readers-list" class="tag-list"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 4: 巡检与操作日志 ==================== -->
+    <section id="panel-logs" class="tab-panel">
+      <div class="filter-bar">
+        <select id="log-filter" class="select">
+          <option value="all">全部记录</option>
+          <option value="auto">⚡ 仅看自动守护操作</option>
+          <option value="manual">👆 仅看手动操作</option>
+          <option value="scan">⏱️ 仅看定时巡检汇总</option>
+        </select>
+        <div class="filter-spacer"></div>
+        <button id="clear-logs-btn" class="btn btn-sm">清空历史日志</button>
+      </div>
+
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th style="width: 155px;">时间</th>
+              <th style="width: 110px;">来源</th>
+              <th style="width: 22%;">文件名称</th>
+              <th style="width: 18%;">目标对象</th>
+              <th>变更详情</th>
+              <th style="width: 130px;">回滚操作</th>
+            </tr>
+          </thead>
+          <tbody id="log-rows">
+            <tr><td colspan="6" class="empty">暂无操作与巡检记录</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <div id="toast" role="status"></div>
+  </main>
+
+  <script src="core.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
