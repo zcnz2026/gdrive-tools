@@ -263,6 +263,43 @@
               </div>
             </div>
 
+            <!-- 板块 2.5：批量输入链接 + 批量邮箱直通授权（浅绿板块） -->
+            <div class="section-block block-green">
+              <div class="block-header">
+                <h2>批量链接授权（输入一批链接 + 一批邮箱）</h2>
+                <span id="batch-links-parsed-info" class="meta-tag">0 链接 · 0 邮箱</span>
+              </div>
+
+              <div class="field-group">
+                <label class="field-label">1. 批量输入文件 / 表格 / 文件夹链接（每行一个）</label>
+                <textarea id="batch-links-input" class="textarea" rows="3" placeholder="粘贴一批 Google 表格/文档/文件夹链接或文件 ID（每行一个）…"></textarea>
+              </div>
+
+              <div class="field-group">
+                <div class="field-label-between">
+                  <span>2. 批量输入目标邮箱（支持直接粘贴「姓名+邮箱」）</span>
+                  <select id="batch-links-fill-group" class="select select-sm" style="padding: 1px 6px; font-size: 11px;">
+                    <option value="">+从分组带入邮箱…</option>
+                  </select>
+                </div>
+                <textarea id="batch-emails-input" class="textarea" rows="3" placeholder="粘贴一批邮箱（每行一个、逗号分隔，或从表格复制两列粘贴）…"></textarea>
+              </div>
+
+              <div class="row-flex" style="margin-top: 6px;">
+                <select id="batch-links-role" class="select">
+                  <option value="reader">权限：查看 (仅查看)</option>
+                  <option value="writer">权限：编辑 (可编辑)</option>
+                  <option value="commenter">权限：评论 (可评论)</option>
+                </select>
+                <button id="batch-links-grant-btn" type="button" class="btn primary grow">
+                  批量开权限
+                </button>
+                <button id="batch-links-revoke-btn" type="button" class="btn danger btn-sm" title="移除这些邮箱在上述链接中的权限">
+                  关闭权限
+                </button>
+              </div>
+            </div>
+
             <!-- 板块 3：快捷权限清理（浅暖杏色板块） -->
             <div class="section-block block-amber">
               <div class="block-header">

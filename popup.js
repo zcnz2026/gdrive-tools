@@ -722,6 +722,17 @@ function renderGroupSelectorsAndBatchBar() {
     sheetPicker.value = prevSheet;
   }
 
+  // 7. #batch-links-fill-group（批量链接授权区的分组快捷带入）
+  const fillGrpSel = $('batch-links-fill-group');
+  if (fillGrpSel) {
+    fillGrpSel.innerHTML = [
+      `<option value="">+从分组带入邮箱…</option>`,
+      ...groups.map(
+        g => `<option value="${escapeHtml(g.name)}">${escapeHtml(g.name)} (${groupCountMap.get(g.name) || 0}人)</option>`
+      )
+    ].join('');
+  }
+
   updateBatchButtons();
 }
 
@@ -1881,6 +1892,97 @@ async function init() {
   $('batch-downgrade-all').addEventListener('click', () => handleBatchQuickAction('downgrade_all'));
   $('batch-remove-public').addEventListener('click', () => handleBatchQuickAction('remove_public'));
   $('batch-revoke-all').addEventListener('click', () => handleBatchQuickAction('revoke_all'));
+
+  // 5.5 批量输入链接 + 批量邮箱直通授权/关闭权限
+  const updateBatchLinksParsedInfo = () => {
+    const fileIds = parseDriveLinksInput($('batch-links-input')?.value || '');
+    const emails = parseEmailsInput($('batch-emails-input')?.value || '');
+    if ($('batch-links-parsed-info')) {
+      $('batch-links-parsed-info').textContent = `${fileIds.length} 链接 · ${emails.length} 邮箱`;
+    }
+  };
+
+  $('batch-links-input').addEventListener('input', updateBatchLinksParsedInfo);
+  $('batch-emails-input').addEventListener('input', updateBatchLinksParsedInfo);
+
+  $('batch-links-fill-group').addEventListener('change', e => {
+    const gName = e.target.value;
+    if (!gName) return;
+    const members = (state.directory.contacts || [])
+      .filter(c => (c.groups || []).includes(gName))
+      .map(c => normalizeEntry(c.email));
+    if (!members.length) {
+      toast(`分组「${gName}」暂无成员邮箱`);
+      e.target.value = '';
+      return;
+    }
+    const existingEmails = parseEmailsInput($('batch-emails-input').value || '');
+    const merged = [...new Set([...existingEmails, ...members])];
+    $('batch-emails-input').value = merged.join('\n');
+    e.target.value = '';
+    updateBatchLinksParsedInfo();
+    toast(`已带入「${gName}」共 ${members.length} 个邮箱`);
+  });
+
+  const handleBatchLinksAction = async (mode = 'grant') => {
+    const fileIds = parseDriveLinksInput($('batch-links-input').value || '');
+    const emails = parseEmailsInput($('batch-emails-input').value || '');
+    const role = $('batch-links-role').value || 'reader';
+
+    if (!fileIds.length) {
+      toast('请先在上方输入框粘贴至少 1 个 Google 文件或文件夹链接');
+      return;
+    }
+    if (!emails.length) {
+      toast('请先输入至少 1 个目标邮箱（或从分组带入）');
+      return;
+    }
+
+    const actionDesc =
+      mode === 'grant'
+        ? `批量开通「${roleLabel(role)}」权限`
+        : '批量关闭/移除这些邮箱的权限';
+
+    if (
+      !confirm(
+        `确认对已识别的 ${fileIds.length} 个链接、${emails.length} 个邮箱执行：\n「${actionDesc}」？\n（全程静默处理，不发送骚扰邮件通知）`
+      )
+    ) {
+      return;
+    }
+
+    $('batch-links-grant-btn').disabled = true;
+    $('batch-links-revoke-btn').disabled = true;
+    $('progress').textContent = `正在启动批量链接权限处理…`;
+
+    try {
+      const res = await executeBatchLinksPermissions({
+        fileIds,
+        emails,
+        role,
+        mode,
+        existingFiles: state.files,
+        targetAccount: state.activeAccount,
+        onProgress(p) {
+          if (p?.message) $('progress').textContent = p.message;
+        }
+      });
+      await saveCurrentFilesSnapshot();
+      state.logs = await getAuditLogs();
+      renderAll();
+      $('progress').textContent = `批量链接处理完成：成功 ${res.successCount} 项，失败 ${res.failCount} 项`;
+      toast(`完成：${res.fileCount} 个链接 × ${res.emailCount} 个邮箱，成功 ${res.successCount} 项，失败 ${res.failCount} 项`);
+    } catch (error) {
+      $('progress').textContent = `批量链接处理失败：${error.message}`;
+      toast(`处理失败：${error.message}`);
+    } finally {
+      $('batch-links-grant-btn').disabled = false;
+      $('batch-links-revoke-btn').disabled = false;
+    }
+  };
+
+  $('batch-links-grant-btn').addEventListener('click', () => handleBatchLinksAction('grant'));
+  $('batch-links-revoke-btn').addEventListener('click', () => handleBatchLinksAction('revoke'));
 
   // 6. 右侧 TAB 2：人员与分组
   $('collab-group-filter').addEventListener('change', renderCollaboratorsTab);

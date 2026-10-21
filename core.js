@@ -1710,3 +1710,305 @@ async function runFullScan({
     autoEnforceResult
   };
 }
+
+
+/* ==================== 批量输入链接 + 批量邮箱直通赋权/撤权 ==================== */
+
+/**
+ * 从多行文本中提取所有 Google Drive 文件/表格/文档/文件夹 ID
+ * 支持：
+ * - https://docs.google.com/spreadsheets/d/FILE_ID/edit...
+ * - https://drive.google.com/file/d/FILE_ID/view...
+ * - https://drive.google.com/drive/folders/FOLDER_ID...
+ * - https://drive.google.com/open?id=FILE_ID
+ * - 直接粘贴的原始 File ID
+ */
+function parseDriveLinksInput(rawText = '') {
+  const tokens = String(rawText)
+    .split(/[\r\n\s,，;；]+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  const ids = [];
+  const seen = new Set();
+
+  for (const token of tokens) {
+    let id = '';
+    const dMatch = token.match(/\/d\/([a-zA-Z0-9_-]{15,})/);
+    const folderMatch = token.match(/\/folders\/([a-zA-Z0-9_-]{15,})/);
+    const idParamMatch = token.match(/[?&]id=([a-zA-Z0-9_-]{15,})/);
+
+    if (dMatch) {
+      id = dMatch[1];
+    } else if (folderMatch) {
+      id = folderMatch[1];
+    } else if (idParamMatch) {
+      id = idParamMatch[1];
+    } else if (/^[a-zA-Z0-9_-]{18,65}$/.test(token) && !token.includes('@')) {
+      id = token;
+    }
+
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      ids.push(id);
+    }
+  }
+
+  return ids;
+}
+
+/**
+ * 从多行文本中提取所有有效邮箱地址（支持直接粘贴「姓名 + 邮箱」两列或逗号/换行分隔）
+ */
+function parseEmailsInput(rawText = '') {
+  const matches = String(rawText).match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
+  return [...new Set(matches.map(normalizeEntry).filter(Boolean))];
+}
+
+/**
+ * 对一批文件/文件夹 ID (fileIds) 和一批邮箱 (emails) 批量开通查看/编辑/评论或关闭权限
+ */
+async function executeBatchLinksPermissions({
+  fileIds = [],
+  emails = [],
+  role = 'reader', // 'reader' | 'writer' | 'commenter'
+  mode = 'grant',  // 'grant' | 'revoke'
+  existingFiles = [],
+  targetAccount = 'all',
+  onProgress = null
+}) {
+  const cleanFileIds = [...new Set(fileIds.filter(Boolean))];
+  const cleanEmails = [...new Set(emails.map(normalizeEntry).filter(Boolean))];
+  if (!cleanFileIds.length || !cleanEmails.length) {
+    throw new Error('请至少提供 1 个有效链接（文件ID）和 1 个有效邮箱');
+  }
+
+  // 构建可用 Token 池（支持多账号/多凭证轮询与自动匹配文件所属账号）
+  const accounts = await getAuthorizedAccounts();
+  const tokenPool = [];
+  if (accounts.length > 0) {
+    const ordered =
+      targetAccount && targetAccount !== 'all'
+        ? [
+            ...accounts.filter(a => normalizeEntry(a.email) === normalizeEntry(targetAccount)),
+            ...accounts.filter(a => normalizeEntry(a.email) !== normalizeEntry(targetAccount))
+          ]
+        : accounts;
+    for (const acc of ordered) {
+      try {
+        const t = await getValidTokenForAccount(acc.email, false);
+        if (t) tokenPool.push({ email: normalizeEntry(acc.email), token: t });
+      } catch (_e) {
+        // ignore expired single account
+      }
+    }
+  }
+  if (!tokenPool.length) {
+    const fallbackToken = await getValidTokenForAccount(
+      targetAccount !== 'all' ? targetAccount : '',
+      true
+    );
+    tokenPool.push({ email: '', token: fallbackToken });
+  }
+
+  const existingMap = new Map(existingFiles.map(f => [f.id, f]));
+  const fileMetaMap = new Map();
+
+  // 先解析每个 fileId 对应的文件名与可用 token
+  for (const fid of cleanFileIds) {
+    const localFile = existingMap.get(fid);
+    const preferredEmail = normalizeEntry(localFile?.ownerAccount || localFile?.owners?.[0]?.emailAddress || '');
+    const preferredEntry = tokenPool.find(x => x.email && x.email === preferredEmail) || tokenPool[0];
+
+    let resolvedToken = preferredEntry.token;
+    let resolvedAccount = preferredEntry.email;
+    let fileName = localFile?.name || `文件 (${fid.slice(0, 8)}…)`;
+    let webViewLink = localFile?.webViewLink || `https://drive.google.com/open?id=${fid}`;
+
+    if (!localFile) {
+      for (const entry of tokenPool) {
+        try {
+          const meta = await driveApi(
+            entry.token,
+            `/files/${encodeURIComponent(fid)}?supportsAllDrives=true&fields=id,name,webViewLink,owners(emailAddress)`
+          );
+          if (meta) {
+            resolvedToken = entry.token;
+            resolvedAccount = entry.email || normalizeEntry(meta.owners?.[0]?.emailAddress || '');
+            fileName = meta.name || fileName;
+            webViewLink = meta.webViewLink || webViewLink;
+            break;
+          }
+        } catch (_e) {
+          // try next account token
+        }
+      }
+    }
+
+    fileMetaMap.set(fid, {
+      fileId: fid,
+      fileName,
+      webViewLink,
+      token: resolvedToken,
+      accountEmail: resolvedAccount,
+      localFile
+    });
+  }
+
+  // 构建任务队列
+  const tasks = [];
+  if (mode === 'grant') {
+    for (const fid of cleanFileIds) {
+      for (const email of cleanEmails) {
+        tasks.push({ type: 'grant', fileId: fid, email, role });
+      }
+    }
+  } else {
+    // mode === 'revoke': 先读取每个文件的权限列表，找出命中 cleanEmails 的权限项
+    const emailSet = new Set(cleanEmails);
+    for (const fid of cleanFileIds) {
+      const meta = fileMetaMap.get(fid);
+      try {
+        let perms = meta.localFile?.permissions;
+        if (!perms || !perms.length) {
+          const data = await driveApi(
+            meta.token,
+            `/files/${encodeURIComponent(fid)}/permissions?supportsAllDrives=true&pageSize=100&fields=permissions(id,type,role,emailAddress)`
+          );
+          perms = data?.permissions || [];
+        }
+        for (const p of perms) {
+          if (p.role === 'owner') continue;
+          const em = normalizeEntry(p.emailAddress || '');
+          if (em && emailSet.has(em)) {
+            tasks.push({ type: 'revoke', fileId: fid, email: em, permissionId: p.id, previousRole: p.role });
+          }
+        }
+      } catch (_e) {
+        // ignore
+      }
+    }
+  }
+
+  let successCount = 0;
+  let failCount = 0;
+  let done = 0;
+  let cursor = 0;
+  const logs = [];
+
+  const workers = Array.from({ length: 6 }, async () => {
+    while (cursor < tasks.length) {
+      const task = tasks[cursor++];
+      const meta = fileMetaMap.get(task.fileId);
+      try {
+        if (task.type === 'grant') {
+          const created = await createPermission(meta.token, task.fileId, {
+            type: 'user',
+            role: task.role,
+            emailAddress: task.email
+          });
+
+          if (meta.localFile) {
+            meta.localFile.permissions = meta.localFile.permissions || [];
+            const existPerm = meta.localFile.permissions.find(
+              p => normalizeEntry(p.emailAddress || '') === task.email
+            );
+            if (existPerm) {
+              existPerm.role = task.role;
+            } else {
+              meta.localFile.permissions.push({
+                id: created?.id || `link-${Date.now()}-${Math.random()}`,
+                type: 'user',
+                role: task.role,
+                emailAddress: task.email
+              });
+            }
+          }
+
+          successCount++;
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'manual',
+            actionType: 'grant',
+            accountEmail: meta.accountEmail,
+            fileId: task.fileId,
+            fileName: meta.fileName,
+            webViewLink: meta.webViewLink,
+            permissionId: created?.id || '',
+            targetType: 'user',
+            targetEmail: task.email,
+            targetLabel: task.email,
+            previousRole: '',
+            newRole: task.role,
+            restored: false,
+            message: `批量链接授权：授予「${roleLabel(task.role)}」权限`
+          });
+        } else if (task.type === 'revoke') {
+          await deletePermission(meta.token, task.fileId, task.permissionId);
+          if (meta.localFile && meta.localFile.permissions) {
+            meta.localFile.permissions = meta.localFile.permissions.filter(p => p.id !== task.permissionId);
+          }
+          successCount++;
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'manual',
+            actionType: 'revoke',
+            accountEmail: meta.accountEmail,
+            fileId: task.fileId,
+            fileName: meta.fileName,
+            webViewLink: meta.webViewLink,
+            permissionId: task.permissionId,
+            targetType: 'user',
+            targetEmail: task.email,
+            targetLabel: task.email,
+            previousRole: task.previousRole || '',
+            newRole: '',
+            restored: false,
+            message: `批量链接撤权：移除 ${task.email} 的权限`
+          });
+        }
+      } catch (error) {
+        failCount++;
+        logs.push({
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: new Date().toISOString(),
+          source: 'manual',
+          actionType: 'error',
+          accountEmail: meta.accountEmail,
+          fileId: task.fileId,
+          fileName: meta.fileName,
+          webViewLink: meta.webViewLink,
+          targetType: 'user',
+          targetEmail: task.email,
+          targetLabel: task.email,
+          restored: false,
+          message: `批量链接操作失败 (${task.email})：${error.message}`
+        });
+      } finally {
+        done++;
+        if (onProgress) {
+          onProgress({
+            done,
+            total: tasks.length,
+            successCount,
+            failCount,
+            message: `正在处理链接权限 ${done}/${tasks.length}（成功 ${successCount}，失败 ${failCount}）…`
+          });
+        }
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  if (logs.length) await appendAuditLogs(logs);
+
+  return {
+    fileCount: cleanFileIds.length,
+    emailCount: cleanEmails.length,
+    totalTasks: tasks.length,
+    successCount,
+    failCount
+  };
+}
