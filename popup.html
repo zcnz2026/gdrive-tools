@@ -30,59 +30,128 @@
 
     <!-- 主体左右分栏（自适应窗口高度，内部独立滚动） -->
     <main class="split-workspace">
-      <!-- ==================== 左侧：扫描结果板块 ==================== -->
+      <!-- ==================== 左侧：主工作区（扫描结果列表 / 批量链接授权 切换） ==================== -->
       <section class="left-results-pane">
-        <!-- 结果表头统计速筛条 -->
-        <div class="results-header-bar">
-          <div class="summary-pills" id="summary">
-            <button type="button" class="summary-card active" data-card-filter="all">
-              <span>全部</span> <strong id="stat-total">0</strong>
-            </button>
-            <button type="button" class="summary-card" data-card-filter="shared">
-              <span>已共享</span> <strong id="stat-shared">0</strong>
-            </button>
-            <button type="button" class="summary-card danger-card" data-card-filter="unauthorized">
-              <span>非白名单</span> <strong id="stat-unauthorized">0</strong>
-            </button>
-            <button type="button" class="summary-card warning-card" data-card-filter="overprivileged">
-              <span>越权编辑</span> <strong id="stat-overprivileged">0</strong>
-            </button>
-            <button type="button" class="summary-card" data-card-filter="public">
-              <span>公开链接</span> <strong id="stat-public">0</strong>
-            </button>
-            <button type="button" class="summary-card new-card" data-card-filter="new">
-              <span>新增</span> <strong id="stat-new">0</strong>
-            </button>
+        <!-- 左侧顶部标签切换栏 -->
+        <nav class="left-tabs-nav" role="tablist">
+          <button type="button" class="left-tab-btn active" data-left-tab="scan-list">
+            📁 扫描结果列表
+          </button>
+          <button type="button" class="left-tab-btn" data-left-tab="batch-links">
+            🔗 批量链接授权（输入一批链接 + 一批邮箱）
+            <span id="batch-links-parsed-info" class="tab-badge">0 链接 · 0 邮箱</span>
+          </button>
+        </nav>
+
+        <!-- 左侧面板 1：扫描结果列表 -->
+        <div id="left-panel-scan-list" class="left-tab-panel active">
+          <!-- 结果表头统计速筛条 -->
+          <div class="results-header-bar">
+            <div class="summary-pills" id="summary">
+              <button type="button" class="summary-card active" data-card-filter="all">
+                <span>全部</span> <strong id="stat-total">0</strong>
+              </button>
+              <button type="button" class="summary-card" data-card-filter="shared">
+                <span>已共享</span> <strong id="stat-shared">0</strong>
+              </button>
+              <button type="button" class="summary-card danger-card" data-card-filter="unauthorized">
+                <span>非白名单</span> <strong id="stat-unauthorized">0</strong>
+              </button>
+              <button type="button" class="summary-card warning-card" data-card-filter="overprivileged">
+                <span>越权编辑</span> <strong id="stat-overprivileged">0</strong>
+              </button>
+              <button type="button" class="summary-card" data-card-filter="public">
+                <span>公开链接</span> <strong id="stat-public">0</strong>
+              </button>
+              <button type="button" class="summary-card new-card" data-card-filter="new">
+                <span>新增</span> <strong id="stat-new">0</strong>
+              </button>
+            </div>
+
+            <div class="results-select-info">
+              <label class="checkbox-inline">
+                <input id="select-all" type="checkbox" disabled>
+                <span>全选当前 (<strong id="selected-count">0</strong>/<span id="filtered-count">0</span>)</span>
+              </label>
+            </div>
           </div>
 
-          <div class="results-select-info">
-            <label class="checkbox-inline">
-              <input id="select-all" type="checkbox" disabled>
-              <span>全选当前 (<strong id="selected-count">0</strong>/<span id="filtered-count">0</span>)</span>
-            </label>
+          <!-- 扫描结果固定滚动容器 -->
+          <div class="results-table-scroll">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th style="width: 34px;"></th>
+                  <th style="width: 30%;">文件名称 / 类型</th>
+                  <th style="width: 18%;">分组状态 / 合规性</th>
+                  <th>直接权限明细（组名 · 姓名 · 角色切换）</th>
+                  <th style="width: 90px;">快捷操作</th>
+                </tr>
+              </thead>
+              <tbody id="file-rows">
+                <tr>
+                  <td colspan="5" class="empty">
+                    请先在右侧「设置」中导入桌面 OAuth JSON 完成账号授权，然后点击右上角「立即扫描」
+                  </td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </div>
 
-        <!-- 扫描结果固定滚动容器 -->
-        <div class="results-table-scroll">
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th style="width: 34px;"></th>
-                <th style="width: 30%;">文件名称 / 类型</th>
-                <th style="width: 18%;">分组状态 / 合规性</th>
-                <th>直接权限明细（组名 · 姓名 · 角色切换）</th>
-                <th style="width: 90px;">快捷操作</th>
-              </tr>
-            </thead>
-            <tbody id="file-rows">
-              <tr>
-                <td colspan="5" class="empty">
-                  请先在右侧「设置」中导入桌面 OAuth JSON 完成账号授权，然后点击右上角「立即扫描」
-                </td>
-              </tr>
-            </tbody>
-          </table>
+        <!-- 左侧面板 2：大尺寸批量链接直通授权工作台 -->
+        <div id="left-panel-batch-links" class="left-tab-panel">
+          <div class="batch-links-workspace">
+            <!-- 顶部操作控制条 -->
+            <div class="batch-links-toolbar section-block block-green">
+              <div class="row-flex" style="flex-wrap: wrap;">
+                <strong>批量执行动作：</strong>
+                <select id="batch-links-role" class="select">
+                  <option value="reader">授予权限：查看 (仅查看)</option>
+                  <option value="writer">授予权限：编辑 (可编辑)</option>
+                  <option value="commenter">授予权限：评论 (可评论)</option>
+                </select>
+                <button id="batch-links-grant-btn" type="button" class="btn primary">
+                  批量开通权限
+                </button>
+                <button id="batch-links-revoke-btn" type="button" class="btn danger" title="从下方链接中批量移除这些邮箱的权限">
+                  批量关闭权限
+                </button>
+              </div>
+
+              <div class="row-flex">
+                <select id="batch-links-fill-group" class="select select-sm">
+                  <option value="">+从分组快速填入邮箱…</option>
+                </select>
+                <button id="batch-links-clear-btn" type="button" class="btn btn-sm">清空输入</button>
+              </div>
+            </div>
+
+            <!-- 左右双大框输入区（自适应撑满高度） -->
+            <div class="batch-links-dual-boxes">
+              <div class="batch-box section-block block-blue">
+                <div class="block-header">
+                  <h2>1. 批量放入 Google 文件 / 表格 / 文档 / 文件夹链接</h2>
+                  <span id="batch-links-count-label" class="meta-tag">已识别 0 个链接</span>
+                </div>
+                <p class="muted" style="margin-bottom: 6px;">
+                  每行粘贴一个链接（支持 Google 表格、文档、幻灯片、文件夹链接或直接粘贴文件 ID，无需先扫描网盘）：
+                </p>
+                <textarea id="batch-links-input" class="textarea batch-large-textarea" placeholder="示例：&#10;https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz/edit&#10;https://drive.google.com/drive/folders/1FolderIdAbCdEfGhIjKlMnOpQrSt&#10;https://drive.google.com/file/d/1FileIdAbCdEfGhIjKlMnOpQrStUv/view"></textarea>
+              </div>
+
+              <div class="batch-box section-block block-indigo">
+                <div class="block-header">
+                  <h2>2. 批量放入目标邮箱（支持粘贴表格「姓名 + 邮箱」）</h2>
+                  <span id="batch-emails-count-label" class="meta-tag">已识别 0 个邮箱</span>
+                </div>
+                <p class="muted" style="margin-bottom: 6px;">
+                  支持每行一个邮箱、逗号分隔，或直接从 Excel/表格复制「A列姓名 + B列邮箱」粘贴（自动提取邮箱并去重）：
+                </p>
+                <textarea id="batch-emails-input" class="textarea batch-large-textarea" placeholder="示例：&#10;张三  zhangsan@gmail.com&#10;李四  lisi@gmail.com&#10;wangwu@gmail.com"></textarea>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -260,43 +329,6 @@
                     移除所选分组权限
                   </button>
                 </div>
-              </div>
-            </div>
-
-            <!-- 板块 2.5：批量输入链接 + 批量邮箱直通授权（浅绿板块） -->
-            <div class="section-block block-green">
-              <div class="block-header">
-                <h2>批量链接授权（输入一批链接 + 一批邮箱）</h2>
-                <span id="batch-links-parsed-info" class="meta-tag">0 链接 · 0 邮箱</span>
-              </div>
-
-              <div class="field-group">
-                <label class="field-label">1. 批量输入文件 / 表格 / 文件夹链接（每行一个）</label>
-                <textarea id="batch-links-input" class="textarea" rows="3" placeholder="粘贴一批 Google 表格/文档/文件夹链接或文件 ID（每行一个）…"></textarea>
-              </div>
-
-              <div class="field-group">
-                <div class="field-label-between">
-                  <span>2. 批量输入目标邮箱（支持直接粘贴「姓名+邮箱」）</span>
-                  <select id="batch-links-fill-group" class="select select-sm" style="padding: 1px 6px; font-size: 11px;">
-                    <option value="">+从分组带入邮箱…</option>
-                  </select>
-                </div>
-                <textarea id="batch-emails-input" class="textarea" rows="3" placeholder="粘贴一批邮箱（每行一个、逗号分隔，或从表格复制两列粘贴）…"></textarea>
-              </div>
-
-              <div class="row-flex" style="margin-top: 6px;">
-                <select id="batch-links-role" class="select">
-                  <option value="reader">权限：查看 (仅查看)</option>
-                  <option value="writer">权限：编辑 (可编辑)</option>
-                  <option value="commenter">权限：评论 (可评论)</option>
-                </select>
-                <button id="batch-links-grant-btn" type="button" class="btn primary grow">
-                  批量开权限
-                </button>
-                <button id="batch-links-revoke-btn" type="button" class="btn danger btn-sm" title="移除这些邮箱在上述链接中的权限">
-                  关闭权限
-                </button>
               </div>
             </div>
 

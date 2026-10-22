@@ -117,7 +117,7 @@ h2 {
   gap: 12px;
 }
 
-/* ==================== 左侧：扫描结果面板 ==================== */
+/* ==================== 左侧：主工作区（扫描结果 / 批量链接授权 切换） ==================== */
 .left-results-pane {
   background: #ffffff;
   border: 1px solid #dbe3ee;
@@ -126,6 +126,100 @@ h2 {
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
+}
+
+.left-tabs-nav {
+  display: flex;
+  background: #f1f5f9;
+  border-bottom: 1px solid #dbe3ee;
+  padding: 6px 10px 0;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.left-tab-btn {
+  border: 1px solid transparent;
+  border-bottom: none;
+  background: transparent;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #475569;
+  cursor: pointer;
+  border-radius: 8px 8px 0 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.left-tab-btn:hover {
+  color: #1e293b;
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.left-tab-btn.active {
+  background: #ffffff;
+  color: #2563eb;
+  border-color: #dbe3ee;
+  margin-bottom: -1px;
+  padding-bottom: 9px;
+}
+
+.left-tab-panel {
+  display: none;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.left-tab-panel.active {
+  display: flex;
+}
+
+.batch-links-workspace {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  gap: 12px;
+  overflow: hidden;
+}
+
+.batch-links-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.batch-links-dual-boxes {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.batch-box {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+}
+
+.batch-large-textarea {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  resize: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
+  padding: 10px;
 }
 
 .results-header-bar {

@@ -1630,10 +1630,22 @@ async function syncPolicyAndSchedule(partial) {
 /* ==================== 初始化与全局事件绑定 ==================== */
 
 async function init() {
-  // 1. 立即绑定右侧标签页切换（保证任何情况下点击标签页立即响应）
+  // 1. 立即绑定右侧标签页切换与左侧主工作区标签页切换
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       switchTab(btn.dataset.tab);
+    });
+  });
+
+  document.querySelectorAll('.left-tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const targetTab = btn.dataset.leftTab;
+      document.querySelectorAll('.left-tab-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.leftTab === targetTab);
+      });
+      document.querySelectorAll('.left-tab-panel').forEach(panel => {
+        panel.classList.toggle('active', panel.id === `left-panel-${targetTab}`);
+      });
     });
   });
 
@@ -1893,17 +1905,30 @@ async function init() {
   $('batch-remove-public').addEventListener('click', () => handleBatchQuickAction('remove_public'));
   $('batch-revoke-all').addEventListener('click', () => handleBatchQuickAction('revoke_all'));
 
-  // 5.5 批量输入链接 + 批量邮箱直通授权/关闭权限
+  // 5.5 批量输入链接 + 批量邮箱直通授权/关闭权限（左侧第二标签页大工作台）
   const updateBatchLinksParsedInfo = () => {
     const fileIds = parseDriveLinksInput($('batch-links-input')?.value || '');
     const emails = parseEmailsInput($('batch-emails-input')?.value || '');
     if ($('batch-links-parsed-info')) {
       $('batch-links-parsed-info').textContent = `${fileIds.length} 链接 · ${emails.length} 邮箱`;
     }
+    if ($('batch-links-count-label')) {
+      $('batch-links-count-label').textContent = `已识别 ${fileIds.length} 个链接`;
+    }
+    if ($('batch-emails-count-label')) {
+      $('batch-emails-count-label').textContent = `已识别 ${emails.length} 个邮箱`;
+    }
   };
 
   $('batch-links-input').addEventListener('input', updateBatchLinksParsedInfo);
   $('batch-emails-input').addEventListener('input', updateBatchLinksParsedInfo);
+
+  $('batch-links-clear-btn').addEventListener('click', () => {
+    $('batch-links-input').value = '';
+    $('batch-emails-input').value = '';
+    updateBatchLinksParsedInfo();
+    toast('已清空链接与邮箱输入');
+  });
 
   $('batch-links-fill-group').addEventListener('change', e => {
     const gName = e.target.value;
