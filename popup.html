@@ -4,6 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Google Drive 权限管理中心</title>
+  <link rel="stylesheet" href="vendor/jsuites.css">
+  <link rel="stylesheet" href="vendor/jspreadsheet.css">
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
@@ -68,7 +70,9 @@
               </button>
             </div>
 
-            <div class="results-select-info">
+            <div class="results-select-info row-flex">
+              <span class="meta-tag" style="background:#eef2ff;color:#4338ca;border-color:#c7d2fe;">📊 Jspreadsheet CE 表格引擎</span>
+              <button id="toggle-scan-detail-table" type="button" class="btn btn-xs" title="在 Jspreadsheet 电子表格视图与传统明细视图间切换">切换明细视图</button>
               <label class="checkbox-inline">
                 <input id="select-all" type="checkbox" disabled>
                 <span>全选当前 (<strong id="selected-count">0</strong>/<span id="filtered-count">0</span>)</span>
@@ -76,9 +80,12 @@
             </div>
           </div>
 
-          <!-- 扫描结果固定滚动容器 -->
+          <!-- 扫描结果固定滚动容器（Jspreadsheet CE 主表格 + 备用明细表） -->
           <div class="results-table-scroll">
-            <table class="data-table">
+            <div id="scan-spreadsheet-wrap" class="spreadsheet-panel-wrap">
+              <div id="scan-spreadsheet-grid" class="jspreadsheet-host"></div>
+            </div>
+            <table id="legacy-scan-table" class="data-table hidden">
               <thead>
                 <tr>
                   <th style="width: 34px;"></th>
@@ -99,7 +106,7 @@
           </div>
         </div>
 
-        <!-- 左侧面板 2：大尺寸批量链接直通授权与权限扫描工作台 -->
+        <!-- 左侧面板 2：Jspreadsheet CE 批量链接直通授权与权限扫描工作台 -->
         <div id="left-panel-batch-links" class="left-tab-panel">
           <div class="batch-links-workspace">
             <!-- 顶部操作控制条（分两行：第1行 扫描链接权限 & 免邮箱公开权限；第2行 按指定邮箱赋权） -->
@@ -107,7 +114,7 @@
               <div class="row-flex" style="justify-content: space-between; flex-wrap: wrap;">
                 <div class="row-flex" style="flex-wrap: wrap;">
                   <button id="batch-links-scan-btn" type="button" class="btn primary">
-                    🔍 扫描这批链接的权限
+                    🔍 扫描表格中链接的权限
                   </button>
                   <span style="color:#cbd5e1;">|</span>
                   <strong>免填邮箱（公开权限）：</strong>
@@ -122,77 +129,51 @@
                   </button>
                 </div>
 
-                <button id="batch-links-clear-btn" type="button" class="btn btn-sm">清空输入</button>
+                <div class="row-flex">
+                  <span id="batch-links-count-label" class="meta-tag">已识别 0 个链接</span>
+                  <span id="batch-emails-count-label" class="meta-tag">已识别 0 个邮箱</span>
+                  <button id="batch-links-add-rows-btn" type="button" class="btn btn-sm">+ 加 20 行</button>
+                  <button id="batch-links-clear-btn" type="button" class="btn btn-sm">清空表格</button>
+                </div>
               </div>
 
               <div class="row-flex" style="justify-content: space-between; flex-wrap: wrap; border-top: 1px dashed #bbf7d0; padding-top: 7px;">
                 <div class="row-flex" style="flex-wrap: wrap;">
-                  <strong>按指定邮箱授权：</strong>
+                  <strong>按 B 列邮箱批量授权：</strong>
                   <select id="batch-links-role" class="select">
                     <option value="reader">授予邮箱：查看 (仅查看)</option>
                     <option value="writer">授予邮箱：编辑 (可编辑)</option>
                     <option value="commenter">授予邮箱：评论 (可评论)</option>
                   </select>
                   <button id="batch-links-grant-btn" type="button" class="btn primary">
-                    给右侧邮箱开权限
+                    给表格中邮箱开权限
                   </button>
-                  <button id="batch-links-revoke-btn" type="button" class="btn danger" title="从下方链接中批量移除右侧这些邮箱的权限">
-                    关闭右侧邮箱权限
+                  <button id="batch-links-revoke-btn" type="button" class="btn danger" title="从表格链接中批量移除 B 列这些邮箱的权限">
+                    关闭表格中邮箱权限
                   </button>
                 </div>
 
                 <div class="row-flex">
+                  <span class="muted" style="font-size:11px;">💡 支持选中 A列/B列 直接 Ctrl+V 粘贴多行；E列可直接下拉改公开权限</span>
                   <select id="batch-links-fill-group" class="select select-sm">
-                    <option value="">+从分组快速填入邮箱…</option>
+                    <option value="">+从分组快速填入邮箱到 B 列…</option>
                   </select>
                 </div>
               </div>
             </div>
 
-            <!-- 左右双大框输入区 -->
-            <div class="batch-links-dual-boxes">
-              <div class="batch-box section-block block-blue">
-                <div class="block-header">
-                  <h2>1. 批量放入 Google 文件 / 表格 / 文档 / 文件夹链接</h2>
-                  <span id="batch-links-count-label" class="meta-tag">已识别 0 个链接</span>
-                </div>
-                <p class="muted" style="margin-bottom: 6px;">
-                  每行粘贴一个链接（可点上方「🔍 扫描这批链接的权限」查看权限，或直接设为「所有人可编辑」）：
-                </p>
-                <textarea id="batch-links-input" class="textarea batch-large-textarea" placeholder="示例：&#10;https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz/edit&#10;https://drive.google.com/drive/folders/1FolderIdAbCdEfGhIjKlMnOpQrSt&#10;https://drive.google.com/file/d/1FileIdAbCdEfGhIjKlMnOpQrStUv/view"></textarea>
-              </div>
-
-              <div class="batch-box section-block block-indigo">
-                <div class="block-header">
-                  <h2>2. 批量放入目标邮箱（若设「所有人可编辑」则无需填写）</h2>
-                  <span id="batch-emails-count-label" class="meta-tag">已识别 0 个邮箱</span>
-                </div>
-                <p class="muted" style="margin-bottom: 6px;">
-                  仅在给特定邮箱开/关权限时填写（支持每行一个，或从表格复制「姓名 + 邮箱」两列粘贴）：
-                </p>
-                <textarea id="batch-emails-input" class="textarea batch-large-textarea" placeholder="（如使用上方「所有人可编辑/查看」，此处留空即可）&#10;如需指定邮箱：&#10;张三  zhangsan@gmail.com&#10;李四  lisi@gmail.com"></textarea>
-              </div>
+            <!-- Jspreadsheet CE 批量链接工作表容器 -->
+            <div class="batch-spreadsheet-section section-block block-blue">
+              <div id="batch-links-spreadsheet-grid" class="jspreadsheet-host"></div>
             </div>
 
-            <!-- 链接权限扫描结果区（点击「扫描这批链接的权限」后展示） -->
-            <div id="batch-links-scan-results-wrap" class="batch-scan-results section-block block-neutral hidden">
-              <div class="block-header">
-                <h2>🔍 链接权限扫描结果（我的权限 & 当前链接公开状态）</h2>
-                <button id="close-batch-scan-results-btn" type="button" class="btn-text">收起结果 ▲</button>
-              </div>
-              <div class="batch-scan-table-scroll">
-                <table class="data-table compact-table">
-                  <thead>
-                    <tr>
-                      <th style="width: 42px;">#</th>
-                      <th style="width: 28%;">文件/文件夹名称</th>
-                      <th style="width: 22%;">我对它的权限</th>
-                      <th style="width: 26%;">当前链接对外权限</th>
-                      <th>快捷修改此链接</th>
-                    </tr>
-                  </thead>
-                  <tbody id="batch-links-scan-rows"></tbody>
-                </table>
+            <!-- 隐藏的兼容输入与结果节点（供底层同步与回退使用） -->
+            <div class="hidden">
+              <textarea id="batch-links-input"></textarea>
+              <textarea id="batch-emails-input"></textarea>
+              <div id="batch-links-scan-results-wrap">
+                <button id="close-batch-scan-results-btn" type="button"></button>
+                <table><tbody id="batch-links-scan-rows"></tbody></table>
               </div>
             </div>
           </div>
@@ -623,6 +604,8 @@
     <div id="toast" role="status"></div>
   </div>
 
+  <script src="vendor/jsuites.js"></script>
+  <script src="vendor/jspreadsheet.js"></script>
   <script src="core.js"></script>
   <script src="popup.js"></script>
 </body>
