@@ -122,8 +122,8 @@
             <div class="batch-links-toolbar section-block block-green" style="flex-direction: column; align-items: stretch; gap: 8px;">
               <div class="row-flex" style="justify-content: space-between; flex-wrap: wrap;">
                 <div class="row-flex" style="flex-wrap: wrap;">
-                  <button id="batch-links-scan-btn" type="button" class="btn primary">
-                    🔍 扫描表格中链接的权限
+                  <button id="batch-links-scan-btn" type="button" class="btn primary" title="扫描 A 列链接的权限，并自动核查 B 列填写的邮箱/服务账号是否拥有读取或编辑权限">
+                    🔍 扫描链接权限 (含核查B列账号可读性)
                   </button>
                   <span style="color:#cbd5e1;">|</span>
                   <strong>免填邮箱（公开权限）：</strong>
@@ -163,9 +163,10 @@
                 </div>
 
                 <div class="row-flex">
-                  <span class="muted" style="font-size:11px;">💡 支持选中 A列/B列 直接 Ctrl+V 粘贴多行；F列可直接下拉改公开权限</span>
+                  <span class="muted" style="font-size:11px;">💡 B列填账号后点「扫描链接权限」即可核查可读性</span>
+                  <button id="batch-links-fill-accounts-btn" type="button" class="btn btn-xs" title="将插件中已导入授权的所有账号/服务账号邮箱一键填入 B 列进行权限核查">+填入已导入账号到B列</button>
                   <select id="batch-links-fill-group" class="select select-sm">
-                    <option value="">+从分组快速填入邮箱到 B 列…</option>
+                    <option value="">+从分组填入邮箱到 B 列…</option>
                   </select>
                 </div>
               </div>
@@ -201,10 +202,14 @@
                     <option value="slide">📽️ 仅演示文稿</option>
                     <option value="other">📦 其他类型</option>
                   </select>
-                  <select id="batch-filter-exec-status" class="select select-sm" title="按「H. 执行状态」过滤">
-                    <option value="all">执行状态：全部</option>
-                    <option value="ok">✅ 成功 / 已检测</option>
-                    <option value="error">❌ 失败 / 无权限</option>
+                  <select id="batch-filter-exec-status" class="select select-sm" title="按「G/H列：B列账号可读性核查结果或执行状态」过滤">
+                    <option value="all">B列核查 / 执行状态：全部</option>
+                    <option value="b_all_ok">✅ B列账号：全部可读</option>
+                    <option value="b_missing">❌ B列账号：存在无权限 (需补开)</option>
+                    <option value="b_partial">⚠️ B列账号：部分可读 (部分缺失)</option>
+                    <option value="b_none">🚫 B列账号：全部无权限 (0可读)</option>
+                    <option value="ok">✅ 执行成功 / 已检测</option>
+                    <option value="error">❌ 执行失败 / 链接无权访问</option>
                   </select>
                 </div>
 

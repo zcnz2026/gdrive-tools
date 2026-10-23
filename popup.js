@@ -545,14 +545,14 @@ function initSpreadsheets() {
     state.batchLinksSheet = jspreadsheet(batchHost, {
       data: initialRows,
       columns: [
-        { type: 'text', title: 'A. 文件/文件夹链接 (Ctrl+V粘贴)', width: 235, align: 'left' },
-        { type: 'text', title: 'B. 目标邮箱 (可选·可粘贴)', width: 185, align: 'left' },
-        { type: 'text', title: 'C. 类型', width: 100, readOnly: true, align: 'left' },
-        { type: 'text', title: 'D. 文件/文件夹名称', width: 195, readOnly: true, align: 'left' },
+        { type: 'text', title: 'A. 文件/文件夹链接 (Ctrl+V粘贴)', width: 225, align: 'left' },
+        { type: 'text', title: 'B. 待核查/授权邮箱 (如 sa-140@...)', width: 195, align: 'left' },
+        { type: 'text', title: 'C. 类型', width: 95, readOnly: true, align: 'left' },
+        { type: 'text', title: 'D. 文件/文件夹名称', width: 185, readOnly: true, align: 'left' },
         { type: 'text', title: 'E. 我对它的权限', width: 135, readOnly: true, align: 'left' },
-        { type: 'dropdown', title: 'F. 当前链接权限 (可下拉改)', width: 170, source: PUBLIC_LINK_DROPDOWN_SOURCE, align: 'left' },
-        { type: 'text', title: 'G. 已授权人数', width: 150, readOnly: true, align: 'left' },
-        { type: 'text', title: 'H. 执行状态 / 结果', width: 185, readOnly: true, align: 'left' }
+        { type: 'dropdown', title: 'F. 当前链接权限 (可下拉改)', width: 165, source: PUBLIC_LINK_DROPDOWN_SOURCE, align: 'left' },
+        { type: 'text', title: 'G. B列可读性 / 授权人数', width: 180, readOnly: true, align: 'left' },
+        { type: 'text', title: 'H. 执行状态 / 缺失账号明细', width: 225, readOnly: true, align: 'left' }
       ],
       minDimensions: [8, 25],
       columnSorting: true,
@@ -809,8 +809,21 @@ function matchesBatchRowFilter(row = []) {
   }
 
   const execVal = $('batch-filter-exec-status')?.value || 'all';
+  const colG = String(row[6] || '');
   const colExec = String(row[7] || '');
   if (execVal !== 'all') {
+    if (execVal === 'b_all_ok' && !colG.includes('B列全部可读') && !colExec.includes('均有读取权限')) return false;
+    if (
+      execVal === 'b_missing' &&
+      !colG.includes('B列部分可读') &&
+      !colG.includes('B列全部无权限') &&
+      !colExec.includes('缺 ') &&
+      !colExec.includes('均无读取权限')
+    ) {
+      return false;
+    }
+    if (execVal === 'b_partial' && !colG.includes('B列部分可读')) return false;
+    if (execVal === 'b_none' && !colG.includes('B列全部无权限') && !colExec.includes('均无读取权限')) return false;
     if (execVal === 'ok' && !colExec.includes('✅')) return false;
     if (execVal === 'error' && !colExec.includes('❌') && !colMy.includes('❌')) return false;
   }
@@ -2397,17 +2410,41 @@ async function init() {
           if (p.role === 'reader' || p.role === 'commenter') rCount++;
           else wCount++;
         }
-        const countSummary = item.loading
-          ? '⏳ 统计中…'
-          : item.permissions?.length
-          ? `共 ${nonOwners.length} 项 (编辑 ${wCount} / 查看 ${rCount})`
-          : item.linkStatusLabel;
 
-        const execStatus = item.loading
-          ? '⏳ 正在检测…'
-          : item.error
-          ? `❌ ${item.error}`
-          : `✅ 已检测 (${item.linkStatusLabel})`;
+        const chk = item.emailCheckSummary;
+        let countSummary = '';
+        let execStatus = '';
+
+        if (item.loading) {
+          countSummary = chk ? '⏳ 正在核查B列账号…' : '⏳ 统计中…';
+          execStatus = '⏳ 正在检测…';
+        } else if (item.error) {
+          countSummary = chk ? `❌ 无法核查 (0/${chk.total})` : item.linkStatusLabel;
+          execStatus = `❌ ${item.error}`;
+        } else if (chk && chk.total > 0) {
+          if (chk.readableCount === chk.total && chk.explicitCount === chk.total) {
+            countSummary = `✅ B列全部可读 (${chk.explicitCount}/${chk.total}已授权 · 编${chk.writerCount}/读${chk.readerCount})`;
+          } else if (chk.readableCount === chk.total && chk.viaPublicLink) {
+            countSummary = `🌐 B列全部可读 (公开链接可读 · 单独授权${chk.explicitCount}/${chk.total})`;
+          } else if (chk.readableCount > 0) {
+            countSummary = `⚠️ B列部分可读 (${chk.readableCount}/${chk.total}可读 · 缺${chk.missingEmails.length}个)`;
+          } else {
+            countSummary = `❌ B列全部无权限 (0/${chk.total}可读)`;
+          }
+
+          if (chk.missingEmails.length === 0) {
+            execStatus = `✅ B列 ${chk.total} 个账号均有读取权限 (${chk.readableEmails.map(e => e.split('@')[0]).join(', ')})`;
+          } else if (chk.readableCount > 0) {
+            execStatus = `⚠️ 缺 ${chk.missingEmails.length} 个无权限: ${chk.missingEmails.join(', ')} | ✅可读(${chk.readableCount}): ${chk.readableEmails.map(e => e.split('@')[0]).join(', ')}`;
+          } else {
+            execStatus = `❌ B列 ${chk.total} 个账号均无读取权限: ${chk.missingEmails.join(', ')}`;
+          }
+        } else {
+          countSummary = item.permissions?.length
+            ? `共 ${nonOwners.length} 项 (编辑 ${wCount} / 查看 ${rCount})`
+            : item.linkStatusLabel;
+          execStatus = `✅ 已检测 (${item.linkStatusLabel})`;
+        }
 
         rows[rIdx][2] = typeLabel;
         rows[rIdx][3] = item.name || item.fileId;
@@ -2423,16 +2460,20 @@ async function init() {
   const handleScanBatchLinks = async () => {
     syncBatchSheetToInputs();
     const fileIds = getActiveBatchFileIds();
+    const checkEmails = parseEmailsInput($('batch-emails-input')?.value || '');
     if (!fileIds.length) {
       toast('请先在表格 A 列粘贴至少 1 个 Google 文件或文件夹链接');
       return;
     }
 
     $('batch-links-scan-btn').disabled = true;
-    $('progress').textContent = `正在扫描 ${fileIds.length} 个链接的权限…`;
+    $('progress').textContent = checkEmails.length
+      ? `正在扫描 ${fileIds.length} 个链接，并核查 B 列 ${checkEmails.length} 个账号的可读权限…`
+      : `正在扫描 ${fileIds.length} 个链接的权限…`;
     try {
       const results = await scanBatchLinksStatus({
         fileIds,
+        checkEmails,
         targetAccount: state.activeAccount,
         onProgress(p) {
           if (p?.message) $('progress').textContent = p.message;
@@ -2442,8 +2483,15 @@ async function init() {
         }
       });
       renderBatchLinksScanTable(results);
-      $('progress').textContent = `链接权限扫描完成：共检测 ${results.length} 个链接`;
-      toast(`已扫描 ${results.length} 个链接的权限状态`);
+      if (checkEmails.length > 0) {
+        const allOkLinks = results.filter(r => r.emailCheckSummary && r.emailCheckSummary.readableCount === r.emailCheckSummary.total).length;
+        const missingLinks = results.length - allOkLinks;
+        $('progress').textContent = `核查完成：共 ${results.length} 个链接 · B列(${checkEmails.length}个账号)全部可读 ${allOkLinks} 个，存在缺权限 ${missingLinks} 个`;
+        toast(`核查完成：全部可读 ${allOkLinks} 个链接，缺权限 ${missingLinks} 个链接`);
+      } else {
+        $('progress').textContent = `链接权限扫描完成：共检测 ${results.length} 个链接`;
+        toast(`已扫描 ${results.length} 个链接的权限状态`);
+      }
     } catch (error) {
       $('progress').textContent = `扫描链接权限失败：${error.message}`;
       toast(`扫描失败：${error.message}`);
@@ -2523,6 +2571,25 @@ async function init() {
     const fileIds = getActiveBatchFileIds();
     const publicMode = $('batch-links-public-mode').value || 'anyone_writer';
     handleApplyPublicModeToLinks(fileIds, publicMode);
+  });
+
+  $('batch-links-fill-accounts-btn')?.addEventListener('click', () => {
+    const accEmails = [
+      ...(state.accounts || []).map(a => normalizeEntry(a.email)),
+      ...(state.oauthClients || []).map(c => normalizeEntry(c.boundEmail || c.client_email || ''))
+    ].filter(Boolean);
+    const uniqueAccEmails = [...new Set(accEmails)];
+    if (!uniqueAccEmails.length) {
+      toast('当前尚未导入授权账号。您可以直接在表格 B 列 Ctrl+V 粘贴需要核查的账号邮箱（如 sa-140@...）');
+      return;
+    }
+    syncBatchSheetToInputs();
+    const existingEmails = parseEmailsInput($('batch-emails-input')?.value || '');
+    const merged = [...new Set([...existingEmails, ...uniqueAccEmails])];
+    if ($('batch-emails-input')) $('batch-emails-input').value = merged.join('\n');
+    syncInputsToBatchSheet();
+    updateBatchLinksParsedInfo();
+    toast(`已将 ${uniqueAccEmails.length} 个已导入账号填入 B 列，点击「🔍 扫描链接权限」即可核查可读性`);
   });
 
   $('batch-links-fill-group').addEventListener('change', e => {

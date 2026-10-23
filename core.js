@@ -429,6 +429,27 @@ function extractOAuthClientsFromJson(parsed, fileName = '') {
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     if (!item || typeof item !== 'object') continue;
+
+    // 1. 支持 Google Cloud Service Account 服务账号 JSON (如 sa-140@sa-140.iam.gserviceaccount.com)
+    if (item.type === 'service_account' && item.client_email && item.private_key) {
+      const clientEmail = normalizeEntry(item.client_email);
+      clients.push({
+        uid: `sa_${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${i}`,
+        fileName: fileName || `${clientEmail.split('@')[0]}.json`,
+        client_id: String(item.client_id || clientEmail).trim(),
+        client_email: clientEmail,
+        private_key: String(item.private_key),
+        private_key_id: String(item.private_key_id || ''),
+        project_id: String(item.project_id || '').trim(),
+        token_uri: item.token_uri || 'https://oauth2.googleapis.com/token',
+        client_type: 'service_account',
+        boundEmail: clientEmail,
+        importedAt: new Date().toISOString()
+      });
+      continue;
+    }
+
+    // 2. 支持常规 Google OAuth 桌面/Web 客户端 JSON
     const raw = item.installed || item.web || (item.client_id && item.client_secret ? item : null);
     if (raw && raw.client_id && raw.client_secret) {
       const clientId = String(raw.client_id).trim();
@@ -448,6 +469,81 @@ function extractOAuthClientsFromJson(parsed, fileName = '') {
     }
   }
   return clients;
+}
+
+function base64UrlEncodeBytes(bytes) {
+  let binary = '';
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  for (let i = 0; i < arr.length; i++) {
+    binary += String.fromCharCode(arr[i]);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlEncodeStr(str) {
+  return base64UrlEncodeBytes(new TextEncoder().encode(str));
+}
+
+function pemToArrayBuffer(pem = '') {
+  const b64 = String(pem)
+    .replace(/-----BEGIN [^-]+-----/g, '')
+    .replace(/-----END [^-]+-----/g, '')
+    .replace(/\s+/g, '');
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+async function mintServiceAccountAccessToken({ clientEmail, privateKey, tokenUri }) {
+  if (!clientEmail || !privateKey) {
+    throw new Error('服务账号配置缺少 client_email 或 private_key');
+  }
+  const targetUri = tokenUri || 'https://oauth2.googleapis.com/token';
+  const nowSec = Math.floor(Date.now() / 1000);
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const claimSet = {
+    iss: clientEmail,
+    scope: 'https://www.googleapis.com/auth/drive',
+    aud: targetUri,
+    iat: nowSec - 30,
+    exp: nowSec + 3500
+  };
+
+  const unsignedJwt = `${base64UrlEncodeStr(JSON.stringify(header))}.${base64UrlEncodeStr(JSON.stringify(claimSet))}`;
+  const keyBuffer = pemToArrayBuffer(privateKey);
+  const cryptoKey = await crypto.subtle.importKey(
+    'pkcs8',
+    keyBuffer,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5',
+    cryptoKey,
+    new TextEncoder().encode(unsignedJwt)
+  );
+  const signedJwt = `${unsignedJwt}.${base64UrlEncodeBytes(signature)}`;
+
+  const response = await fetch(targetUri, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: signedJwt
+    }).toString()
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.access_token) {
+    throw new Error(data.error_description || data.error || `服务账号签发令牌失败 (${response.status})`);
+  }
+  return {
+    accessToken: data.access_token,
+    expiresIn: Number(data.expires_in) || 3500
+  };
 }
 
 async function getOAuthClients() {
@@ -510,6 +606,20 @@ async function removeAuthorizedAccount(email) {
 }
 
 async function refreshAccountAccessToken(account) {
+  if (account.isServiceAccount && account.privateKey) {
+    const minted = await mintServiceAccountAccessToken({
+      clientEmail: account.email,
+      privateKey: account.privateKey,
+      tokenUri: account.tokenUri
+    });
+    const updatedSa = await saveAuthorizedAccount({
+      ...account,
+      accessToken: minted.accessToken,
+      expiresAt: Date.now() + minted.expiresIn * 1000
+    });
+    return updatedSa.accessToken;
+  }
+
   if (!account.refreshToken || !account.clientId || !account.clientSecret) {
     throw new Error(`账号 ${account.email} 授权已过期，请重新点击授权`);
   }
@@ -546,6 +656,9 @@ async function getValidTokenForAccount(email, interactive = false) {
   if (target) {
     if (target.accessToken && Date.now() < (target.expiresAt || 0) - 60000) {
       return target.accessToken;
+    }
+    if (target.isServiceAccount && target.privateKey) {
+      return refreshAccountAccessToken(target);
     }
     if (target.refreshToken && target.clientId && target.clientSecret) {
       return refreshAccountAccessToken(target);
@@ -588,6 +701,28 @@ function getChromeIdentityToken(interactive = true) {
 }
 
 async function authorizeWithOAuthClient(client, loginHint = '') {
+  if (client && (client.client_type === 'service_account' || (client.client_email && client.private_key))) {
+    const email = normalizeEntry(client.client_email);
+    const minted = await mintServiceAccountAccessToken({
+      clientEmail: email,
+      privateKey: client.private_key,
+      tokenUri: client.token_uri
+    });
+    const savedAccount = await saveAuthorizedAccount({
+      email,
+      displayName: email.split('@')[0],
+      clientId: client.client_id || email,
+      isServiceAccount: true,
+      privateKey: client.private_key,
+      tokenUri: client.token_uri || 'https://oauth2.googleapis.com/token',
+      accessToken: minted.accessToken,
+      expiresAt: Date.now() + minted.expiresIn * 1000,
+      authorizedAt: new Date().toISOString()
+    });
+    await saveOAuthClients([{ ...client, boundEmail: email }]);
+    return savedAccount;
+  }
+
   if (!client || !client.client_id || !client.client_secret) {
     throw new Error('无效的 OAuth 客户端配置（缺少 client_id 或 client_secret）');
   }
@@ -2402,6 +2537,7 @@ async function executeBatchLinksPublicAccess({
  */
 async function scanBatchLinksStatus({
   fileIds = [],
+  checkEmails = [],
   targetAccount = 'all',
   onProgress = null,
   onPartialResults = null
@@ -2410,6 +2546,7 @@ async function scanBatchLinksStatus({
   if (!cleanFileIds.length) {
     throw new Error('请先粘贴要扫描的链接');
   }
+  const cleanCheckEmails = [...new Set((checkEmails || []).map(e => normalizeEntry(e)).filter(Boolean))];
 
   const accounts = await getAuthorizedAccounts();
   const tokenPool = [];
@@ -2434,6 +2571,7 @@ async function scanBatchLinksStatus({
     const fallbackToken = await getValidTokenForAccount(targetAccount !== 'all' ? targetAccount : '', true);
     tokenPool.push({ email: '', token: fallbackToken });
   }
+  const tokenByEmail = new Map(tokenPool.filter(t => t.email).map(t => [t.email, t.token]));
 
   const results = cleanFileIds.map((fid, idx) => ({
     index: idx + 1,
@@ -2452,6 +2590,7 @@ async function scanBatchLinksStatus({
     linkStatusClass: 'private',
     linkPublicRole: 'none', // 'writer' | 'commenter' | 'reader' | 'domain' | 'restricted' | 'unknown'
     permissions: [],
+    emailCheckSummary: null,
     error: ''
   }));
 
@@ -2576,6 +2715,95 @@ async function scanBatchLinksStatus({
             item.linkStatusClass = 'private';
           }
         }
+      }
+
+      // 3. 如果 B 列填写了待核查邮箱（如 sa-140 ~ sa-149），逐一核查这些账号对该链接是否有读取/编辑权限
+      if (cleanCheckEmails.length > 0) {
+        const permByEmail = new Map();
+        for (const p of item.permissions || []) {
+          const em = normalizeEntry(p.emailAddress || '');
+          if (em) permByEmail.set(em, p.role || 'reader');
+        }
+        if (item.ownerEmail && !permByEmail.has(item.ownerEmail)) {
+          permByEmail.set(item.ownerEmail, 'owner');
+        }
+        const anyonePerm = (item.permissions || []).find(p => p.type === 'anyone');
+        const domainPerm = (item.permissions || []).find(p => p.type === 'domain');
+
+        let readableCount = 0;
+        let explicitCount = 0;
+        let writerCount = 0;
+        let readerCount = 0;
+        const readableEmails = [];
+        const missingEmails = [];
+        const perEmailStatus = [];
+
+        for (const targetEm of cleanCheckEmails) {
+          let canRead = false;
+          let explicit = false;
+          let role = 'none';
+
+          if (permByEmail.has(targetEm)) {
+            canRead = true;
+            explicit = true;
+            role = permByEmail.get(targetEm);
+          } else if (anyonePerm) {
+            canRead = true;
+            explicit = false;
+            role = anyonePerm.role || 'reader';
+          } else if (domainPerm && domainPerm.domain && targetEm.endsWith('@' + normalizeEntry(domainPerm.domain))) {
+            canRead = true;
+            explicit = false;
+            role = domainPerm.role || 'reader';
+          } else if ((!item.permissions || item.permissions.length === 0) && tokenByEmail.has(targetEm)) {
+            // 当无法直接列出完整 permissions 时，若该待查邮箱本身已在插件中授权（如导入了 Service Account JSON），直接用其自身 Token 实测读取权限
+            if (item.accessible && item.matchedAccount === targetEm) {
+              canRead = true;
+              explicit = true;
+              role = item.myAccessLabel.includes('可编辑') || item.myAccessLabel.includes('所有者') ? 'writer' : 'reader';
+            } else {
+              try {
+                const probeMeta = await driveApi(
+                  tokenByEmail.get(targetEm),
+                  `/files/${encodeURIComponent(fid)}?supportsAllDrives=true&fields=id,name,mimeType,capabilities(canEdit,canComment)`
+                );
+                if (probeMeta) {
+                  canRead = true;
+                  explicit = true;
+                  role = probeMeta.capabilities?.canEdit ? 'writer' : 'reader';
+                }
+              } catch (_probeErr) {
+                canRead = false;
+              }
+            }
+          }
+
+          if (canRead) {
+            readableCount++;
+            if (explicit) explicitCount++;
+            if (role === 'owner' || role === 'organizer' || role === 'fileOrganizer' || role === 'writer') {
+              writerCount++;
+            } else {
+              readerCount++;
+            }
+            readableEmails.push(targetEm);
+          } else {
+            missingEmails.push(targetEm);
+          }
+          perEmailStatus.push({ email: targetEm, canRead, explicit, role });
+        }
+
+        item.emailCheckSummary = {
+          total: cleanCheckEmails.length,
+          readableCount,
+          explicitCount,
+          writerCount,
+          readerCount,
+          viaPublicLink: Boolean(anyonePerm),
+          readableEmails,
+          missingEmails,
+          perEmailStatus
+        };
       }
 
       item.loading = false;
