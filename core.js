@@ -1476,106 +1476,170 @@ async function enforceFilesByPolicy(fallbackToken, files, policy, fallbackOwnerE
 }
 
 /**
- * 扫描单个账号下的所有文件与权限（支持流式边扫边展示回调 onPartialFiles）
+ * 扫描单个账号下的所有文件与文件夹及权限（支持全网盘扫描 & 内联权限极速获取 & 节流流式回调）
+ * scanScope:
+ * - 'all_drive': 扫描整个网盘（含全部文件夹 + 文件 + 我的云盘 + 与我共享 + 共享云端硬盘）
+ * - 'owned': 仅扫描我拥有的全部文件夹与文件
+ * - 'folders_only': 仅扫描所有文件夹（目录结构权限巡检）
+ * - 'shared_only': 仅扫描已对外共享的文件夹与文件
  */
-async function scanSingleAccount(accountEmail, token, onProgress = null, accountPrefix = '', onPartialFiles = null) {
+async function scanSingleAccount(
+  accountEmail,
+  token,
+  onProgress = null,
+  accountPrefix = '',
+  onPartialFiles = null,
+  scanScope = 'all_drive'
+) {
   let files = [];
   let pageToken = '';
 
+  let q = 'trashed = false';
+  if (scanScope === 'owned') {
+    q = "'me' in owners and trashed = false";
+  } else if (scanScope === 'folders_only') {
+    q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false";
+  }
+
+  let lastPartialEmit = 0;
+
   do {
     const params = new URLSearchParams({
-      q: "'me' in owners and trashed = false",
-      corpora: 'user',
+      q,
       pageSize: '200',
       supportsAllDrives: 'true',
       includeItemsFromAllDrives: 'true',
       fields:
-        'nextPageToken,incompleteSearch,files(id,name,mimeType,webViewLink,createdTime,modifiedTime,ownedByMe,owners(emailAddress),parents)'
+        'nextPageToken,incompleteSearch,files(id,name,mimeType,webViewLink,createdTime,modifiedTime,ownedByMe,shared,owners(emailAddress,displayName),capabilities(canEdit,canComment,canShare),permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(inherited,inheritedFrom,permissionType)),parents)'
     });
     if (pageToken) params.set('pageToken', pageToken);
     const data = await driveApi(token, `/files?${params}`);
-    const pageItems = (data.files || []).filter(file => file.ownedByMe !== false);
+    let pageItems = data.files || [];
+
+    if (scanScope === 'owned') {
+      pageItems = pageItems.filter(file => file.ownedByMe !== false);
+    } else if (scanScope === 'shared_only') {
+      pageItems = pageItems.filter(
+        file => file.shared === true || (Array.isArray(file.permissions) && file.permissions.length > 1)
+      );
+    }
+
     for (const file of pageItems) {
       file.ownerAccount = normalizeEntry(accountEmail || file.owners?.[0]?.emailAddress || '');
-      file.permissions = [];
-      file.permissionsLoading = true;
+      file.scannedByAccount = normalizeEntry(accountEmail || '');
+      if (Array.isArray(file.permissions) && file.permissions.length > 0) {
+        // files.list 已内联返回完整权限，无需再次发起单独 HTTP 请求！
+        file.permissionsLoading = false;
+        file.permissionError = '';
+      } else if (file.shared === false && file.ownedByMe) {
+        // 未共享的私有文件/文件夹，无需额外请求 /permissions
+        file.permissions = [
+          {
+            id: 'owner',
+            type: 'user',
+            role: 'owner',
+            emailAddress: file.ownerAccount
+          }
+        ];
+        file.permissionsLoading = false;
+        file.permissionError = '';
+      } else if (file.ownedByMe || file.capabilities?.canShare) {
+        file.permissions = [];
+        file.permissionsLoading = true;
+      } else {
+        // 对该文件仅有只读/编辑但无权列出他人权限
+        file.permissions = [];
+        file.permissionsLoading = false;
+        file.permissionError = '';
+      }
     }
+
     files.push(...pageItems);
     pageToken = data.nextPageToken || '';
+
+    const folderCount = files.filter(f => f.mimeType === 'application/vnd.google-apps.folder').length;
     if (onProgress) {
       onProgress({
         phase: 'files',
         count: files.length,
-        message: `${accountPrefix}已发现 ${files.length} 个文件，正在边读边展示…`
+        message: `${accountPrefix}已扫描 ${files.length} 项（含 ${folderCount} 个文件夹）…`
       });
     }
-    if (onPartialFiles) {
+    const now = Date.now();
+    if (onPartialFiles && (now - lastPartialEmit >= 650 || !pageToken)) {
+      lastPartialEmit = now;
       onPartialFiles(files);
     }
   } while (pageToken);
 
-  let cursor = 0;
-  let finished = 0;
-  let lastEmitAt = 0;
+  // 仅对 files.list 未内联返回 permissions 且当前账号有权限管理能力的项补充请求
+  const needPermFiles = files.filter(f => f.permissionsLoading);
+  if (needPermFiles.length > 0) {
+    let cursor = 0;
+    let finished = 0;
+    let lastEmitAt = 0;
 
-  const workers = Array.from({ length: 10 }, async () => {
-    while (cursor < files.length) {
-      const index = cursor++;
-      const file = files[index];
-      try {
-        let pToken = '';
-        const permissions = [];
-        do {
-          const params = new URLSearchParams({
-            supportsAllDrives: 'true',
-            pageSize: '100',
-            fields:
-              'nextPageToken,permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(inherited,inheritedFrom,permissionType))'
-          });
-          if (pToken) params.set('pageToken', pToken);
-          const data = await driveApi(token, `/files/${encodeURIComponent(file.id)}/permissions?${params}`);
-          permissions.push(...(data.permissions || []));
-          pToken = data.nextPageToken || '';
-        } while (pToken);
-        file.permissions = permissions;
-        file.permissionError = '';
-      } catch (error) {
-        file.permissions = [];
-        file.permissionError = error.message;
-      } finally {
-        file.permissionsLoading = false;
-      }
-      finished++;
-
-      const now = Date.now();
-      if (finished % 5 === 0 || finished === files.length || now - lastEmitAt >= 300) {
-        lastEmitAt = now;
-        if (onProgress) {
-          onProgress({
-            phase: 'permissions',
-            finished,
-            total: files.length,
-            message: `${accountPrefix}正在读取权限 ${finished}/${files.length}…`
-          });
+    const workers = Array.from({ length: Math.min(10, needPermFiles.length) }, async () => {
+      while (cursor < needPermFiles.length) {
+        const index = cursor++;
+        const file = needPermFiles[index];
+        try {
+          let pToken = '';
+          const permissions = [];
+          do {
+            const params = new URLSearchParams({
+              supportsAllDrives: 'true',
+              pageSize: '100',
+              fields:
+                'nextPageToken,permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(inherited,inheritedFrom,permissionType))'
+            });
+            if (pToken) params.set('pageToken', pToken);
+            const data = await driveApi(token, `/files/${encodeURIComponent(file.id)}/permissions?${params}`);
+            permissions.push(...(data.permissions || []));
+            pToken = data.nextPageToken || '';
+          } while (pToken);
+          file.permissions = permissions;
+          file.permissionError = '';
+        } catch (error) {
+          file.permissions = [];
+          file.permissionError = error.message;
+        } finally {
+          file.permissionsLoading = false;
         }
-        if (onPartialFiles) {
-          onPartialFiles(files);
+        finished++;
+
+        const now = Date.now();
+        if (finished === needPermFiles.length || now - lastEmitAt >= 650) {
+          lastEmitAt = now;
+          if (onProgress) {
+            onProgress({
+              phase: 'permissions',
+              finished,
+              total: needPermFiles.length,
+              message: `${accountPrefix}正在补充读取权限明细 ${finished}/${needPermFiles.length}…`
+            });
+          }
+          if (onPartialFiles) {
+            onPartialFiles(files);
+          }
         }
       }
-    }
-  });
+    });
 
-  await Promise.all(workers);
+    await Promise.all(workers);
+  }
+
   return files;
 }
 
 /**
- * 执行完整扫描（支持多账号并发 & 边扫边展示 onPartialFiles）
+ * 执行完整扫描（支持多账号并发、扫描范围选择 scanScope & 边扫边展示 onPartialFiles）
  */
 async function runFullScan({
   interactive = false,
   source = 'manual',
   targetAccount = 'all',
+  scanScope = 'all_drive',
   onProgress = null,
   onPartialFiles = null
 } = {}) {
@@ -1615,11 +1679,25 @@ async function runFullScan({
 
   const perAccountFiles = new Map();
 
+  // 多账号全网盘扫描时按 file.id 去重，优先保留 ownedByMe 或权限信息更完整的项
+  const mergeAndDedupeFiles = () => {
+    const byId = new Map();
+    const allLists = [...perAccountFiles.values(), otherAccountFiles];
+    for (const list of allLists) {
+      for (const file of list) {
+        if (!file?.id) continue;
+        const prev = byId.get(file.id);
+        if (!prev || (!prev.ownedByMe && file.ownedByMe) || ((file.permissions?.length || 0) > (prev.permissions?.length || 0))) {
+          byId.set(file.id, file);
+        }
+      }
+    }
+    return [...byId.values()];
+  };
+
   const emitPartialCombined = () => {
     if (!onPartialFiles) return;
-    const combined = [];
-    for (const list of perAccountFiles.values()) combined.push(...list);
-    combined.push(...otherAccountFiles);
+    const combined = mergeAndDedupeFiles();
     for (const file of combined) {
       file.isNew = (!isFirstScan && !knownSet.has(file.id)) || prevNewSet.has(file.id);
     }
@@ -1628,21 +1706,26 @@ async function runFullScan({
 
   // 多账号多线程并发扫描
   await Promise.all(
-    targetAccounts.map(async (acc, i) => {
+    targetAccounts.map(async acc => {
       const prefix = targetAccounts.length > 1 ? `[${acc.email}] ` : '';
       const token = await getValidTokenForAccount(acc.email, interactive);
-      const accFiles = await scanSingleAccount(acc.email, token, onProgress, prefix, partialList => {
-        perAccountFiles.set(acc.email, partialList);
-        emitPartialCombined();
-      });
+      const accFiles = await scanSingleAccount(
+        acc.email,
+        token,
+        onProgress,
+        prefix,
+        partialList => {
+          perAccountFiles.set(acc.email, partialList);
+          emitPartialCombined();
+        },
+        scanScope
+      );
       perAccountFiles.set(acc.email, accFiles);
       emitPartialCombined();
     })
   );
 
-  let mergedFiles = [];
-  for (const list of perAccountFiles.values()) mergedFiles.push(...list);
-  mergedFiles.push(...otherAccountFiles);
+  const mergedFiles = mergeAndDedupeFiles();
 
   const newlyDiscoveredIds = [];
   for (const file of mergedFiles) {
