@@ -1475,10 +1475,39 @@ async function enforceFilesByPolicy(fallbackToken, files, policy, fallbackOwnerE
   return { removed, downgraded, failed, total: queue.length, logs };
 }
 
+function normalizeScannedFileItem(file, accountEmail = '') {
+  file.ownerAccount = normalizeEntry(accountEmail || file.owners?.[0]?.emailAddress || '');
+  file.scannedByAccount = normalizeEntry(accountEmail || '');
+  if (Array.isArray(file.permissions) && file.permissions.length > 0) {
+    file.permissionsLoading = false;
+    file.permissionError = '';
+  } else if (file.shared === false && file.ownedByMe) {
+    file.permissions = [
+      {
+        id: 'owner',
+        type: 'user',
+        role: 'owner',
+        emailAddress: file.ownerAccount
+      }
+    ];
+    file.permissionsLoading = false;
+    file.permissionError = '';
+  } else if (file.ownedByMe || file.capabilities?.canShare) {
+    file.permissions = [];
+    file.permissionsLoading = true;
+  } else {
+    file.permissions = [];
+    file.permissionsLoading = false;
+    file.permissionError = '';
+  }
+  return file;
+}
+
 /**
- * 扫描单个账号下的所有文件与文件夹及权限（支持全网盘扫描 & 内联权限极速获取 & 节流流式回调）
+ * 扫描单个账号下的所有文件与文件夹及权限（支持全网盘扫描、指定多个文件夹递归扫描 & 内联权限极速获取）
  * scanScope:
  * - 'all_drive': 扫描整个网盘（含全部文件夹 + 文件 + 我的云盘 + 与我共享 + 共享云端硬盘）
+ * - 'custom_folders': 扫描指定的 1 个或多个文件夹 ID（支持递归扫描所有子文件夹与内部文件）
  * - 'owned': 仅扫描我拥有的全部文件夹与文件
  * - 'folders_only': 仅扫描所有文件夹（目录结构权限巡检）
  * - 'shared_only': 仅扫描已对外共享的文件夹与文件
@@ -1489,88 +1518,165 @@ async function scanSingleAccount(
   onProgress = null,
   accountPrefix = '',
   onPartialFiles = null,
-  scanScope = 'all_drive'
+  scanScope = 'all_drive',
+  customFolderIds = [],
+  recursive = true
 ) {
   let files = [];
-  let pageToken = '';
-
-  let q = 'trashed = false';
-  if (scanScope === 'owned') {
-    q = "'me' in owners and trashed = false";
-  } else if (scanScope === 'folders_only') {
-    q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false";
-  }
-
+  const seenFileIds = new Set();
   let lastPartialEmit = 0;
 
-  do {
-    const params = new URLSearchParams({
-      q,
-      pageSize: '200',
-      supportsAllDrives: 'true',
-      includeItemsFromAllDrives: 'true',
-      fields:
-        'nextPageToken,incompleteSearch,files(id,name,mimeType,webViewLink,createdTime,modifiedTime,ownedByMe,shared,owners(emailAddress,displayName),capabilities(canEdit,canComment,canShare),permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(inherited,inheritedFrom,permissionType)),parents)'
-    });
-    if (pageToken) params.set('pageToken', pageToken);
-    const data = await driveApi(token, `/files?${params}`);
-    let pageItems = data.files || [];
+  const INLINE_FILE_FIELDS =
+    'id,name,mimeType,webViewLink,createdTime,modifiedTime,ownedByMe,shared,owners(emailAddress,displayName),capabilities(canEdit,canComment,canShare),permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(inherited,inheritedFrom,permissionType)),parents';
 
-    if (scanScope === 'owned') {
-      pageItems = pageItems.filter(file => file.ownedByMe !== false);
-    } else if (scanScope === 'shared_only') {
-      pageItems = pageItems.filter(
-        file => file.shared === true || (Array.isArray(file.permissions) && file.permissions.length > 1)
-      );
+  if (scanScope === 'custom_folders') {
+    const cleanRootIds = [...new Set((customFolderIds || []).filter(Boolean))];
+    if (!cleanRootIds.length) {
+      throw new Error('请先输入至少 1 个有效的 Google Drive 文件夹链接或文件夹 ID');
     }
 
-    for (const file of pageItems) {
-      file.ownerAccount = normalizeEntry(accountEmail || file.owners?.[0]?.emailAddress || '');
-      file.scannedByAccount = normalizeEntry(accountEmail || '');
-      if (Array.isArray(file.permissions) && file.permissions.length > 0) {
-        // files.list 已内联返回完整权限，无需再次发起单独 HTTP 请求！
-        file.permissionsLoading = false;
-        file.permissionError = '';
-      } else if (file.shared === false && file.ownedByMe) {
-        // 未共享的私有文件/文件夹，无需额外请求 /permissions
-        file.permissions = [
-          {
-            id: 'owner',
-            type: 'user',
-            role: 'owner',
-            emailAddress: file.ownerAccount
+    const visitedFolderIds = new Set();
+    let frontierFolderIds = [];
+
+    // 1. 先并发读取所输入的根文件夹（或文件）本身的元数据与权限
+    await Promise.all(
+      cleanRootIds.map(async rootId => {
+        try {
+          const meta = await driveApi(
+            token,
+            `/files/${encodeURIComponent(rootId)}?supportsAllDrives=true&fields=${encodeURIComponent(INLINE_FILE_FIELDS)}`
+          );
+          if (meta && meta.id && !seenFileIds.has(meta.id)) {
+            seenFileIds.add(meta.id);
+            normalizeScannedFileItem(meta, accountEmail);
+            files.push(meta);
+            if (meta.mimeType === 'application/vnd.google-apps.folder') {
+              frontierFolderIds.push(meta.id);
+            }
           }
-        ];
-        file.permissionsLoading = false;
-        file.permissionError = '';
-      } else if (file.ownedByMe || file.capabilities?.canShare) {
-        file.permissions = [];
-        file.permissionsLoading = true;
-      } else {
-        // 对该文件仅有只读/编辑但无权列出他人权限
-        file.permissions = [];
-        file.permissionsLoading = false;
-        file.permissionError = '';
-      }
-    }
+        } catch (_err) {
+          // 若根文件夹元数据未直接返回但可能可枚举子项，仍尝试将其作为父目录查询
+          frontierFolderIds.push(rootId);
+        }
+      })
+    );
 
-    files.push(...pageItems);
-    pageToken = data.nextPageToken || '';
-
-    const folderCount = files.filter(f => f.mimeType === 'application/vnd.google-apps.folder').length;
-    if (onProgress) {
-      onProgress({
-        phase: 'files',
-        count: files.length,
-        message: `${accountPrefix}已扫描 ${files.length} 项（含 ${folderCount} 个文件夹）…`
-      });
-    }
-    const now = Date.now();
-    if (onPartialFiles && (now - lastPartialEmit >= 650 || !pageToken)) {
-      lastPartialEmit = now;
+    if (onPartialFiles && files.length > 0) {
       onPartialFiles(files);
     }
-  } while (pageToken);
+
+    // 2. 广度优先（按层批量）扫描文件夹下的子文件夹与文件
+    let depth = 0;
+    while (frontierFolderIds.length > 0) {
+      depth++;
+      const currentBatchIds = frontierFolderIds.filter(id => !visitedFolderIds.has(id));
+      if (!currentBatchIds.length) break;
+      for (const id of currentBatchIds) visitedFolderIds.add(id);
+
+      const nextFrontier = [];
+      // 每 15 个父文件夹合并为一次 Drive API 查询，大幅提速
+      for (let i = 0; i < currentBatchIds.length; i += 15) {
+        const chunk = currentBatchIds.slice(i, i + 15);
+        const parentClause = chunk.map(fid => `'${fid.replace(/'/g, "\\'")}' in parents`).join(' or ');
+        const q = `(${parentClause}) and trashed = false`;
+        let pageToken = '';
+
+        do {
+          const params = new URLSearchParams({
+            q,
+            pageSize: '200',
+            supportsAllDrives: 'true',
+            includeItemsFromAllDrives: 'true',
+            fields: `nextPageToken,incompleteSearch,files(${INLINE_FILE_FIELDS})`
+          });
+          if (pageToken) params.set('pageToken', pageToken);
+          const data = await driveApi(token, `/files?${params}`);
+          const pageItems = data.files || [];
+
+          for (const item of pageItems) {
+            if (!item?.id || seenFileIds.has(item.id)) continue;
+            seenFileIds.add(item.id);
+            normalizeScannedFileItem(item, accountEmail);
+            files.push(item);
+
+            if (recursive && item.mimeType === 'application/vnd.google-apps.folder' && !visitedFolderIds.has(item.id)) {
+              nextFrontier.push(item.id);
+            }
+          }
+
+          pageToken = data.nextPageToken || '';
+          const folderCount = files.filter(f => f.mimeType === 'application/vnd.google-apps.folder').length;
+          if (onProgress) {
+            onProgress({
+              phase: 'files',
+              count: files.length,
+              message: `${accountPrefix}正在扫描指定文件夹（第 ${depth} 层）：已发现 ${files.length} 项（含 ${folderCount} 个文件夹）…`
+            });
+          }
+          const now = Date.now();
+          if (onPartialFiles && (now - lastPartialEmit >= 650 || !pageToken)) {
+            lastPartialEmit = now;
+            onPartialFiles(files);
+          }
+        } while (pageToken);
+      }
+
+      if (!recursive) break;
+      frontierFolderIds = nextFrontier;
+    }
+  } else {
+    let pageToken = '';
+    let q = 'trashed = false';
+    if (scanScope === 'owned') {
+      q = "'me' in owners and trashed = false";
+    } else if (scanScope === 'folders_only') {
+      q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false";
+    }
+
+    do {
+      const params = new URLSearchParams({
+        q,
+        pageSize: '200',
+        supportsAllDrives: 'true',
+        includeItemsFromAllDrives: 'true',
+        fields: `nextPageToken,incompleteSearch,files(${INLINE_FILE_FIELDS})`
+      });
+      if (pageToken) params.set('pageToken', pageToken);
+      const data = await driveApi(token, `/files?${params}`);
+      let pageItems = data.files || [];
+
+      if (scanScope === 'owned') {
+        pageItems = pageItems.filter(file => file.ownedByMe !== false);
+      } else if (scanScope === 'shared_only') {
+        pageItems = pageItems.filter(
+          file => file.shared === true || (Array.isArray(file.permissions) && file.permissions.length > 1)
+        );
+      }
+
+      for (const file of pageItems) {
+        if (!file?.id || seenFileIds.has(file.id)) continue;
+        seenFileIds.add(file.id);
+        normalizeScannedFileItem(file, accountEmail);
+        files.push(file);
+      }
+
+      pageToken = data.nextPageToken || '';
+
+      const folderCount = files.filter(f => f.mimeType === 'application/vnd.google-apps.folder').length;
+      if (onProgress) {
+        onProgress({
+          phase: 'files',
+          count: files.length,
+          message: `${accountPrefix}已扫描 ${files.length} 项（含 ${folderCount} 个文件夹）…`
+        });
+      }
+      const now = Date.now();
+      if (onPartialFiles && (now - lastPartialEmit >= 650 || !pageToken)) {
+        lastPartialEmit = now;
+        onPartialFiles(files);
+      }
+    } while (pageToken);
+  }
 
   // 仅对 files.list 未内联返回 permissions 且当前账号有权限管理能力的项补充请求
   const needPermFiles = files.filter(f => f.permissionsLoading);
@@ -1640,6 +1746,8 @@ async function runFullScan({
   source = 'manual',
   targetAccount = 'all',
   scanScope = 'all_drive',
+  customFolderIds = [],
+  recursive = true,
   onProgress = null,
   onPartialFiles = null
 } = {}) {
@@ -1673,7 +1781,7 @@ async function runFullScan({
 
   const scannedAccountSet = new Set(targetAccounts.map(a => normalizeEntry(a.email)));
   const otherAccountFiles =
-    targetAccount !== 'all' && prevSnapshot.files?.length
+    scanScope !== 'custom_folders' && targetAccount !== 'all' && prevSnapshot.files?.length
       ? prevSnapshot.files.filter(f => f.ownerAccount && !scannedAccountSet.has(normalizeEntry(f.ownerAccount)))
       : [];
 
@@ -1718,7 +1826,9 @@ async function runFullScan({
           perAccountFiles.set(acc.email, partialList);
           emitPartialCombined();
         },
-        scanScope
+        scanScope,
+        customFolderIds,
+        recursive
       );
       perAccountFiles.set(acc.email, accFiles);
       emitPartialCombined();

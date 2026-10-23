@@ -26,8 +26,9 @@
         <button id="clear-new-flags" type="button" class="btn-link hidden">清除新增标记</button>
         <button id="quick-enforce-all" type="button" class="btn warning btn-sm" disabled>一键修正异常 (0)</button>
         <button id="export" type="button" class="btn btn-sm" disabled>导出 CSV</button>
-        <select id="scan-scope-select" class="select select-sm" title="选择扫描范围：整个网盘（含文件夹与共享项）或指定范围">
+        <select id="scan-scope-select" class="select select-sm" title="选择扫描范围：整个网盘、指定文件夹或指定范围">
           <option value="all_drive">🌐 扫描整个网盘 (含全部文件夹+文件+与我共享)</option>
+          <option value="custom_folders">📂 扫描指定文件夹 (输入1或多个文件夹链接/ID)</option>
           <option value="owned">👑 仅我拥有的 (全部文件夹+文件)</option>
           <option value="folders_only">📁 仅扫描所有文件夹 (目录权限巡检)</option>
           <option value="shared_only">🔗 仅扫描已对外共享项</option>
@@ -77,12 +78,33 @@
             </div>
 
             <div class="results-select-info row-flex">
+              <button id="toggle-custom-folder-bar-btn" type="button" class="btn btn-xs primary" title="输入一个或多个文件夹链接/ID进行定向扫描">📂 指定文件夹扫描</button>
               <span class="meta-tag" style="background:#eef2ff;color:#4338ca;border-color:#c7d2fe;">📊 Jspreadsheet CE</span>
               <label class="checkbox-inline">
                 <input id="select-all" type="checkbox" disabled>
                 <span>全选当前 (<strong id="selected-count">0</strong>/<span id="filtered-count">0</span>)</span>
               </label>
             </div>
+          </div>
+
+          <!-- 指定文件夹定向扫描输入栏（选择「扫描指定文件夹」或点击「📂 指定文件夹扫描」时展开） -->
+          <div id="custom-folders-scan-bar" class="custom-folders-bar hidden">
+            <div class="row-flex" style="justify-content: space-between; margin-bottom: 5px; flex-wrap: wrap;">
+              <div class="row-flex">
+                <strong>📂 定向扫描指定文件夹（支持多个文件夹链接或文件夹 ID）：</strong>
+                <span id="custom-folders-count-badge" class="meta-tag">已识别 0 个文件夹ID</span>
+                <label class="checkbox-inline" style="margin-left: 6px;">
+                  <input id="custom-folders-recursive" type="checkbox" checked>
+                  <span>递归扫描所有子文件夹及内部全部文件</span>
+                </label>
+              </div>
+              <div class="row-flex">
+                <button id="scan-custom-folders-btn" type="button" class="btn primary btn-sm">🔍 立即扫描这些文件夹</button>
+                <button id="clear-custom-folders-btn" type="button" class="btn btn-xs">清空</button>
+                <button id="close-custom-folders-bar-btn" type="button" class="btn-text">收起 ▲</button>
+              </div>
+            </div>
+            <textarea id="custom-folders-input" rows="2" class="textarea full-width" placeholder="粘贴 1 个或多个 Google Drive 文件夹链接或文件夹 ID（每行一个，或用逗号/空格分隔）：&#10;例如：https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOpQrStUvWxYz   或直接输入文件夹 ID：1AbCdEfGhIjKlMnOpQrStUvWxYz"></textarea>
           </div>
 
           <!-- 扫描结果固定滚动容器（纯 Jspreadsheet CE 电子表格） -->

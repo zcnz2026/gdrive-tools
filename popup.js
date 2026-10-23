@@ -1240,11 +1240,29 @@ async function importParsedContacts(rows) {
 
 /* ==================== 扫描、批量执行与单项权限操作 ==================== */
 
-async function handleScan(targetAccount = state.activeAccount) {
+async function handleScan(targetAccount = state.activeAccount, overrideScope = '') {
   const scanBtn = $('scan');
-  const scanScope = $('scan-scope-select')?.value || 'all_drive';
+  const customScanBtn = $('scan-custom-folders-btn');
+  const scanScope = overrideScope || $('scan-scope-select')?.value || 'all_drive';
+  let customFolderIds = [];
+  const recursive = Boolean($('custom-folders-recursive')?.checked ?? true);
+
+  if (scanScope === 'custom_folders') {
+    $('custom-folders-scan-bar')?.classList.remove('hidden');
+    customFolderIds = parseDriveLinksInput($('custom-folders-input')?.value || '');
+    if (!customFolderIds.length) {
+      $('custom-folders-input')?.focus?.();
+      toast('请先在上方输入框粘贴 1 个或多个 Google Drive 文件夹链接或文件夹 ID');
+      return;
+    }
+  }
+
   scanBtn.disabled = true;
-  $('progress').textContent = '正在启动全网盘极速扫描…';
+  if (customScanBtn) customScanBtn.disabled = true;
+  $('progress').textContent =
+    scanScope === 'custom_folders'
+      ? `正在扫描指定的 ${customFolderIds.length} 个文件夹…`
+      : '正在启动全网盘极速扫描…';
 
   try {
     const res = await runFullScan({
@@ -1252,6 +1270,8 @@ async function handleScan(targetAccount = state.activeAccount) {
       source: 'manual',
       targetAccount: targetAccount || 'all',
       scanScope,
+      customFolderIds,
+      recursive,
       onProgress(info) {
         if (info?.message) $('progress').textContent = info.message;
       },
@@ -1277,6 +1297,7 @@ async function handleScan(targetAccount = state.activeAccount) {
     toast(`扫描失败：${error.message}`);
   } finally {
     scanBtn.disabled = false;
+    if (customScanBtn) customScanBtn.disabled = false;
   }
 }
 
@@ -1906,10 +1927,56 @@ async function init() {
     renderGroupSelectorsAndBatchBar();
   });
 
-  // 3. 顶部栏按钮与账号切换
+  // 3. 顶部栏按钮与账号切换 & 指定文件夹扫描栏
   $('scan').addEventListener('click', () => handleScan(state.activeAccount));
   $('export').addEventListener('click', exportCsv);
   $('quick-enforce-all').addEventListener('click', () => handleEnforceFiles(getScopedFilesByAccount()));
+
+  const updateCustomFoldersBadge = () => {
+    const ids = parseDriveLinksInput($('custom-folders-input')?.value || '');
+    if ($('custom-folders-count-badge')) {
+      $('custom-folders-count-badge').textContent = `已识别 ${ids.length} 个文件夹ID`;
+    }
+  };
+
+  $('scan-scope-select')?.addEventListener('change', e => {
+    const isCustom = e.target.value === 'custom_folders';
+    $('custom-folders-scan-bar')?.classList.toggle('hidden', !isCustom);
+    if (isCustom) {
+      $('custom-folders-input')?.focus?.();
+    }
+  });
+
+  $('toggle-custom-folder-bar-btn')?.addEventListener('click', () => {
+    const bar = $('custom-folders-scan-bar');
+    if (!bar) return;
+    const willShow = bar.classList.contains('hidden');
+    bar.classList.toggle('hidden', !willShow);
+    if (willShow) {
+      if ($('scan-scope-select')) $('scan-scope-select').value = 'custom_folders';
+      $('custom-folders-input')?.focus?.();
+    }
+  });
+
+  $('close-custom-folders-bar-btn')?.addEventListener('click', () => {
+    $('custom-folders-scan-bar')?.classList.add('hidden');
+    if ($('scan-scope-select')?.value === 'custom_folders') {
+      $('scan-scope-select').value = 'all_drive';
+    }
+  });
+
+  $('custom-folders-input')?.addEventListener('input', updateCustomFoldersBadge);
+
+  $('clear-custom-folders-btn')?.addEventListener('click', () => {
+    if ($('custom-folders-input')) $('custom-folders-input').value = '';
+    updateCustomFoldersBadge();
+    toast('已清空指定文件夹输入');
+  });
+
+  $('scan-custom-folders-btn')?.addEventListener('click', () => {
+    if ($('scan-scope-select')) $('scan-scope-select').value = 'custom_folders';
+    handleScan(state.activeAccount, 'custom_folders');
+  });
 
   $('clear-new-flags').addEventListener('click', async () => {
     state.newFileIds.clear();
