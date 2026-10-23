@@ -169,6 +169,51 @@
                   </select>
                 </div>
               </div>
+
+              <!-- 第3行：多维筛选过滤条（按我对它的权限、当前链接权限、类型、状态、关键词实时过滤） -->
+              <div class="row-flex batch-links-filter-row" style="justify-content: space-between; flex-wrap: wrap; border-top: 1px dashed #bbf7d0; padding-top: 7px;">
+                <div class="row-flex" style="flex-wrap: wrap; gap: 6px;">
+                  <strong>🌪️ 筛选过滤：</strong>
+                  <input id="batch-filter-keyword" type="text" class="input input-xs" style="width: 150px;" placeholder="搜名称/链接/邮箱/状态…">
+                  <select id="batch-filter-my-access" class="select select-sm" title="按「E. 我对它的权限」过滤">
+                    <option value="all">我对它的权限：全部</option>
+                    <option value="can_manage">👑/✏️ 我可改权限 (所有者+可编辑)</option>
+                    <option value="owner">👑 我是所有者</option>
+                    <option value="writer">✏️ 我可编辑</option>
+                    <option value="commenter">💬 我仅可评论</option>
+                    <option value="reader">👁️ 我仅可查看 (只读)</option>
+                    <option value="no_access">❌ 无权限访问 / 链接无效</option>
+                    <option value="unscanned">⏳ 未扫描 / 待检测</option>
+                  </select>
+                  <select id="batch-filter-link-perm" class="select select-sm" title="按「F. 当前链接权限」过滤">
+                    <option value="all">当前链接权限：全部</option>
+                    <option value="anyone_writer">🌐 任何人可编辑</option>
+                    <option value="anyone_commenter">🌐 任何人可评论</option>
+                    <option value="anyone_reader">🌐 任何人可查看</option>
+                    <option value="anyone_any">🌐 所有公开链接 (编辑/评论/查看)</option>
+                    <option value="anyone_off">🔒 受限 / 私密 (仅指定邮箱)</option>
+                  </select>
+                  <select id="batch-filter-type" class="select select-sm" title="按「C. 类型」过滤">
+                    <option value="all">类型：全部</option>
+                    <option value="folder">📁 仅文件夹</option>
+                    <option value="sheet">📊 仅表格</option>
+                    <option value="doc">📄 仅文档</option>
+                    <option value="slide">📽️ 仅演示文稿</option>
+                    <option value="other">📦 其他类型</option>
+                  </select>
+                  <select id="batch-filter-exec-status" class="select select-sm" title="按「H. 执行状态」过滤">
+                    <option value="all">执行状态：全部</option>
+                    <option value="ok">✅ 成功 / 已检测</option>
+                    <option value="error">❌ 失败 / 无权限</option>
+                  </select>
+                </div>
+
+                <div class="row-flex" style="gap: 6px;">
+                  <span id="batch-filter-result-count" class="meta-tag">显示 0 / 0 条链接</span>
+                  <button id="batch-filter-keep-only-btn" type="button" class="btn btn-xs" title="从表格中剔除未命中的行，仅保留当前筛选出的链接">仅保留当前筛选</button>
+                  <button id="batch-filter-reset-btn" type="button" class="btn btn-xs">重置筛选</button>
+                </div>
+              </div>
             </div>
 
             <!-- Jspreadsheet CE 批量链接工作表容器 -->

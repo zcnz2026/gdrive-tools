@@ -24,7 +24,9 @@ const state = {
   isUpdatingScanSheet: false,
   scanDetailView: false,
   batchLinksSheet: null,
-  isUpdatingBatchSheet: false
+  isUpdatingBatchSheet: false,
+  batchMasterRows: Array.from({ length: 25 }, () => ['', '', '', '', '', '', '', '']),
+  batchVisibleRowMap: Array.from({ length: 25 }, (_, i) => i)
 };
 
 function toast(message) {
@@ -538,6 +540,8 @@ function initSpreadsheets() {
   const batchHost = $('batch-links-spreadsheet-grid');
   if (batchHost && !state.batchLinksSheet) {
     const initialRows = Array.from({ length: 25 }, () => ['', '', '', '', '', '', '', '']);
+    state.batchMasterRows = initialRows.map(r => [...r]);
+    state.batchVisibleRowMap = initialRows.map((_, i) => i);
     state.batchLinksSheet = jspreadsheet(batchHost, {
       data: initialRows,
       columns: [
@@ -551,6 +555,7 @@ function initSpreadsheets() {
         { type: 'text', title: 'H. 执行状态 / 结果', width: 185, readOnly: true, align: 'left' }
       ],
       minDimensions: [8, 25],
+      columnSorting: true,
       tableOverflow: true,
       tableWidth: '100%',
       tableHeight: '100%',
@@ -560,20 +565,32 @@ function initSpreadsheets() {
         if (state.isUpdatingBatchSheet) return;
         const col = Number(x);
         const row = Number(y);
+        const masterIdx = state.batchVisibleRowMap[row] ?? row;
+        while (state.batchMasterRows.length <= masterIdx) {
+          state.batchMasterRows.push(['', '', '', '', '', '', '', '']);
+        }
+        state.batchMasterRows[masterIdx][col] = value ?? '';
+
         if (col === 0 || col === 1) {
           syncBatchSheetToInputs();
         } else if (col === 5 && value) {
-          const rows = state.batchLinksSheet.getData();
-          const rawLink = rows[row]?.[0] || '';
+          const rawLink = state.batchMasterRows[masterIdx]?.[0] || '';
           const parsedIds = parseDriveLinksInput(rawLink);
           if (parsedIds.length > 0) {
-            handleBatchRowPublicModeChange(parsedIds[0], row, value);
+            handleBatchRowPublicModeChange(parsedIds[0], row, masterIdx, value);
           }
         }
       },
       onpaste() {
         if (!state.isUpdatingBatchSheet) {
-          setTimeout(syncBatchSheetToInputs, 20);
+          setTimeout(() => {
+            if (!isBatchFilterActive()) {
+              const sheetRows = state.batchLinksSheet.getData() || [];
+              state.batchMasterRows = sheetRows.map(r => [...r]);
+              state.batchVisibleRowMap = sheetRows.map((_, i) => i);
+            }
+            syncBatchSheetToInputs();
+          }, 20);
         }
       }
     });
@@ -605,11 +622,11 @@ async function handleScanSheetPublicChange(fileId, rowIndex, publicMode) {
   }
 }
 
-async function handleBatchRowPublicModeChange(fileId, rowIndex, publicMode) {
+async function handleBatchRowPublicModeChange(fileId, visibleRowIndex, masterRowIndex, publicMode) {
   if (!fileId || !state.batchLinksSheet) return;
   try {
     state.isUpdatingBatchSheet = true;
-    state.batchLinksSheet.setValueFromCoords(7, rowIndex, '⏳ 正在修改公开权限…', true);
+    state.batchLinksSheet.setValueFromCoords(7, visibleRowIndex, '⏳ 正在修改公开权限…', true);
     state.isUpdatingBatchSheet = false;
 
     const res = await executeBatchLinksPublicAccess({
@@ -623,16 +640,28 @@ async function handleBatchRowPublicModeChange(fileId, rowIndex, publicMode) {
     const item = res.results?.[0];
     state.isUpdatingBatchSheet = true;
     if (item?.ok) {
-      if (item.fileName) state.batchLinksSheet.setValueFromCoords(3, rowIndex, item.fileName, true);
-      state.batchLinksSheet.setValueFromCoords(7, rowIndex, `✅ ${item.status}`, true);
+      if (item.fileName) {
+        state.batchLinksSheet.setValueFromCoords(3, visibleRowIndex, item.fileName, true);
+        if (state.batchMasterRows[masterRowIndex]) state.batchMasterRows[masterRowIndex][3] = item.fileName;
+      }
+      const statusMsg = `✅ ${item.status}`;
+      state.batchLinksSheet.setValueFromCoords(7, visibleRowIndex, statusMsg, true);
+      if (state.batchMasterRows[masterRowIndex]) {
+        state.batchMasterRows[masterRowIndex][5] = publicMode;
+        state.batchMasterRows[masterRowIndex][7] = statusMsg;
+      }
       toast(`已更新链接权限：${item.status}`);
     } else {
-      state.batchLinksSheet.setValueFromCoords(7, rowIndex, `❌ ${item?.status || '修改失败'}`, true);
+      const failMsg = `❌ ${item?.status || '修改失败'}`;
+      state.batchLinksSheet.setValueFromCoords(7, visibleRowIndex, failMsg, true);
+      if (state.batchMasterRows[masterRowIndex]) state.batchMasterRows[masterRowIndex][7] = failMsg;
       toast(`修改失败：${item?.status || '未知错误'}`);
     }
   } catch (err) {
     state.isUpdatingBatchSheet = true;
-    state.batchLinksSheet.setValueFromCoords(7, rowIndex, `❌ ${err.message}`, true);
+    const errMsg = `❌ ${err.message}`;
+    state.batchLinksSheet.setValueFromCoords(7, visibleRowIndex, errMsg, true);
+    if (state.batchMasterRows[masterRowIndex]) state.batchMasterRows[masterRowIndex][7] = errMsg;
     toast(`修改失败：${err.message}`);
   } finally {
     state.isUpdatingBatchSheet = false;
@@ -704,9 +733,150 @@ function renderScanSpreadsheet(filtered = []) {
   }
 }
 
+function isBatchFilterActive() {
+  const kw = ($('batch-filter-keyword')?.value || '').trim();
+  const myAccess = $('batch-filter-my-access')?.value || 'all';
+  const linkPerm = $('batch-filter-link-perm')?.value || 'all';
+  const typeVal = $('batch-filter-type')?.value || 'all';
+  const execVal = $('batch-filter-exec-status')?.value || 'all';
+  return Boolean(kw || myAccess !== 'all' || linkPerm !== 'all' || typeVal !== 'all' || execVal !== 'all');
+}
+
+function matchesBatchRowFilter(row = []) {
+  const linkStr = String(row[0] || '').trim();
+  const emailStr = String(row[1] || '').trim();
+  if (!linkStr && !emailStr) return false;
+
+  const kw = ($('batch-filter-keyword')?.value || '').trim().toLowerCase();
+  if (kw) {
+    const joined = row.map(c => String(c || '').toLowerCase()).join(' ');
+    if (!joined.includes(kw)) return false;
+  }
+
+  const myAccess = $('batch-filter-my-access')?.value || 'all';
+  const colMy = String(row[4] || '');
+  if (myAccess !== 'all') {
+    if (myAccess === 'can_manage') {
+      if (!colMy.includes('所有者') && !(colMy.includes('可编辑') && !colMy.includes('不可改权限'))) return false;
+    } else if (myAccess === 'owner') {
+      if (!colMy.includes('所有者')) return false;
+    } else if (myAccess === 'writer') {
+      if (!colMy.includes('可编辑')) return false;
+    } else if (myAccess === 'commenter') {
+      if (!colMy.includes('可评论')) return false;
+    } else if (myAccess === 'reader') {
+      if (!colMy.includes('仅可查看') && !colMy.includes('只读')) return false;
+    } else if (myAccess === 'no_access') {
+      if (!colMy.includes('无权限') && !colMy.includes('无效')) return false;
+    } else if (myAccess === 'unscanned') {
+      if (colMy && !colMy.includes('检测中')) return false;
+    }
+  }
+
+  const linkPerm = $('batch-filter-link-perm')?.value || 'all';
+  const colPub = String(row[5] || '');
+  if (linkPerm !== 'all') {
+    if (linkPerm === 'anyone_writer' && colPub !== 'anyone_writer') return false;
+    if (linkPerm === 'anyone_commenter' && colPub !== 'anyone_commenter') return false;
+    if (linkPerm === 'anyone_reader' && colPub !== 'anyone_reader') return false;
+    if (linkPerm === 'anyone_any' && !['anyone_writer', 'anyone_commenter', 'anyone_reader'].includes(colPub)) {
+      return false;
+    }
+    if (linkPerm === 'anyone_off' && colPub !== 'anyone_off') return false;
+  }
+
+  const typeVal = $('batch-filter-type')?.value || 'all';
+  const colType = String(row[2] || '');
+  if (typeVal !== 'all') {
+    if (typeVal === 'folder' && !colType.includes('文件夹')) return false;
+    if (typeVal === 'sheet' && !colType.includes('表格') && !colType.includes('Excel')) return false;
+    if (typeVal === 'doc' && !colType.includes('文档') && !colType.includes('Word') && !colType.includes('PDF')) {
+      return false;
+    }
+    if (typeVal === 'slide' && !colType.includes('演示')) return false;
+    if (
+      typeVal === 'other' &&
+      (colType.includes('文件夹') ||
+        colType.includes('表格') ||
+        colType.includes('Excel') ||
+        colType.includes('文档') ||
+        colType.includes('Word') ||
+        colType.includes('PDF') ||
+        colType.includes('演示'))
+    ) {
+      return false;
+    }
+  }
+
+  const execVal = $('batch-filter-exec-status')?.value || 'all';
+  const colExec = String(row[7] || '');
+  if (execVal !== 'all') {
+    if (execVal === 'ok' && !colExec.includes('✅')) return false;
+    if (execVal === 'error' && !colExec.includes('❌') && !colMy.includes('❌')) return false;
+  }
+
+  return true;
+}
+
+function updateBatchFilterCountBadge() {
+  const masterLinkRows = (state.batchMasterRows || []).filter(r => String(r?.[0] || '').trim());
+  const matchedLinkRows = isBatchFilterActive()
+    ? masterLinkRows.filter(r => matchesBatchRowFilter(r))
+    : masterLinkRows;
+  if ($('batch-filter-result-count')) {
+    $('batch-filter-result-count').textContent = `显示 ${matchedLinkRows.length} / ${masterLinkRows.length} 条链接`;
+  }
+}
+
+function renderBatchMasterToSheet() {
+  if (!state.batchLinksSheet) return;
+  const activeFilter = isBatchFilterActive();
+  const visibleRows = [];
+  const rowMap = [];
+
+  if (!activeFilter) {
+    const total = Math.max(25, state.batchMasterRows.length);
+    for (let i = 0; i < total; i++) {
+      const r = state.batchMasterRows[i] || ['', '', '', '', '', '', '', ''];
+      state.batchMasterRows[i] = r;
+      visibleRows.push([...r]);
+      rowMap.push(i);
+    }
+  } else {
+    for (let i = 0; i < state.batchMasterRows.length; i++) {
+      const r = state.batchMasterRows[i];
+      if (matchesBatchRowFilter(r)) {
+        visibleRows.push([...r]);
+        rowMap.push(i);
+      }
+    }
+    if (visibleRows.length === 0) {
+      visibleRows.push(['', '', '-', '当前筛选条件下无匹配链接', '', '', '', '']);
+      rowMap.push(0);
+    }
+  }
+
+  state.batchVisibleRowMap = rowMap;
+  state.isUpdatingBatchSheet = true;
+  try {
+    state.batchLinksSheet.setData(visibleRows);
+  } finally {
+    state.isUpdatingBatchSheet = false;
+  }
+  updateBatchFilterCountBadge();
+}
+
+function getActiveBatchFileIds() {
+  const rows = isBatchFilterActive()
+    ? (state.batchMasterRows || []).filter(r => matchesBatchRowFilter(r))
+    : state.batchMasterRows || [];
+  const linksText = rows.map(r => String(r?.[0] || '').trim()).filter(Boolean).join('\n');
+  return parseDriveLinksInput(linksText);
+}
+
 function syncBatchSheetToInputs() {
   if (!state.batchLinksSheet) return;
-  const rows = state.batchLinksSheet.getData() || [];
+  const rows = state.batchMasterRows || [];
   const linksLines = [];
   const emailLines = [];
   for (const r of rows) {
@@ -729,6 +899,7 @@ function syncBatchSheetToInputs() {
   if ($('batch-emails-count-label')) {
     $('batch-emails-count-label').textContent = `已识别 ${emails.length} 个邮箱`;
   }
+  updateBatchFilterCountBadge();
 }
 
 function syncInputsToBatchSheet() {
@@ -742,9 +913,9 @@ function syncInputsToBatchSheet() {
     .map(s => s.trim())
     .filter(Boolean);
 
-  const curRows = state.batchLinksSheet.getData() || [];
+  const curRows = state.batchMasterRows || [];
   const totalRows = Math.max(25, linksLines.length, emailLines.length, curRows.length);
-  const nextRows = Array.from({ length: totalRows }, (_, i) => {
+  state.batchMasterRows = Array.from({ length: totalRows }, (_, i) => {
     const prev = curRows[i] || ['', '', '', '', '', '', '', ''];
     return [
       linksLines[i] !== undefined ? linksLines[i] : '',
@@ -758,12 +929,7 @@ function syncInputsToBatchSheet() {
     ];
   });
 
-  state.isUpdatingBatchSheet = true;
-  try {
-    state.batchLinksSheet.setData(nextRows);
-  } finally {
-    state.isUpdatingBatchSheet = false;
-  }
+  renderBatchMasterToSheet();
   syncBatchSheetToInputs();
 }
 
@@ -2140,88 +2306,123 @@ async function init() {
 
   $('batch-links-add-rows-btn')?.addEventListener('click', () => {
     if (state.batchLinksSheet) {
-      const cur = state.batchLinksSheet.getData() || [];
       const extra = Array.from({ length: 20 }, () => ['', '', '', '', '', '', '', '']);
-      state.isUpdatingBatchSheet = true;
-      state.batchLinksSheet.setData([...cur, ...extra]);
-      state.isUpdatingBatchSheet = false;
+      state.batchMasterRows = [...(state.batchMasterRows || []), ...extra];
+      renderBatchMasterToSheet();
       toast('已在表格底部增加 20 行');
     }
   });
 
+  const resetBatchFilterInputs = () => {
+    if ($('batch-filter-keyword')) $('batch-filter-keyword').value = '';
+    if ($('batch-filter-my-access')) $('batch-filter-my-access').value = 'all';
+    if ($('batch-filter-link-perm')) $('batch-filter-link-perm').value = 'all';
+    if ($('batch-filter-type')) $('batch-filter-type').value = 'all';
+    if ($('batch-filter-exec-status')) $('batch-filter-exec-status').value = 'all';
+  };
+
   $('batch-links-clear-btn').addEventListener('click', () => {
     $('batch-links-input').value = '';
     $('batch-emails-input').value = '';
-    if (state.batchLinksSheet) {
-      state.isUpdatingBatchSheet = true;
-      state.batchLinksSheet.setData(Array.from({ length: 25 }, () => ['', '', '', '', '', '', '', '']));
-      state.isUpdatingBatchSheet = false;
-    }
+    resetBatchFilterInputs();
+    state.batchMasterRows = Array.from({ length: 25 }, () => ['', '', '', '', '', '', '', '']);
+    renderBatchMasterToSheet();
     updateBatchLinksParsedInfo();
     toast('已清空表格中的链接与邮箱');
   });
 
+  // 批量链接表格的多维筛选事件绑定
+  let batchFilterDebounce = null;
+  $('batch-filter-keyword')?.addEventListener('input', () => {
+    clearTimeout(batchFilterDebounce);
+    batchFilterDebounce = setTimeout(() => {
+      renderBatchMasterToSheet();
+    }, 100);
+  });
+
+  ['batch-filter-my-access', 'batch-filter-link-perm', 'batch-filter-type', 'batch-filter-exec-status'].forEach(id => {
+    $(id)?.addEventListener('change', () => {
+      renderBatchMasterToSheet();
+    });
+  });
+
+  $('batch-filter-reset-btn')?.addEventListener('click', () => {
+    resetBatchFilterInputs();
+    renderBatchMasterToSheet();
+    toast('已重置批量链接表格筛选条件');
+  });
+
+  $('batch-filter-keep-only-btn')?.addEventListener('click', () => {
+    if (!isBatchFilterActive()) {
+      toast('请先选择至少一个筛选条件，再点击「仅保留当前筛选」');
+      return;
+    }
+    const matched = (state.batchMasterRows || []).filter(r => matchesBatchRowFilter(r));
+    const padCount = Math.max(0, 25 - matched.length);
+    const padded = [...matched, ...Array.from({ length: padCount }, () => ['', '', '', '', '', '', '', ''])];
+    state.batchMasterRows = padded;
+    resetBatchFilterInputs();
+    renderBatchMasterToSheet();
+    syncBatchSheetToInputs();
+    toast(`已剔除未命中项，表格仅保留筛选出的 ${matched.length} 条记录`);
+  });
+
   const renderBatchLinksScanTable = (results = []) => {
-    // 同步更新 Jspreadsheet 表格行（C列类型、D列文件名称、E列我的权限、F列公开权限下拉、G列已授权人数、H列状态）
+    // 同步更新 state.batchMasterRows 并按当前筛选条件渲染 Jspreadsheet
     if (state.batchLinksSheet) {
       const byFileId = new Map(results.map(r => [r.fileId, r]));
-      const rows = state.batchLinksSheet.getData() || [];
-      state.isUpdatingBatchSheet = true;
-      try {
-        for (let rIdx = 0; rIdx < rows.length; rIdx++) {
-          const parsed = parseDriveLinksInput(rows[rIdx]?.[0] || '');
-          if (!parsed.length) continue;
-          const item = byFileId.get(parsed[0]);
-          if (!item) continue;
+      const rows = state.batchMasterRows || [];
+      for (let rIdx = 0; rIdx < rows.length; rIdx++) {
+        const parsed = parseDriveLinksInput(rows[rIdx]?.[0] || '');
+        if (!parsed.length) continue;
+        const item = byFileId.get(parsed[0]);
+        if (!item) continue;
 
-          const typeLabel = item.mimeType ? fileCategoryLabel(item.mimeType, item.name) : '🔗 链接';
-          let pubDropdownId = 'anyone_off';
-          if (item.linkPublicRole === 'writer' || item.linkPublicRole === 'organizer' || item.linkPublicRole === 'fileOrganizer') {
-            pubDropdownId = 'anyone_writer';
-          } else if (item.linkPublicRole === 'commenter') {
-            pubDropdownId = 'anyone_commenter';
-          } else if (item.linkPublicRole === 'reader') {
-            pubDropdownId = 'anyone_reader';
-          }
-
-          const nonOwners = (item.permissions || []).filter(
-            p => p.role !== 'owner' && normalizeEntry(p.emailAddress || '') !== normalizeEntry(item.ownerEmail || '')
-          );
-          let wCount = 0;
-          let rCount = 0;
-          for (const p of nonOwners) {
-            if (p.role === 'reader' || p.role === 'commenter') rCount++;
-            else wCount++;
-          }
-          const countSummary = item.loading
-            ? '⏳ 统计中…'
-            : item.permissions?.length
-            ? `共 ${nonOwners.length} 项 (编辑 ${wCount} / 查看 ${rCount})`
-            : item.linkStatusLabel;
-
-          const execStatus = item.loading
-            ? '⏳ 正在检测…'
-            : item.error
-            ? `❌ ${item.error}`
-            : `✅ 已检测 (${item.linkStatusLabel})`;
-
-          rows[rIdx][2] = typeLabel;
-          rows[rIdx][3] = item.name || item.fileId;
-          rows[rIdx][4] = item.myAccessLabel || '';
-          rows[rIdx][5] = pubDropdownId;
-          rows[rIdx][6] = countSummary;
-          rows[rIdx][7] = execStatus;
+        const typeLabel = item.mimeType ? fileCategoryLabel(item.mimeType, item.name) : '🔗 链接';
+        let pubDropdownId = 'anyone_off';
+        if (item.linkPublicRole === 'writer' || item.linkPublicRole === 'organizer' || item.linkPublicRole === 'fileOrganizer') {
+          pubDropdownId = 'anyone_writer';
+        } else if (item.linkPublicRole === 'commenter') {
+          pubDropdownId = 'anyone_commenter';
+        } else if (item.linkPublicRole === 'reader') {
+          pubDropdownId = 'anyone_reader';
         }
-        state.batchLinksSheet.setData(rows);
-      } finally {
-        state.isUpdatingBatchSheet = false;
+
+        const nonOwners = (item.permissions || []).filter(
+          p => p.role !== 'owner' && normalizeEntry(p.emailAddress || '') !== normalizeEntry(item.ownerEmail || '')
+        );
+        let wCount = 0;
+        let rCount = 0;
+        for (const p of nonOwners) {
+          if (p.role === 'reader' || p.role === 'commenter') rCount++;
+          else wCount++;
+        }
+        const countSummary = item.loading
+          ? '⏳ 统计中…'
+          : item.permissions?.length
+          ? `共 ${nonOwners.length} 项 (编辑 ${wCount} / 查看 ${rCount})`
+          : item.linkStatusLabel;
+
+        const execStatus = item.loading
+          ? '⏳ 正在检测…'
+          : item.error
+          ? `❌ ${item.error}`
+          : `✅ 已检测 (${item.linkStatusLabel})`;
+
+        rows[rIdx][2] = typeLabel;
+        rows[rIdx][3] = item.name || item.fileId;
+        rows[rIdx][4] = item.myAccessLabel || '';
+        rows[rIdx][5] = pubDropdownId;
+        rows[rIdx][6] = countSummary;
+        rows[rIdx][7] = execStatus;
       }
+      renderBatchMasterToSheet();
     }
   };
 
   const handleScanBatchLinks = async () => {
     syncBatchSheetToInputs();
-    const fileIds = parseDriveLinksInput($('batch-links-input').value || '');
+    const fileIds = getActiveBatchFileIds();
     if (!fileIds.length) {
       toast('请先在表格 A 列粘贴至少 1 个 Google 文件或文件夹链接');
       return;
@@ -2255,7 +2456,7 @@ async function init() {
 
   const handleApplyPublicModeToLinks = async (targetFileIds, publicMode) => {
     if (!targetFileIds.length) {
-      toast('请先在表格 A 列粘贴至少 1 个 Google 文件或文件夹链接');
+      toast('当前表格（或筛选结果）中没有可处理的链接');
       return;
     }
 
@@ -2268,7 +2469,7 @@ async function init() {
 
     if (
       targetFileIds.length > 1 &&
-      !confirm(`确认对 ${targetFileIds.length} 个链接直接设置为：\n「${modeMap[publicMode] || publicMode}」？\n（无需填写邮箱，直接修改链接公开权限）`)
+      !confirm(`确认对当前列表中的 ${targetFileIds.length} 个链接直接设置为：\n「${modeMap[publicMode] || publicMode}」？\n（无需填写邮箱，直接修改链接公开权限）`)
     ) {
       return;
     }
@@ -2291,8 +2492,7 @@ async function init() {
 
       if (state.batchLinksSheet && Array.isArray(res.results)) {
         const resById = new Map(res.results.map(r => [r.fileId, r]));
-        const rows = state.batchLinksSheet.getData() || [];
-        state.isUpdatingBatchSheet = true;
+        const rows = state.batchMasterRows || [];
         for (let rIdx = 0; rIdx < rows.length; rIdx++) {
           const parsed = parseDriveLinksInput(rows[rIdx]?.[0] || '');
           if (!parsed.length) continue;
@@ -2306,8 +2506,7 @@ async function init() {
             rows[rIdx][7] = `❌ ${item.status}`;
           }
         }
-        state.batchLinksSheet.setData(rows);
-        state.isUpdatingBatchSheet = false;
+        renderBatchMasterToSheet();
       }
 
       $('progress').textContent = `公开权限设置完成：成功 ${res.successCount} 个链接，失败 ${res.failCount} 个`;
@@ -2321,7 +2520,7 @@ async function init() {
 
   $('batch-links-public-apply-btn').addEventListener('click', () => {
     syncBatchSheetToInputs();
-    const fileIds = parseDriveLinksInput($('batch-links-input').value || '');
+    const fileIds = getActiveBatchFileIds();
     const publicMode = $('batch-links-public-mode').value || 'anyone_writer';
     handleApplyPublicModeToLinks(fileIds, publicMode);
   });
@@ -2349,7 +2548,7 @@ async function init() {
 
   const handleBatchLinksAction = async (mode = 'grant') => {
     syncBatchSheetToInputs();
-    const fileIds = parseDriveLinksInput($('batch-links-input').value || '');
+    const fileIds = getActiveBatchFileIds();
     const emails = parseEmailsInput($('batch-emails-input').value || '');
     const role = $('batch-links-role').value || 'reader';
 
@@ -2369,7 +2568,7 @@ async function init() {
 
     if (
       !confirm(
-        `确认对已识别的 ${fileIds.length} 个链接、${emails.length} 个邮箱执行：\n「${actionDesc}」？\n（全程静默处理，不发送骚扰邮件通知）`
+        `确认对当前筛选/列表中的 ${fileIds.length} 个链接、${emails.length} 个邮箱执行：\n「${actionDesc}」？\n（全程静默处理，不发送骚扰邮件通知）`
       )
     ) {
       return;
@@ -2396,18 +2595,17 @@ async function init() {
       renderAll();
 
       if (state.batchLinksSheet) {
-        const rows = state.batchLinksSheet.getData() || [];
-        state.isUpdatingBatchSheet = true;
+        const targetSet = new Set(fileIds);
+        const rows = state.batchMasterRows || [];
         for (let rIdx = 0; rIdx < rows.length; rIdx++) {
           const parsed = parseDriveLinksInput(rows[rIdx]?.[0] || '');
-          if (!parsed.length) continue;
+          if (!parsed.length || !targetSet.has(parsed[0])) continue;
           rows[rIdx][7] =
             mode === 'grant'
               ? `✅ 已对 ${emails.length} 个邮箱开通${roleLabel(role)}`
               : `✅ 已移除 ${emails.length} 个邮箱权限`;
         }
-        state.batchLinksSheet.setData(rows);
-        state.isUpdatingBatchSheet = false;
+        renderBatchMasterToSheet();
       }
 
       $('progress').textContent = `批量链接处理完成：成功 ${res.successCount} 项，失败 ${res.failCount} 项`;
