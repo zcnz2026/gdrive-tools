@@ -1926,8 +1926,143 @@ async function init() {
   $('batch-links-clear-btn').addEventListener('click', () => {
     $('batch-links-input').value = '';
     $('batch-emails-input').value = '';
+    $('batch-links-scan-results-wrap')?.classList.add('hidden');
     updateBatchLinksParsedInfo();
     toast('已清空链接与邮箱输入');
+  });
+
+  $('close-batch-scan-results-btn')?.addEventListener('click', () => {
+    $('batch-links-scan-results-wrap')?.classList.add('hidden');
+  });
+
+  const renderBatchLinksScanTable = (results = []) => {
+    const wrap = $('batch-links-scan-results-wrap');
+    const tbody = $('batch-links-scan-rows');
+    if (!wrap || !tbody) return;
+    wrap.classList.remove('hidden');
+
+    tbody.innerHTML = results
+      .map(item => {
+        const typeLabel = item.mimeType ? fileCategoryLabel(item.mimeType, item.name) : '🔗 链接';
+        const quickActions = item.canShare
+          ? `<div class="row-actions-inline">
+              <button type="button" class="btn btn-xs warning" data-action="quick-link-public" data-file-id="${escapeHtml(item.fileId)}" data-mode="anyone_writer">所有人可编辑</button>
+              <button type="button" class="btn btn-xs" data-action="quick-link-public" data-file-id="${escapeHtml(item.fileId)}" data-mode="anyone_reader">所有人可查看</button>
+              <button type="button" class="btn btn-xs danger" data-action="quick-link-public" data-file-id="${escapeHtml(item.fileId)}" data-mode="anyone_off">关闭公开</button>
+            </div>`
+          : `<span class="muted">${item.loading ? '检测中…' : '无改权限能力'}</span>`;
+
+        return `<tr class="compact-row">
+          <td>${item.index}</td>
+          <td>
+            <div class="single-line-cell" title="${escapeHtml(item.name)} (ID: ${escapeHtml(item.fileId)})">
+              <span class="badge">${escapeHtml(typeLabel)}</span>
+              <a class="file-name-nowrap" href="${escapeHtml(item.webViewLink)}" target="_blank" rel="noreferrer">${escapeHtml(item.name)}</a>
+            </div>
+          </td>
+          <td>
+            <span class="status-pill ${escapeHtml(item.myAccessClass)}">${escapeHtml(item.myAccessLabel)}</span>
+          </td>
+          <td>
+            <span class="status-pill ${escapeHtml(item.linkStatusClass)}">${escapeHtml(item.linkStatusLabel)}</span>
+          </td>
+          <td>${quickActions}</td>
+        </tr>`;
+      })
+      .join('');
+  };
+
+  const handleScanBatchLinks = async () => {
+    const fileIds = parseDriveLinksInput($('batch-links-input').value || '');
+    if (!fileIds.length) {
+      toast('请先在左下方输入框粘贴至少 1 个 Google 文件或文件夹链接');
+      return;
+    }
+
+    $('batch-links-scan-btn').disabled = true;
+    $('progress').textContent = `正在扫描 ${fileIds.length} 个链接的权限…`;
+    try {
+      const results = await scanBatchLinksStatus({
+        fileIds,
+        targetAccount: state.activeAccount,
+        onProgress(p) {
+          if (p?.message) $('progress').textContent = p.message;
+        },
+        onPartialResults(liveResults) {
+          renderBatchLinksScanTable(liveResults);
+        }
+      });
+      renderBatchLinksScanTable(results);
+      $('progress').textContent = `链接权限扫描完成：共检测 ${results.length} 个链接`;
+      toast(`已扫描 ${results.length} 个链接的权限状态`);
+    } catch (error) {
+      $('progress').textContent = `扫描链接权限失败：${error.message}`;
+      toast(`扫描失败：${error.message}`);
+    } finally {
+      $('batch-links-scan-btn').disabled = false;
+    }
+  };
+
+  $('batch-links-scan-btn').addEventListener('click', handleScanBatchLinks);
+
+  const handleApplyPublicModeToLinks = async (targetFileIds, publicMode) => {
+    if (!targetFileIds.length) {
+      toast('请先在左下方输入框粘贴至少 1 个 Google 文件或文件夹链接');
+      return;
+    }
+
+    const modeMap = {
+      anyone_writer: '🌐 所有人可编辑（知道链接的任何人均可编辑）',
+      anyone_reader: '🌐 所有人可查看（知道链接的任何人仅可查看）',
+      anyone_commenter: '🌐 所有人可评论（知道链接的任何人可评论）',
+      anyone_off: '🔒 关闭公开链接（恢复仅指定邮箱可访问）'
+    };
+
+    if (
+      targetFileIds.length > 1 &&
+      !confirm(`确认对 ${targetFileIds.length} 个链接直接设置为：\n「${modeMap[publicMode] || publicMode}」？\n（无需填写邮箱，直接修改链接公开权限）`)
+    ) {
+      return;
+    }
+
+    $('batch-links-public-apply-btn').disabled = true;
+    $('progress').textContent = `正在批量设置链接公开权限…`;
+    try {
+      const res = await executeBatchLinksPublicAccess({
+        fileIds: targetFileIds,
+        publicMode,
+        existingFiles: state.files,
+        targetAccount: state.activeAccount,
+        onProgress(p) {
+          if (p?.message) $('progress').textContent = p.message;
+        }
+      });
+      await saveCurrentFilesSnapshot();
+      state.logs = await getAuditLogs();
+      renderAll();
+      $('progress').textContent = `公开权限设置完成：成功 ${res.successCount} 个链接，失败 ${res.failCount} 个`;
+      toast(`完成：成功设置 ${res.successCount} 个链接，失败 ${res.failCount} 个`);
+      // 若扫描结果表当前打开，自动刷新扫描结果表
+      if (!$('batch-links-scan-results-wrap')?.classList.contains('hidden')) {
+        await handleScanBatchLinks();
+      }
+    } catch (error) {
+      toast(`设置失败：${error.message}`);
+    } finally {
+      $('batch-links-public-apply-btn').disabled = false;
+    }
+  };
+
+  $('batch-links-public-apply-btn').addEventListener('click', () => {
+    const fileIds = parseDriveLinksInput($('batch-links-input').value || '');
+    const publicMode = $('batch-links-public-mode').value || 'anyone_writer';
+    handleApplyPublicModeToLinks(fileIds, publicMode);
+  });
+
+  $('batch-links-scan-rows')?.addEventListener('click', e => {
+    const btn = e.target.closest('button[data-action="quick-link-public"]');
+    if (!btn) return;
+    handleApplyPublicModeToLinks([btn.dataset.fileId], btn.dataset.mode);
   });
 
   $('batch-links-fill-group').addEventListener('change', e => {

@@ -222,6 +222,24 @@ h2 {
   padding: 10px;
 }
 
+.batch-scan-results {
+  flex: 1.1;
+  min-height: 180px;
+  max-height: 48%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.batch-scan-table-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 7px;
+}
+
 .results-header-bar {
   background: #ebf3fe;
   border-bottom: 1px solid #d4e3fc;

@@ -1814,46 +1814,51 @@ async function executeBatchLinksPermissions({
   const existingMap = new Map(existingFiles.map(f => [f.id, f]));
   const fileMetaMap = new Map();
 
-  // 先解析每个 fileId 对应的文件名与可用 token
-  for (const fid of cleanFileIds) {
-    const localFile = existingMap.get(fid);
-    const preferredEmail = normalizeEntry(localFile?.ownerAccount || localFile?.owners?.[0]?.emailAddress || '');
-    const preferredEntry = tokenPool.find(x => x.email && x.email === preferredEmail) || tokenPool[0];
+  // 并发解析每个 fileId 对应的文件名与可用 token（避免逐个串行等待）
+  let metaCursor = 0;
+  const metaWorkers = Array.from({ length: Math.min(10, cleanFileIds.length) }, async () => {
+    while (metaCursor < cleanFileIds.length) {
+      const fid = cleanFileIds[metaCursor++];
+      const localFile = existingMap.get(fid);
+      const preferredEmail = normalizeEntry(localFile?.ownerAccount || localFile?.owners?.[0]?.emailAddress || '');
+      const preferredEntry = tokenPool.find(x => x.email && x.email === preferredEmail) || tokenPool[0];
 
-    let resolvedToken = preferredEntry.token;
-    let resolvedAccount = preferredEntry.email;
-    let fileName = localFile?.name || `文件 (${fid.slice(0, 8)}…)`;
-    let webViewLink = localFile?.webViewLink || `https://drive.google.com/open?id=${fid}`;
+      let resolvedToken = preferredEntry.token;
+      let resolvedAccount = preferredEntry.email;
+      let fileName = localFile?.name || `文件 (${fid.slice(0, 8)}…)`;
+      let webViewLink = localFile?.webViewLink || `https://drive.google.com/open?id=${fid}`;
 
-    if (!localFile) {
-      for (const entry of tokenPool) {
-        try {
-          const meta = await driveApi(
-            entry.token,
-            `/files/${encodeURIComponent(fid)}?supportsAllDrives=true&fields=id,name,webViewLink,owners(emailAddress)`
-          );
-          if (meta) {
-            resolvedToken = entry.token;
-            resolvedAccount = entry.email || normalizeEntry(meta.owners?.[0]?.emailAddress || '');
-            fileName = meta.name || fileName;
-            webViewLink = meta.webViewLink || webViewLink;
-            break;
+      if (!localFile) {
+        for (const entry of tokenPool) {
+          try {
+            const meta = await driveApi(
+              entry.token,
+              `/files/${encodeURIComponent(fid)}?supportsAllDrives=true&fields=id,name,webViewLink,owners(emailAddress)`
+            );
+            if (meta) {
+              resolvedToken = entry.token;
+              resolvedAccount = entry.email || normalizeEntry(meta.owners?.[0]?.emailAddress || '');
+              fileName = meta.name || fileName;
+              webViewLink = meta.webViewLink || webViewLink;
+              break;
+            }
+          } catch (_e) {
+            // try next account token
           }
-        } catch (_e) {
-          // try next account token
         }
       }
-    }
 
-    fileMetaMap.set(fid, {
-      fileId: fid,
-      fileName,
-      webViewLink,
-      token: resolvedToken,
-      accountEmail: resolvedAccount,
-      localFile
-    });
-  }
+      fileMetaMap.set(fid, {
+        fileId: fid,
+        fileName,
+        webViewLink,
+        token: resolvedToken,
+        accountEmail: resolvedAccount,
+        localFile
+      });
+    }
+  });
+  await Promise.all(metaWorkers);
 
   // 构建任务队列
   const tasks = [];
@@ -1864,30 +1869,35 @@ async function executeBatchLinksPermissions({
       }
     }
   } else {
-    // mode === 'revoke': 先读取每个文件的权限列表，找出命中 cleanEmails 的权限项
+    // mode === 'revoke': 并发读取每个文件的权限列表，找出命中 cleanEmails 的权限项
     const emailSet = new Set(cleanEmails);
-    for (const fid of cleanFileIds) {
-      const meta = fileMetaMap.get(fid);
-      try {
-        let perms = meta.localFile?.permissions;
-        if (!perms || !perms.length) {
-          const data = await driveApi(
-            meta.token,
-            `/files/${encodeURIComponent(fid)}/permissions?supportsAllDrives=true&pageSize=100&fields=permissions(id,type,role,emailAddress)`
-          );
-          perms = data?.permissions || [];
-        }
-        for (const p of perms) {
-          if (p.role === 'owner') continue;
-          const em = normalizeEntry(p.emailAddress || '');
-          if (em && emailSet.has(em)) {
-            tasks.push({ type: 'revoke', fileId: fid, email: em, permissionId: p.id, previousRole: p.role });
+    let revCursor = 0;
+    const revWorkers = Array.from({ length: Math.min(10, cleanFileIds.length) }, async () => {
+      while (revCursor < cleanFileIds.length) {
+        const fid = cleanFileIds[revCursor++];
+        const meta = fileMetaMap.get(fid);
+        try {
+          let perms = meta.localFile?.permissions;
+          if (!perms || !perms.length) {
+            const data = await driveApi(
+              meta.token,
+              `/files/${encodeURIComponent(fid)}/permissions?supportsAllDrives=true&pageSize=100&fields=permissions(id,type,role,emailAddress)`
+            );
+            perms = data?.permissions || [];
           }
+          for (const p of perms) {
+            if (p.role === 'owner') continue;
+            const em = normalizeEntry(p.emailAddress || '');
+            if (em && emailSet.has(em)) {
+              tasks.push({ type: 'revoke', fileId: fid, email: em, permissionId: p.id, previousRole: p.role });
+            }
+          }
+        } catch (_e) {
+          // ignore
         }
-      } catch (_e) {
-        // ignore
       }
-    }
+    });
+    await Promise.all(revWorkers);
   }
 
   let successCount = 0;
@@ -1896,7 +1906,7 @@ async function executeBatchLinksPermissions({
   let cursor = 0;
   const logs = [];
 
-  const workers = Array.from({ length: 6 }, async () => {
+  const workers = Array.from({ length: 12 }, async () => {
     while (cursor < tasks.length) {
       const task = tasks[cursor++];
       const meta = fileMetaMap.get(task.fileId);
@@ -2011,4 +2021,385 @@ async function executeBatchLinksPermissions({
     successCount,
     failCount
   };
+}
+
+
+/**
+ * 免填邮箱：对一批链接直接设置公开权限（所有人可编辑 / 所有人可查看 / 所有人可评论 / 关闭公开链接）
+ * mode: 'anyone_writer' | 'anyone_reader' | 'anyone_commenter' | 'anyone_off'
+ */
+async function executeBatchLinksPublicAccess({
+  fileIds = [],
+  publicMode = 'anyone_writer',
+  existingFiles = [],
+  targetAccount = 'all',
+  onProgress = null
+}) {
+  const cleanFileIds = [...new Set(fileIds.filter(Boolean))];
+  if (!cleanFileIds.length) {
+    throw new Error('请先输入至少 1 个有效链接');
+  }
+
+  const accounts = await getAuthorizedAccounts();
+  const tokenPool = [];
+  if (accounts.length > 0) {
+    const ordered =
+      targetAccount && targetAccount !== 'all'
+        ? [
+            ...accounts.filter(a => normalizeEntry(a.email) === normalizeEntry(targetAccount)),
+            ...accounts.filter(a => normalizeEntry(a.email) !== normalizeEntry(targetAccount))
+          ]
+        : accounts;
+    for (const acc of ordered) {
+      try {
+        const t = await getValidTokenForAccount(acc.email, false);
+        if (t) tokenPool.push({ email: normalizeEntry(acc.email), token: t });
+      } catch (_e) {
+        // ignore
+      }
+    }
+  }
+  if (!tokenPool.length) {
+    const fallbackToken = await getValidTokenForAccount(targetAccount !== 'all' ? targetAccount : '', true);
+    tokenPool.push({ email: '', token: fallbackToken });
+  }
+
+  const existingMap = new Map(existingFiles.map(f => [f.id, f]));
+  const desiredRole =
+    publicMode === 'anyone_writer' ? 'writer' : publicMode === 'anyone_commenter' ? 'commenter' : 'reader';
+
+  let successCount = 0;
+  let failCount = 0;
+  let done = 0;
+  let cursor = 0;
+  const logs = [];
+
+  const workers = Array.from({ length: Math.min(10, cleanFileIds.length) }, async () => {
+    while (cursor < cleanFileIds.length) {
+      const fid = cleanFileIds[cursor++];
+      const localFile = existingMap.get(fid);
+      let fileName = localFile?.name || `文件 (${fid.slice(0, 8)}…)`;
+      let webViewLink = localFile?.webViewLink || `https://drive.google.com/open?id=${fid}`;
+      let usedAccount = '';
+
+      try {
+        // 找到可操作此文件的 token
+        let activeToken = tokenPool[0].token;
+        usedAccount = tokenPool[0].email;
+        for (const entry of tokenPool) {
+          try {
+            const meta = await driveApi(
+              entry.token,
+              `/files/${encodeURIComponent(fid)}?supportsAllDrives=true&fields=id,name,webViewLink,capabilities(canShare)`
+            );
+            if (meta) {
+              activeToken = entry.token;
+              usedAccount = entry.email;
+              fileName = meta.name || fileName;
+              webViewLink = meta.webViewLink || webViewLink;
+              if (meta.capabilities?.canShare) break;
+            }
+          } catch (_e) {
+            // try next
+          }
+        }
+
+        if (publicMode === 'anyone_off') {
+          const permData = await driveApi(
+            activeToken,
+            `/files/${encodeURIComponent(fid)}/permissions?supportsAllDrives=true&fields=permissions(id,type,role)`
+          );
+          const pubPerms = (permData?.permissions || []).filter(p => p.type === 'anyone' || p.type === 'domain');
+          for (const pp of pubPerms) {
+            await deletePermission(activeToken, fid, pp.id);
+          }
+          if (localFile && localFile.permissions) {
+            localFile.permissions = localFile.permissions.filter(p => p.type !== 'anyone' && p.type !== 'domain');
+          }
+          successCount++;
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'manual',
+            actionType: 'revoke',
+            accountEmail: usedAccount,
+            fileId: fid,
+            fileName,
+            webViewLink,
+            targetType: 'anyone',
+            targetLabel: '公开链接 (任何人)',
+            restored: false,
+            message: `批量关闭公开链接（恢复受限访问）`
+          });
+        } else {
+          // 设为任何人可编辑 / 查看 / 评论（每个链接只需 1 次请求，无需填邮箱）
+          const created = await createPermission(activeToken, fid, {
+            type: 'anyone',
+            role: desiredRole
+          });
+          if (localFile) {
+            localFile.permissions = localFile.permissions || [];
+            const existAnyone = localFile.permissions.find(p => p.type === 'anyone');
+            if (existAnyone) {
+              existAnyone.role = desiredRole;
+            } else {
+              localFile.permissions.push({
+                id: created?.id || 'anyoneWithLink',
+                type: 'anyone',
+                role: desiredRole
+              });
+            }
+          }
+          successCount++;
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'manual',
+            actionType: 'grant',
+            accountEmail: usedAccount,
+            fileId: fid,
+            fileName,
+            webViewLink,
+            permissionId: created?.id || 'anyoneWithLink',
+            targetType: 'anyone',
+            targetLabel: '公开链接 (任何人)',
+            newRole: desiredRole,
+            restored: false,
+            message: `批量设置公开链接：任何人「${roleLabel(desiredRole)}」`
+          });
+        }
+      } catch (error) {
+        failCount++;
+        logs.push({
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: new Date().toISOString(),
+          source: 'manual',
+          actionType: 'error',
+          accountEmail: usedAccount,
+          fileId: fid,
+          fileName,
+          webViewLink,
+          targetType: 'anyone',
+          targetLabel: '公开链接 (任何人)',
+          restored: false,
+          message: `设置公开链接失败：${error.message}`
+        });
+      } finally {
+        done++;
+        if (onProgress) {
+          onProgress({
+            done,
+            total: cleanFileIds.length,
+            successCount,
+            failCount,
+            message: `正在设置链接公开权限 ${done}/${cleanFileIds.length}（成功 ${successCount}，失败 ${failCount}）…`
+          });
+        }
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  if (logs.length) await appendAuditLogs(logs);
+  return { total: cleanFileIds.length, successCount, failCount };
+}
+
+/**
+ * 扫描一批输入的链接：查看「我对该链接有什么权限」以及「目前该链接对外是什么权限（如任何人可编辑/查看/受限）」
+ */
+async function scanBatchLinksStatus({
+  fileIds = [],
+  targetAccount = 'all',
+  onProgress = null,
+  onPartialResults = null
+}) {
+  const cleanFileIds = [...new Set(fileIds.filter(Boolean))];
+  if (!cleanFileIds.length) {
+    throw new Error('请先粘贴要扫描的链接');
+  }
+
+  const accounts = await getAuthorizedAccounts();
+  const tokenPool = [];
+  if (accounts.length > 0) {
+    const ordered =
+      targetAccount && targetAccount !== 'all'
+        ? [
+            ...accounts.filter(a => normalizeEntry(a.email) === normalizeEntry(targetAccount)),
+            ...accounts.filter(a => normalizeEntry(a.email) !== normalizeEntry(targetAccount))
+          ]
+        : accounts;
+    for (const acc of ordered) {
+      try {
+        const t = await getValidTokenForAccount(acc.email, false);
+        if (t) tokenPool.push({ email: normalizeEntry(acc.email), token: t });
+      } catch (_e) {
+        // ignore
+      }
+    }
+  }
+  if (!tokenPool.length) {
+    const fallbackToken = await getValidTokenForAccount(targetAccount !== 'all' ? targetAccount : '', true);
+    tokenPool.push({ email: '', token: fallbackToken });
+  }
+
+  const results = cleanFileIds.map((fid, idx) => ({
+    index: idx + 1,
+    fileId: fid,
+    name: `正在检测 (${fid.slice(0, 10)}…)`,
+    mimeType: '',
+    webViewLink: `https://drive.google.com/open?id=${fid}`,
+    loading: true,
+    accessible: false,
+    matchedAccount: '',
+    ownerEmail: '',
+    myAccessLabel: '⏳ 检测中…',
+    myAccessClass: 'private',
+    canShare: false,
+    linkStatusLabel: '⏳ 检测中…',
+    linkStatusClass: 'private',
+    linkPublicRole: 'none', // 'writer' | 'commenter' | 'reader' | 'domain' | 'restricted' | 'unknown'
+    permissions: [],
+    error: ''
+  }));
+
+  if (onPartialResults) onPartialResults(results);
+
+  let cursor = 0;
+  let finished = 0;
+
+  const workers = Array.from({ length: Math.min(10, cleanFileIds.length) }, async () => {
+    while (cursor < cleanFileIds.length) {
+      const i = cursor++;
+      const item = results[i];
+      const fid = item.fileId;
+
+      let bestMeta = null;
+      let bestEntry = null;
+      let lastErr = '';
+
+      // 尝试用已授权账号读取该链接元数据与能力 (capabilities)
+      for (const entry of tokenPool) {
+        try {
+          const meta = await driveApi(
+            entry.token,
+            `/files/${encodeURIComponent(fid)}?supportsAllDrives=true&fields=id,name,mimeType,webViewLink,ownedByMe,shared,owners(emailAddress,displayName),capabilities(canEdit,canComment,canShare)`
+          );
+          if (meta) {
+            bestMeta = meta;
+            bestEntry = entry;
+            // 如果当前账号拥有所有权或分享管理权，优先采用该账号
+            if (meta.ownedByMe || meta.capabilities?.canShare || meta.capabilities?.canEdit) {
+              break;
+            }
+          }
+        } catch (err) {
+          lastErr = err.message;
+        }
+      }
+
+      if (!bestMeta) {
+        item.loading = false;
+        item.accessible = false;
+        item.name = `无法访问 (${fid.slice(0, 12)}…)`;
+        item.myAccessLabel = '❌ 无权限访问 / 链接无效';
+        item.myAccessClass = 'danger';
+        item.linkStatusLabel = '🔒 受限（当前账号无权打开）';
+        item.linkStatusClass = 'danger';
+        item.error = lastErr || '无访问权限';
+      } else {
+        item.accessible = true;
+        item.name = bestMeta.name || fid;
+        item.mimeType = bestMeta.mimeType || '';
+        item.webViewLink = bestMeta.webViewLink || item.webViewLink;
+        item.matchedAccount = bestEntry.email || '';
+        item.ownerEmail = normalizeEntry(bestMeta.owners?.[0]?.emailAddress || '');
+        item.canShare = Boolean(bestMeta.ownedByMe || bestMeta.capabilities?.canShare);
+
+        // 1. 判定「我对这个链接有什么权限」
+        if (bestMeta.ownedByMe) {
+          item.myAccessLabel = '👑 我是所有者 (最高权限)';
+          item.myAccessClass = 'ok';
+        } else if (bestMeta.capabilities?.canEdit && bestMeta.capabilities?.canShare) {
+          item.myAccessLabel = '✏️ 我可编辑 (且可改权限)';
+          item.myAccessClass = 'ok';
+        } else if (bestMeta.capabilities?.canEdit) {
+          item.myAccessLabel = '✏️ 我可编辑 (不可改权限)';
+          item.myAccessClass = 'warning';
+        } else if (bestMeta.capabilities?.canComment) {
+          item.myAccessLabel = '💬 我仅可评论 (不可编辑)';
+          item.myAccessClass = 'warning';
+        } else {
+          item.myAccessLabel = '👁️ 我仅可查看 (只读)';
+          item.myAccessClass = 'private';
+        }
+
+        // 2. 读取权限明细，判定「目前这个链接对外是什么权限（如任何人可编辑/查看/受限）」
+        try {
+          const permRes = await driveApi(
+            bestEntry.token,
+            `/files/${encodeURIComponent(fid)}/permissions?supportsAllDrives=true&pageSize=100&fields=permissions(id,type,role,emailAddress,domain,displayName)`
+          );
+          const perms = permRes?.permissions || [];
+          item.permissions = perms;
+
+          const anyonePerm = perms.find(p => p.type === 'anyone');
+          const domainPerm = perms.find(p => p.type === 'domain');
+
+          if (anyonePerm) {
+            item.linkPublicRole = anyonePerm.role;
+            if (anyonePerm.role === 'writer' || anyonePerm.role === 'organizer' || anyonePerm.role === 'fileOrganizer') {
+              item.linkStatusLabel = '🌐 任何人可编辑 (公开可编辑)';
+              item.linkStatusClass = 'danger';
+            } else if (anyonePerm.role === 'commenter') {
+              item.linkStatusLabel = '🌐 任何人可评论 (公开可评论)';
+              item.linkStatusClass = 'warning';
+            } else {
+              item.linkStatusLabel = '🌐 任何人可查看 (公开只读)';
+              item.linkStatusClass = 'ok';
+            }
+          } else if (domainPerm) {
+            item.linkPublicRole = 'domain';
+            item.linkStatusLabel = `🏢 域内公开 (${domainPerm.domain || '组织内'} · ${roleLabel(domainPerm.role)})`;
+            item.linkStatusClass = 'warning';
+          } else {
+            item.linkPublicRole = 'restricted';
+            const nonOwners = perms.filter(
+              p => p.role !== 'owner' && normalizeEntry(p.emailAddress || '') !== item.ownerEmail
+            );
+            item.linkStatusLabel =
+              nonOwners.length > 0
+                ? `🔒 受限（仅指定 ${nonOwners.length} 个邮箱可访问）`
+                : '🔒 私密（仅所有者本人可访问）';
+            item.linkStatusClass = 'private';
+          }
+        } catch (_permErr) {
+          // 当我对该文件只有“仅查看”权限时，Google 可能不允许列出全部他人权限
+          item.linkPublicRole = 'unknown';
+          if (bestMeta.capabilities?.canEdit) {
+            item.linkStatusLabel = '🌐 公开可编辑 或 已对我授权编辑';
+            item.linkStatusClass = 'warning';
+          } else {
+            item.linkStatusLabel = '👁️ 对我只读（非管理员无法查看完整权限列表）';
+            item.linkStatusClass = 'private';
+          }
+        }
+      }
+
+      item.loading = false;
+      finished++;
+      if (onProgress) {
+        onProgress({
+          done: finished,
+          total: cleanFileIds.length,
+          message: `正在扫描链接权限 ${finished}/${cleanFileIds.length}…`
+        });
+      }
+      if (onPartialResults) {
+        onPartialResults(results);
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
 }

@@ -99,35 +99,57 @@
           </div>
         </div>
 
-        <!-- 左侧面板 2：大尺寸批量链接直通授权工作台 -->
+        <!-- 左侧面板 2：大尺寸批量链接直通授权与权限扫描工作台 -->
         <div id="left-panel-batch-links" class="left-tab-panel">
           <div class="batch-links-workspace">
-            <!-- 顶部操作控制条 -->
-            <div class="batch-links-toolbar section-block block-green">
-              <div class="row-flex" style="flex-wrap: wrap;">
-                <strong>批量执行动作：</strong>
-                <select id="batch-links-role" class="select">
-                  <option value="reader">授予权限：查看 (仅查看)</option>
-                  <option value="writer">授予权限：编辑 (可编辑)</option>
-                  <option value="commenter">授予权限：评论 (可评论)</option>
-                </select>
-                <button id="batch-links-grant-btn" type="button" class="btn primary">
-                  批量开通权限
-                </button>
-                <button id="batch-links-revoke-btn" type="button" class="btn danger" title="从下方链接中批量移除这些邮箱的权限">
-                  批量关闭权限
-                </button>
+            <!-- 顶部操作控制条（分两行：第1行 扫描链接权限 & 免邮箱公开权限；第2行 按指定邮箱赋权） -->
+            <div class="batch-links-toolbar section-block block-green" style="flex-direction: column; align-items: stretch; gap: 8px;">
+              <div class="row-flex" style="justify-content: space-between; flex-wrap: wrap;">
+                <div class="row-flex" style="flex-wrap: wrap;">
+                  <button id="batch-links-scan-btn" type="button" class="btn primary">
+                    🔍 扫描这批链接的权限
+                  </button>
+                  <span style="color:#cbd5e1;">|</span>
+                  <strong>免填邮箱（公开权限）：</strong>
+                  <select id="batch-links-public-mode" class="select">
+                    <option value="anyone_writer">🌐 所有人可编辑 (知道链接即可编辑)</option>
+                    <option value="anyone_reader">🌐 所有人可查看 (知道链接仅可查看)</option>
+                    <option value="anyone_commenter">🌐 所有人可评论 (知道链接可评论)</option>
+                    <option value="anyone_off">🔒 关闭公开链接 (仅限指定邮箱访问)</option>
+                  </select>
+                  <button id="batch-links-public-apply-btn" type="button" class="btn warning">
+                    一键应用公开权限 (无需邮箱)
+                  </button>
+                </div>
+
+                <button id="batch-links-clear-btn" type="button" class="btn btn-sm">清空输入</button>
               </div>
 
-              <div class="row-flex">
-                <select id="batch-links-fill-group" class="select select-sm">
-                  <option value="">+从分组快速填入邮箱…</option>
-                </select>
-                <button id="batch-links-clear-btn" type="button" class="btn btn-sm">清空输入</button>
+              <div class="row-flex" style="justify-content: space-between; flex-wrap: wrap; border-top: 1px dashed #bbf7d0; padding-top: 7px;">
+                <div class="row-flex" style="flex-wrap: wrap;">
+                  <strong>按指定邮箱授权：</strong>
+                  <select id="batch-links-role" class="select">
+                    <option value="reader">授予邮箱：查看 (仅查看)</option>
+                    <option value="writer">授予邮箱：编辑 (可编辑)</option>
+                    <option value="commenter">授予邮箱：评论 (可评论)</option>
+                  </select>
+                  <button id="batch-links-grant-btn" type="button" class="btn primary">
+                    给右侧邮箱开权限
+                  </button>
+                  <button id="batch-links-revoke-btn" type="button" class="btn danger" title="从下方链接中批量移除右侧这些邮箱的权限">
+                    关闭右侧邮箱权限
+                  </button>
+                </div>
+
+                <div class="row-flex">
+                  <select id="batch-links-fill-group" class="select select-sm">
+                    <option value="">+从分组快速填入邮箱…</option>
+                  </select>
+                </div>
               </div>
             </div>
 
-            <!-- 左右双大框输入区（自适应撑满高度） -->
+            <!-- 左右双大框输入区 -->
             <div class="batch-links-dual-boxes">
               <div class="batch-box section-block block-blue">
                 <div class="block-header">
@@ -135,20 +157,42 @@
                   <span id="batch-links-count-label" class="meta-tag">已识别 0 个链接</span>
                 </div>
                 <p class="muted" style="margin-bottom: 6px;">
-                  每行粘贴一个链接（支持 Google 表格、文档、幻灯片、文件夹链接或直接粘贴文件 ID，无需先扫描网盘）：
+                  每行粘贴一个链接（可点上方「🔍 扫描这批链接的权限」查看权限，或直接设为「所有人可编辑」）：
                 </p>
                 <textarea id="batch-links-input" class="textarea batch-large-textarea" placeholder="示例：&#10;https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz/edit&#10;https://drive.google.com/drive/folders/1FolderIdAbCdEfGhIjKlMnOpQrSt&#10;https://drive.google.com/file/d/1FileIdAbCdEfGhIjKlMnOpQrStUv/view"></textarea>
               </div>
 
               <div class="batch-box section-block block-indigo">
                 <div class="block-header">
-                  <h2>2. 批量放入目标邮箱（支持粘贴表格「姓名 + 邮箱」）</h2>
+                  <h2>2. 批量放入目标邮箱（若设「所有人可编辑」则无需填写）</h2>
                   <span id="batch-emails-count-label" class="meta-tag">已识别 0 个邮箱</span>
                 </div>
                 <p class="muted" style="margin-bottom: 6px;">
-                  支持每行一个邮箱、逗号分隔，或直接从 Excel/表格复制「A列姓名 + B列邮箱」粘贴（自动提取邮箱并去重）：
+                  仅在给特定邮箱开/关权限时填写（支持每行一个，或从表格复制「姓名 + 邮箱」两列粘贴）：
                 </p>
-                <textarea id="batch-emails-input" class="textarea batch-large-textarea" placeholder="示例：&#10;张三  zhangsan@gmail.com&#10;李四  lisi@gmail.com&#10;wangwu@gmail.com"></textarea>
+                <textarea id="batch-emails-input" class="textarea batch-large-textarea" placeholder="（如使用上方「所有人可编辑/查看」，此处留空即可）&#10;如需指定邮箱：&#10;张三  zhangsan@gmail.com&#10;李四  lisi@gmail.com"></textarea>
+              </div>
+            </div>
+
+            <!-- 链接权限扫描结果区（点击「扫描这批链接的权限」后展示） -->
+            <div id="batch-links-scan-results-wrap" class="batch-scan-results section-block block-neutral hidden">
+              <div class="block-header">
+                <h2>🔍 链接权限扫描结果（我的权限 & 当前链接公开状态）</h2>
+                <button id="close-batch-scan-results-btn" type="button" class="btn-text">收起结果 ▲</button>
+              </div>
+              <div class="batch-scan-table-scroll">
+                <table class="data-table compact-table">
+                  <thead>
+                    <tr>
+                      <th style="width: 42px;">#</th>
+                      <th style="width: 28%;">文件/文件夹名称</th>
+                      <th style="width: 22%;">我对它的权限</th>
+                      <th style="width: 26%;">当前链接对外权限</th>
+                      <th>快捷修改此链接</th>
+                    </tr>
+                  </thead>
+                  <tbody id="batch-links-scan-rows"></tbody>
+                </table>
               </div>
             </div>
           </div>
