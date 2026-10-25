@@ -2154,6 +2154,61 @@ async function handleTransferVerifyCompare() {
   }
 }
 
+async function handleTransferMountToRoot() {
+  const sourceEmail = normalizeEntry($('transfer-source-select')?.value || state.transferState.sourceEmail || '');
+  const targetEmail = normalizeEntry($('transfer-target-email-input')?.value || $('transfer-target-select')?.value || state.transferState.targetEmail || '');
+  if (!targetEmail) {
+    toast('请先在右侧选择或输入「接收邮箱」');
+    return;
+  }
+
+  let targetToken = '';
+  let sourceToken = '';
+  try {
+    targetToken = await getValidTokenForAccount(targetEmail, true);
+  } catch (err) {
+    toast(`接收邮箱 (${targetEmail}) 尚未在插件内授权，请先点击「+授权接收号」完成授权`);
+    return;
+  }
+  if (sourceEmail) {
+    try {
+      sourceToken = await getValidTokenForAccount(sourceEmail, false);
+    } catch (_e) {}
+  }
+
+  const concurrency = Math.max(1, Math.min(16, Number($('transfer-concurrency-select')?.value) || 8));
+  const btn = $('transfer-mount-to-root-btn');
+  if (btn) btn.disabled = true;
+
+  await appendTransferLog(
+    `📂 开始整理接收邮箱 [${targetEmail}] 的『我的云端硬盘』目录显示：自动识别所有顶层文件夹与顶层文件并挂入根目录（子文件夹内部结构 100% 保持原样）…`,
+    false
+  );
+
+  try {
+    const res = await mountTransferredItemsToMyDriveRoot({
+      targetToken,
+      sourceToken,
+      transferItems: state.transferState?.items || [],
+      concurrency,
+      onProgress(p) {
+        if (p?.message) $('progress').textContent = p.message;
+      }
+    });
+
+    await appendTransferLog(
+      `✅ 归入『我的云端硬盘』完成！接收号共拥有 ${res.totalOwned} 项，其中识别出未挂入根目录的顶层项 ${res.totalTopLevel} 个 ➔ 已成功挂入根目录 ${res.mountedCount} 个（📁 顶层文件夹 ${res.mountedFolders} 个 / 📄 顶层文件 ${res.mountedFiles} 个）。现在去网页刷新「我的云端硬盘」即可直接看到全部文件夹与文件！`,
+      true
+    );
+    toast(`已将 ${res.mountedFolders} 个顶层文件夹、${res.mountedFiles} 个顶层文件归入「我的云端硬盘」！`);
+  } catch (err) {
+    await appendTransferLog(`❌ 归入『我的云端硬盘』失败：${err.message}`, true);
+    toast(`操作失败：${err.message}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 function exportTransferCsv() {
   const items = state.transferState?.items || [];
   if (!items.length) {
@@ -3810,6 +3865,7 @@ async function init() {
   });
 
   $('transfer-accept-all-btn')?.addEventListener('click', handleTransferAcceptAll);
+  $('transfer-mount-to-root-btn')?.addEventListener('click', handleTransferMountToRoot);
   $('transfer-verify-compare-btn')?.addEventListener('click', handleTransferVerifyCompare);
 
   $('transfer-open-web-pending-btn')?.addEventListener('click', () => {

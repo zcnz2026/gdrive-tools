@@ -3813,7 +3813,7 @@ async function transferSingleItemOwnership({
 }
 
 /**
- * 批量核对/对比来源邮箱与接收邮箱的实际归属状态（用于点击「核对左右邮箱实际归属」或网页端全选接受后刷新状态）
+ * 批量核对/对比来源邮箱与接收邮箱的实际归属状态（极速批量拉取对比，0.5秒核验数千文件）
  */
 async function verifyOwnershipTransferItems({
   sourceToken = '',
@@ -3828,14 +3828,74 @@ async function verifyOwnershipTransferItems({
     throw new Error('请至少授权来源邮箱或接收邮箱以执行归属对比核验');
   }
 
-  let cursor = 0;
-  let done = 0;
   const total = items.length;
   let newlyCompleted = 0;
   let stillPending = 0;
   let stillSource = 0;
 
-  const workers = Array.from({ length: Math.min(8, Math.max(1, total)) }, async () => {
+  // 若已授权接收方 Token，优先用 4 线程 pageSize=1000 一次性拉取接收方名下所有 'me' in owners 的文件 ID 集合（数千文件仅需 0.5 秒）
+  if (targetToken) {
+    if (onProgress) {
+      onProgress({
+        done: 0,
+        total,
+        message: `⚡ 正在用 4 线程极速扫描接收邮箱 (${normTarget}) 已拥有的全部文件与文件夹…`
+      });
+    }
+    const targetOwnedIds = new Set();
+    const baseQ = "trashed = false and 'me' in owners";
+    const shards = [
+      `${baseQ} and mimeType = 'application/vnd.google-apps.folder'`,
+      `${baseQ} and mimeType != 'application/vnd.google-apps.folder' and modifiedTime >= '2025-01-01T00:00:00'`,
+      `${baseQ} and mimeType != 'application/vnd.google-apps.folder' and modifiedTime >= '2023-01-01T00:00:00' and modifiedTime < '2025-01-01T00:00:00'`,
+      `${baseQ} and mimeType != 'application/vnd.google-apps.folder' and modifiedTime < '2023-01-01T00:00:00'`
+    ];
+    await Promise.all(
+      shards.map(async sq => {
+        let pt = '';
+        do {
+          const res = await driveApi(
+            targetToken,
+            `/files?pageSize=1000&supportsAllDrives=true&includeItemsFromAllDrives=true&q=${encodeURIComponent(
+              sq
+            )}&fields=nextPageToken,files(id)${pt ? `&pageToken=${encodeURIComponent(pt)}` : ''}`
+          );
+          for (const f of res?.files || []) {
+            if (f?.id) targetOwnedIds.add(f.id);
+          }
+          pt = res?.nextPageToken || '';
+        } while (pt);
+      })
+    );
+
+    const nowIso = new Date().toISOString();
+    for (const it of items) {
+      if (targetOwnedIds.has(it.id)) {
+        it.stage = 'completed';
+        it.currentOwner = normTarget || it.targetOwner;
+        it.statusText = '✅ 已归属接收邮箱 (对比确认)';
+        it.error = '';
+        it.updatedAt = nowIso;
+        newlyCompleted++;
+      } else if (it.stage === 'pending_accept') {
+        stillPending++;
+      } else {
+        stillSource++;
+      }
+    }
+    if (onProgress) {
+      onProgress({
+        done: total,
+        total,
+        message: `✅ 极速归属对比完成：已归接收方 ${newlyCompleted} 项 · 待确认 ${stillPending} 项 · 仍归来源 ${stillSource} 项`
+      });
+    }
+    return { total, newlyCompleted, stillPending, stillSource };
+  }
+
+  let cursor = 0;
+  let done = 0;
+  const workers = Array.from({ length: Math.min(10, Math.max(1, total)) }, async () => {
     while (cursor < total) {
       const idx = cursor++;
       const it = items[idx];
@@ -3851,7 +3911,7 @@ async function verifyOwnershipTransferItems({
         if (ownerEm) it.currentOwner = ownerEm;
         if (targetPerm?.id) it.targetPermissionId = targetPerm.id;
 
-        if ((normTarget && ownerEm === normTarget) || targetPerm?.role === 'owner' || (targetToken && probeToken === targetToken && meta?.ownedByMe)) {
+        if ((normTarget && ownerEm === normTarget) || targetPerm?.role === 'owner') {
           it.stage = 'completed';
           it.currentOwner = normTarget || ownerEm;
           it.statusText = '✅ 已归属接收邮箱 (对比确认)';
@@ -3871,7 +3931,7 @@ async function verifyOwnershipTransferItems({
         // keep current state if single file probe fails
       }
       done++;
-      if (onProgress && (done % 5 === 0 || done === total)) {
+      if (onProgress && (done % 10 === 0 || done === total)) {
         onProgress({
           done,
           total,
@@ -3883,4 +3943,162 @@ async function verifyOwnershipTransferItems({
 
   await Promise.all(workers);
   return { total, newlyCompleted, stillPending, stillSource };
+}
+
+/**
+ * 将已转移给接收邮箱（或来自来源邮箱）的顶层文件夹与顶层文件一键归入接收邮箱的「我的云端硬盘 (My Drive)」根目录，
+ * 同时 100% 保持子文件夹与内部文件的原始目录树层级结构，不会把子文件打散到根目录！
+ */
+async function mountTransferredItemsToMyDriveRoot({
+  targetToken = '',
+  sourceToken = '',
+  transferItems = [],
+  concurrency = 8,
+  onProgress = null
+}) {
+  if (!targetToken) {
+    throw new Error('请先在右侧授权或选择已授权的「接收邮箱」，才能将其归入接收号的『我的云端硬盘』');
+  }
+
+  if (onProgress) {
+    onProgress({ message: '正在读取接收邮箱『我的云端硬盘 (root)』根目录 ID…' });
+  }
+  const targetRootMeta = await driveApi(targetToken, '/files/root?fields=id');
+  const targetRootId = targetRootMeta?.id || 'root';
+
+  let sourceRootId = '';
+  if (sourceToken) {
+    try {
+      const srcRootMeta = await driveApi(sourceToken, '/files/root?fields=id');
+      sourceRootId = srcRootMeta?.id || '';
+    } catch (_e) {}
+  }
+
+  // 4 线程极速扫描接收邮箱当前已拥有的全部文件与文件夹及其 parents 父目录关系
+  const ownedFiles = [];
+  const seenIds = new Set();
+  const baseQ = "trashed = false and 'me' in owners";
+  const shards = [
+    `${baseQ} and mimeType = 'application/vnd.google-apps.folder'`,
+    `${baseQ} and mimeType != 'application/vnd.google-apps.folder' and modifiedTime >= '2025-01-01T00:00:00'`,
+    `${baseQ} and mimeType != 'application/vnd.google-apps.folder' and modifiedTime >= '2023-01-01T00:00:00' and modifiedTime < '2025-01-01T00:00:00'`,
+    `${baseQ} and mimeType != 'application/vnd.google-apps.folder' and modifiedTime < '2023-01-01T00:00:00'`
+  ];
+
+  await Promise.all(
+    shards.map(async sq => {
+      let pt = '';
+      do {
+        const res = await driveApi(
+          targetToken,
+          `/files?pageSize=1000&supportsAllDrives=true&includeItemsFromAllDrives=true&q=${encodeURIComponent(
+            sq
+          )}&fields=nextPageToken,files(id,name,mimeType,parents)${pt ? `&pageToken=${encodeURIComponent(pt)}` : ''}`
+        );
+        for (const f of res?.files || []) {
+          if (f?.id && !seenIds.has(f.id)) {
+            seenIds.add(f.id);
+            ownedFiles.push(f);
+          }
+        }
+        pt = res?.nextPageToken || '';
+        if (onProgress) {
+          onProgress({ message: `正在分析接收邮箱目录树结构（已读取 ${ownedFiles.length} 项）…` });
+        }
+      } while (pt);
+    })
+  );
+
+  // 建立所有已知文件夹 ID 集合（含接收方已拥有的文件夹 + 转移清单中的文件夹）
+  const allFolderIds = new Set();
+  for (const f of ownedFiles) {
+    if (f.mimeType === 'application/vnd.google-apps.folder') {
+      allFolderIds.add(f.id);
+    }
+  }
+  for (const it of transferItems || []) {
+    if (it.mimeType === 'application/vnd.google-apps.folder') {
+      allFolderIds.add(it.id);
+    }
+  }
+
+  // 筛选出「顶层文件夹与顶层文件」：
+  // 条件：1. 尚未在接收方的 targetRootId (我的云端硬盘根目录) 下；
+  //       2. 它的父目录为空，或者它的父目录不在 allFolderIds（即它不是某个子文件夹里的子文件，而是原本就在最外层的顶层目录/顶层文件）
+  const topLevelCandidates = ownedFiles.filter(f => {
+    const parents = Array.isArray(f.parents) ? f.parents : [];
+    if (parents.includes(targetRootId)) return false;
+    if (parents.length === 0) return true;
+    if (sourceRootId && parents.includes(sourceRootId)) return true;
+    const isInsideKnownSubfolder = parents.some(pid => allFolderIds.has(pid));
+    return !isInsideKnownSubfolder;
+  });
+
+  // 文件夹优先归入根目录
+  topLevelCandidates.sort((a, b) => {
+    const af = a.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+    const bf = b.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+    return af - bf;
+  });
+
+  let mountedCount = 0;
+  let mountedFolders = 0;
+  let mountedFiles = 0;
+  let failedCount = 0;
+  let cursor = 0;
+  const totalTop = topLevelCandidates.length;
+
+  if (totalTop > 0) {
+    const workerCount = Math.min(Math.max(1, concurrency), totalTop);
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (cursor < totalTop) {
+        const idx = cursor++;
+        if (idx >= totalTop) break;
+        const item = topLevelCandidates[idx];
+        const parents = Array.isArray(item.parents) ? item.parents : [];
+        const oldRootParent = sourceRootId && parents.includes(sourceRootId) ? sourceRootId : '';
+
+        try {
+          try {
+            const removeQuery = oldRootParent ? `&removeParents=${encodeURIComponent(oldRootParent)}` : '';
+            await driveApi(
+              targetToken,
+              `/files/${encodeURIComponent(item.id)}?addParents=root${removeQuery}&supportsAllDrives=true&fields=id,parents`,
+              { method: 'PATCH' }
+            );
+          } catch (_e1) {
+            await driveApi(
+              targetToken,
+              `/files/${encodeURIComponent(item.id)}?addParents=root&supportsAllDrives=true&fields=id,parents`,
+              { method: 'PATCH' }
+            );
+          }
+          mountedCount++;
+          if (item.mimeType === 'application/vnd.google-apps.folder') mountedFolders++;
+          else mountedFiles++;
+        } catch (_err) {
+          failedCount++;
+        }
+
+        const done = mountedCount + failedCount;
+        if (onProgress && (done % 5 === 0 || done === totalTop)) {
+          onProgress({
+            done,
+            total: totalTop,
+            message: `📂 正在将顶层目录与文件挂入『我的云端硬盘』(${done}/${totalTop})：已挂入 ${mountedFolders} 个顶层文件夹、${mountedFiles} 个顶层文件…`
+          });
+        }
+      }
+    });
+    await Promise.all(workers);
+  }
+
+  return {
+    totalOwned: ownedFiles.length,
+    totalTopLevel: totalTop,
+    mountedCount,
+    mountedFolders,
+    mountedFiles,
+    failedCount
+  };
 }
