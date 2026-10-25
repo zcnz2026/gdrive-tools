@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Google Drive 权限扫描器",
-  "version": "0.6.8",
+  "version": "0.7.0",
   "description": "直观、便利、自动化地扫描并管理 Google Drive 所有文件与表格的共享权限，支持双层白名单与定期自动巡检。",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAut3ylHEd/Zvx86M9mkopdgHLtwhzyZMQzkyakSNh5hGo4jJHrkiSqVwEiLnjZyRwSYmcvonau9SpE9dcs/YX7wRC/i00AK04FBmPiud0kdcv+9sfHA/JQsWR2w6wCe82XwimfE9+mIrF9JbK8lDP9PRfhpQt7BtNR1ksQIQzcHjh0Vf+7o30zoI6hxyouVDtFXapjTufQEj+JN4k7N8iWMeoce96EjMVgM4WjbERJp940QgNeNmKGdWLMDDc8SG/am6z1VeXFLa//K6f9EMROuem7cDGaAsaoWlGINCQ82gwQEnM+puMa5MG58qYlh2T8ELc6H9n+n2ysyQeBwq7GQIDAQAB",
   "action": {

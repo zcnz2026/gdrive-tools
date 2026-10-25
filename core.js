@@ -1274,9 +1274,44 @@ async function clearAuditLogs() {
   await safeStorageSet({ auditLogs: [] });
 }
 
-/* ==================== Drive API 请求封装 ==================== */
+/* ==================== Drive API 请求封装（含 AIMD 全局自适应平滑控速器） ==================== */
+
+const globalWritePacer = {
+  minIntervalMs: 95, // 初始写间隔 95ms (~10.5 req/s)，随成功自动下探至 60ms，遇 403 自动上调至 240ms
+  nextAllowedAt: 0,
+  consecutiveOk: 0
+};
+
+async function acquireWriteSlot() {
+  const now = Date.now();
+  const scheduled = Math.max(now, globalWritePacer.nextAllowedAt);
+  globalWritePacer.nextAllowedAt = scheduled + globalWritePacer.minIntervalMs;
+  const waitMs = scheduled - now;
+  if (waitMs > 2) {
+    await new Promise(r => setTimeout(r, waitMs));
+  }
+}
+
+function reportWriteSuccess() {
+  globalWritePacer.consecutiveOk++;
+  if (globalWritePacer.consecutiveOk >= 8 && globalWritePacer.minIntervalMs > 60) {
+    globalWritePacer.minIntervalMs = Math.max(60, globalWritePacer.minIntervalMs - 4);
+    globalWritePacer.consecutiveOk = 0;
+  }
+}
+
+function reportWriteRateLimit() {
+  globalWritePacer.consecutiveOk = 0;
+  globalWritePacer.minIntervalMs = Math.min(240, Math.round(globalWritePacer.minIntervalMs * 1.25) + 18);
+}
 
 async function driveApi(token, path, options = {}, retry = 0) {
+  const method = String(options.method || 'GET').toUpperCase();
+  const isWrite = method !== 'GET' && method !== 'HEAD';
+  if (isWrite) {
+    await acquireWriteSlot();
+  }
+
   const response = await fetch(`${DRIVE_API}${path}`, {
     ...options,
     headers: {
@@ -1295,13 +1330,19 @@ async function driveApi(token, path, options = {}, retry = 0) {
     ) {
       throw new Error(body?.error?.message || `Drive API 错误 ${response.status}`);
     }
-    const waitMs = Math.min(280 * 1.55 ** retry + Math.random() * 180, 5000);
+    if (isWrite) {
+      reportWriteRateLimit();
+    }
+    const waitMs = Math.min(260 * 1.5 ** retry + Math.random() * 150, 4500);
     await new Promise(r => setTimeout(r, waitMs));
     return driveApi(token, path, options, retry + 1);
   }
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new Error(body?.error?.message || `Drive API 错误 ${response.status}`);
+  }
+  if (isWrite) {
+    reportWriteSuccess();
   }
   return response.status === 204 ? null : response.json();
 }
@@ -3280,24 +3321,87 @@ async function clearOwnershipTransferState() {
 }
 
 /**
+ * 为转移列表计算目录树拓扑结构：
+ * 1. 识别所有顶层大文件夹 (isTopLevelFolder = true)
+ * 2. 为每个子文件夹与文件溯源归属的顶层大文件夹 (rootFolderId / rootFolderName / depth)
+ * 3. 按【顶层文件夹 ➔ 子文件夹(按浅到深) ➔ 内部文件(按所属顶层大文件夹聚合)】排序
+ */
+function enrichTransferItemsWithTree(items = []) {
+  const folderMap = new Map();
+  for (const it of items) {
+    if (it.mimeType === 'application/vnd.google-apps.folder') {
+      folderMap.set(it.id, it);
+    }
+  }
+
+  const rootCache = new Map();
+  function resolveRootAndDepth(item) {
+    if (rootCache.has(item.id)) return rootCache.get(item.id);
+    const visited = new Set([item.id]);
+    let cur = item;
+    let depth = 0;
+    while (cur) {
+      const pList = Array.isArray(cur.parents) ? cur.parents : [];
+      const parentFolder = pList.map(pid => folderMap.get(pid)).find(Boolean);
+      if (!parentFolder || visited.has(parentFolder.id)) {
+        break;
+      }
+      visited.add(parentFolder.id);
+      cur = parentFolder;
+      depth++;
+    }
+    const isFolder = item.mimeType === 'application/vnd.google-apps.folder';
+    const isTopLevelFolder = isFolder && depth === 0;
+    const rootFolderId = isFolder && depth === 0 ? item.id : cur !== item ? cur.id : '__root_loose__';
+    const rootFolderName =
+      isFolder && depth === 0
+        ? item.name
+        : cur !== item
+        ? cur.name || '(顶层文件夹)'
+        : '📄 根目录直属单文件';
+    const res = { isTopLevelFolder, depth, rootFolderId, rootFolderName };
+    rootCache.set(item.id, res);
+    return res;
+  }
+
+  for (const it of items) {
+    const info = resolveRootAndDepth(it);
+    it.isTopLevelFolder = info.isTopLevelFolder;
+    it.folderDepth = info.depth;
+    it.rootFolderId = info.rootFolderId;
+    it.rootFolderName = info.rootFolderName;
+  }
+
+  items.sort((a, b) => {
+    // 1. 顶层大文件夹最优先（先给顶层大文件夹赋权 writer，全树子目录与文件即刻自动继承）
+    if (a.isTopLevelFolder !== b.isTopLevelFolder) return a.isTopLevelFolder ? -1 : 1;
+    // 2. 其余文件夹按层级由浅入深排在文件前面
+    const aFolder = a.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+    const bFolder = b.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+    if (aFolder !== bFolder) return aFolder - bFolder;
+    if (aFolder === 0 && a.folderDepth !== b.folderDepth) return a.folderDepth - b.folderDepth;
+    // 3. 按所属顶层文件夹聚合排序
+    if (a.rootFolderName !== b.rootFolderName) {
+      return String(a.rootFolderName || '').localeCompare(String(b.rootFolderName || ''), 'zh-CN');
+    }
+    return String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN');
+  });
+
+  return items;
+}
+
+/**
  * 将扫描到的原始 Drive 文件数组转换为所有权转移条目列表（供每页边扫边展示与最终汇总共用）
  */
 function buildTransferItemsFromRawFiles(
   rawFiles = [],
   { normSource = '', normTarget = '', existingItems = [], mergeMode = false, includeHistoricalMerged = false } = {}
 ) {
-  const sorted = [...rawFiles].sort((a, b) => {
-    const aFolder = a.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
-    const bFolder = b.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
-    if (aFolder !== bFolder) return aFolder - bFolder;
-    return String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN');
-  });
-
   const prevById = new Map((existingItems || []).map(it => [it.id, it]));
   const nextItems = [];
   const seenIds = new Set();
 
-  for (const f of sorted) {
+  for (const f of rawFiles) {
     if (!f?.id || seenIds.has(f.id)) continue;
     seenIds.add(f.id);
 
@@ -3321,7 +3425,7 @@ function buildTransferItemsFromRawFiles(
     } else if (targetPerm?.pendingOwner === true) {
       stage = 'pending_accept';
       statusText = '📨 已发起邀请 (待接收邮箱确认)';
-    } else if (mergeMode && prev && (prev.stage === 'completed' || prev.stage === 'pending_accept')) {
+    } else if (prev && (prev.stage === 'completed' || prev.stage === 'pending_accept')) {
       stage = prev.stage;
       statusText = prev.statusText || statusText;
       currentOwner = prev.currentOwner || currentOwner;
@@ -3331,6 +3435,7 @@ function buildTransferItemsFromRawFiles(
       id: f.id,
       name: f.name || '(无名称)',
       mimeType: f.mimeType || '',
+      parents: Array.isArray(f.parents) ? f.parents : Array.isArray(prev?.parents) ? prev.parents : [],
       webViewLink: f.webViewLink || `https://drive.google.com/open?id=${f.id}`,
       sourceOwner: normSource,
       targetOwner: normTarget,
@@ -3359,7 +3464,7 @@ function buildTransferItemsFromRawFiles(
     }
   }
 
-  return nextItems;
+  return enrichTransferItemsWithTree(nextItems);
 }
 
 /**
@@ -3427,8 +3532,8 @@ async function scanSourceOwnedItemsForTransfer({
     }
   ];
 
-  // 轻量字段列表：不请求内联 permissions(...)，使 Google Drive 允许 pageSize=1000 且单页响应时间从 3 秒降至 0.3 秒
-  const fastFields = 'nextPageToken,files(id,name,mimeType,webViewLink,modifiedTime,ownedByMe,owners(emailAddress,displayName))';
+  // 轻量字段列表：不请求内联 permissions(...)，使 Google Drive 允许 pageSize=1000 且单页响应时间从 3 秒降至 0.3 秒（同时拉取 parents 构建目录树）
+  const fastFields = 'nextPageToken,files(id,name,mimeType,webViewLink,modifiedTime,ownedByMe,owners(emailAddress,displayName),parents)';
   let activeShards = shards.length;
 
   await Promise.all(
@@ -3640,6 +3745,84 @@ async function acceptSingleItemOwnership({ targetToken, item, targetEmail }) {
     statusText: '📨 已发邀请(Pending) · 需网页全选确认',
     logMsg: `《${item.name}》已处于待接收(pendingOwner)状态（Google 个人号策略需在网页汇总页全选接受：${acceptErr}）`
   };
+}
+
+/**
+ * 【阶段 0：顶层大文件夹预热剪枝 + 自动挂载到接收方『我的云端硬盘』】
+ * 在正式并发转移万级子文件前，先对最外层的「顶层文件夹」：
+ * 1. 赋予接收方 writer 权限并拿到固定 permId（使内部所有多级子文件夹和子文件瞬间自动继承 writer，省去 90% 的 POST 请求！）
+ * 2. 若接收方已授权 Token，立即将这些顶层文件夹挂入接收方的『我的云端硬盘 (root)』根目录，转移第1秒即可在『我的云端硬盘』看到完整目录树！
+ */
+async function prepareTopLevelFoldersForTransfer({
+  sourceToken = '',
+  targetToken = '',
+  topFolders = [],
+  targetEmail = '',
+  onLog = null
+}) {
+  const normTarget = normalizeEntry(targetEmail);
+  if (!sourceToken || !normTarget || !Array.isArray(topFolders) || !topFolders.length) {
+    return { permId: '', grantedCount: 0, mountedCount: 0 };
+  }
+
+  let discoveredPermId = '';
+  let grantedCount = 0;
+  let mountedCount = 0;
+  let cursor = 0;
+
+  const workers = Array.from({ length: Math.min(4, topFolders.length) }, async () => {
+    while (cursor < topFolders.length) {
+      const idx = cursor++;
+      if (idx >= topFolders.length) break;
+      const folder = topFolders[idx];
+
+      // 1. 为顶层文件夹赋予接收方 writer 权限（触发 Google Drive 自动向所有子文件夹与子文件级联继承）
+      try {
+        const created = await driveApi(
+          sourceToken,
+          `/files/${encodeURIComponent(folder.id)}/permissions?sendNotificationEmail=false&supportsAllDrives=true&fields=id,role,pendingOwner`,
+          {
+            method: 'POST',
+            body: JSON.stringify({ type: 'user', role: 'writer', emailAddress: normTarget })
+          }
+        );
+        if (created?.id) {
+          discoveredPermId = discoveredPermId || created.id;
+          folder.targetPermissionId = created.id;
+        }
+        grantedCount++;
+      } catch (_e) {
+        // ignore if already owner
+      }
+
+      // 2. 若接收方 Token 可用，开局立即将该顶层文件夹挂入接收方的『我的云端硬盘 (root)』根目录
+      if (targetToken && !folder._mountedToTargetRoot) {
+        try {
+          await driveApi(
+            targetToken,
+            `/files/${encodeURIComponent(folder.id)}?addParents=root&supportsAllDrives=true&fields=id`,
+            { method: 'PATCH' }
+          );
+          folder._mountedToTargetRoot = true;
+          mountedCount++;
+        } catch (_e2) {
+          // ignore if already in root
+        }
+      }
+    }
+  });
+
+  await Promise.all(workers);
+
+  if (grantedCount > 0 && onLog) {
+    await onLog(
+      `🌳 [顶层目录树剪枝预热完成] 已为 ${grantedCount} 个顶层大文件夹赋权 writer（子目录与子文件已自动级联继承 permId=${
+        discoveredPermId || '已就绪'
+      }）${mountedCount > 0 ? `，并已将 ${mountedCount} 个顶层大文件夹自动挂入接收号『我的云端硬盘』根目录` : ''}！`
+    );
+  }
+
+  return { permId: discoveredPermId, grantedCount, mountedCount };
 }
 
 /**

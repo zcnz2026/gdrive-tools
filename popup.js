@@ -1596,6 +1596,9 @@ function renderTransferWorkspace(skipSheet = false) {
   }
 
   const items = state.transferState?.items || [];
+  if (items.length > 0 && items[0].rootFolderId === undefined && typeof enrichTransferItemsWithTree === 'function') {
+    enrichTransferItemsWithTree(items);
+  }
   const total = items.length;
   let folderCount = 0;
   let sourceOwnedCount = 0;
@@ -1603,7 +1606,10 @@ function renderTransferWorkspace(skipSheet = false) {
   let targetOwnedCount = 0;
   let failedCount = 0;
 
-  // 单次循环极速统计（即使 20,000 条也仅耗时 0.3ms）
+  // 统计各顶层大文件夹的完成度
+  const rootFolderStats = new Map();
+
+  // 单次循环极速统计（即使 20,000 条也仅耗时 0.5ms）
   for (let i = 0; i < total; i++) {
     const it = items[i];
     if (it.mimeType === 'application/vnd.google-apps.folder') folderCount++;
@@ -1612,8 +1618,43 @@ function renderTransferWorkspace(skipSheet = false) {
     else if (st === 'pending_accept') pendingAcceptCount++;
     else if (st === 'completed') targetOwnedCount++;
     else if (st === 'failed') failedCount++;
+
+    if (!onlyStats) {
+      const rfId = it.rootFolderId || '__root_loose__';
+      const rfName = it.rootFolderName || '📄 根目录直属单文件';
+      let rStat = rootFolderStats.get(rfId);
+      if (!rStat) {
+        rStat = { id: rfId, name: rfName, total: 0, done: 0 };
+        rootFolderStats.set(rfId, rStat);
+      }
+      rStat.total++;
+      if (st === 'completed' || st === 'pending_accept') rStat.done++;
+    }
   }
   const fileCount = total - folderCount;
+
+  // 更新顶层大目录筛选下拉框（展示每个顶层文件夹的实时进度）
+  const rootSelect = $('transfer-filter-root-folder');
+  if (!onlyStats && rootSelect) {
+    const prevVal = rootSelect.value || 'all';
+    const sortedRoots = [...rootFolderStats.values()].sort((a, b) => {
+      if (a.id === '__root_loose__') return 1;
+      if (b.id === '__root_loose__') return -1;
+      return b.total - a.total;
+    });
+    rootSelect.innerHTML =
+      `<option value="all">📁 顶层大目录：全部 (${total}项)</option>` +
+      sortedRoots
+        .map(r => {
+          const pctR = r.total > 0 ? Math.round((r.done / r.total) * 100) : 0;
+          const icon = r.id === '__root_loose__' ? '📄' : pctR === 100 ? '✅' : '📂';
+          return `<option value="${escapeHtml(r.id)}">${icon} ${escapeHtml(r.name)} (${r.done}/${r.total} · ${pctR}%)</option>`;
+        })
+        .join('');
+    if ([...rootSelect.options].some(o => o.value === prevVal)) {
+      rootSelect.value = prevVal;
+    }
+  }
 
   if ($('transfer-tab-badge')) {
     $('transfer-tab-badge').textContent = `${targetOwnedCount}/${total}`;
@@ -1674,17 +1715,19 @@ function renderTransferWorkspace(skipSheet = false) {
 
   // 渲染 Jspreadsheet 对比表格（高频转移循环中可通过 skipSheet=true 跳过重度 DOM 重建，且超过 500 条时仅渲染前 500 条预览以彻底杜绝万级数据主线程卡顿）
   if (!onlyStats && state.transferSheet) {
+    const rootFolderFilter = $('transfer-filter-root-folder')?.value || 'all';
     const stageFilter = $('transfer-filter-stage')?.value || 'all';
     const typeFilter = $('transfer-filter-type')?.value || 'all';
     const kw = ($('transfer-filter-kw')?.value || '').trim().toLowerCase();
 
     const filtered = items.filter(it => {
+      if (rootFolderFilter !== 'all' && (it.rootFolderId || '__root_loose__') !== rootFolderFilter) return false;
       if (stageFilter !== 'all' && it.stage !== stageFilter) return false;
       const isFolder = it.mimeType === 'application/vnd.google-apps.folder';
       if (typeFilter === 'folder' && !isFolder) return false;
       if (typeFilter === 'file' && isFolder) return false;
       if (kw) {
-        const hay = `${it.name || ''} ${it.sourceOwner || ''} ${it.targetOwner || ''} ${it.currentOwner || ''} ${it.statusText || ''}`.toLowerCase();
+        const hay = `${it.name || ''} ${it.rootFolderName || ''} ${it.sourceOwner || ''} ${it.targetOwner || ''} ${it.currentOwner || ''} ${it.statusText || ''}`.toLowerCase();
         if (!hay.includes(kw)) return false;
       }
       return true;
@@ -1862,7 +1905,7 @@ async function handleTransferScanSource(mergeMode = false) {
   }
 }
 
-async function handleTransferRunLoop(retryFailedOnly = false) {
+async function handleTransferRunLoop(retryFailedOnly = false, onlyRootFolderId = '') {
   if (state.transferRunning) return;
 
   const sourceEmail = normalizeEntry($('transfer-source-select')?.value || state.transferState.sourceEmail || '');
@@ -1892,6 +1935,9 @@ async function handleTransferRunLoop(retryFailedOnly = false) {
   state.transferState.autoAccept = autoAccept;
 
   const items = state.transferState.items;
+  if (items.length > 0 && items[0].rootFolderId === undefined && typeof enrichTransferItemsWithTree === 'function') {
+    enrichTransferItemsWithTree(items);
+  }
   for (const it of items) {
     it.targetOwner = targetEmail;
   }
@@ -1914,9 +1960,15 @@ async function handleTransferRunLoop(retryFailedOnly = false) {
     }
   }
 
-  const todoIndices = [];
+  const selectedRootFilter = onlyRootFolderId || ($('transfer-filter-root-folder')?.value || 'all');
+
+  let todoIndices = [];
   for (let i = 0; i < items.length; i++) {
-    const st = items[i].stage;
+    const it = items[i];
+    if (onlyRootFolderId && onlyRootFolderId !== 'all' && (it.rootFolderId || '__root_loose__') !== onlyRootFolderId) {
+      continue;
+    }
+    const st = it.stage;
     if (retryFailedOnly) {
       if (st === 'failed') todoIndices.push(i);
     } else {
@@ -1926,8 +1978,19 @@ async function handleTransferRunLoop(retryFailedOnly = false) {
     }
   }
 
+  // 若用户在下拉框选中了某个顶层大文件夹（即使点击的是常规开始按钮），自动将该顶层大文件夹的所有条目排到最前面优先插队转移！
+  if (!onlyRootFolderId && selectedRootFilter && selectedRootFilter !== 'all') {
+    const prio = [];
+    const rest = [];
+    for (const idx of todoIndices) {
+      if ((items[idx].rootFolderId || '__root_loose__') === selectedRootFilter) prio.push(idx);
+      else rest.push(idx);
+    }
+    todoIndices = [...prio, ...rest];
+  }
+
   if (!todoIndices.length) {
-    toast('当前没有待处理的条目（已全部处理完毕，或可点击「🔄 刷新左右归属对比」核验）');
+    toast('当前筛选范围内没有待处理的条目（已全部处理完毕，或可点击「🔄 刷新左右归属对比」核验）');
     return;
   }
 
@@ -1938,7 +2001,7 @@ async function handleTransferRunLoop(retryFailedOnly = false) {
   renderTransferWorkspace();
 
   await appendTransferLog(
-    `🚀 启动 ${concurrency} 线程并发全盘转移：来源 [${sourceEmail}] ➔ 接收 [${targetEmail}]，本次待处理 ${todoIndices.length} / 总计 ${items.length} 项（接收方Token: ${targetToken ? '已就绪·自动接管' : '未授权·仅发转移邀请'}）`,
+    `🚀 启动 ${concurrency} 线程并发转移（含 AIMD 智能平滑控速）：来源 [${sourceEmail}] ➔ 接收 [${targetEmail}]，本次待处理 ${todoIndices.length} / 总计 ${items.length} 项`,
     true
   );
 
@@ -1956,6 +2019,28 @@ async function handleTransferRunLoop(retryFailedOnly = false) {
   const isPersonalGmailTarget = /@(gmail|googlemail)\.com$/i.test(targetEmail);
 
   try {
+    // 【阶段 0：顶层大文件夹剪枝预热 + 开局自动挂入接收方『我的云端硬盘』根目录】
+    const topFoldersToPrep = todoIndices
+      .map(idx => items[idx])
+      .filter(it => it.isTopLevelFolder && (!it.targetPermissionId || (targetToken && !it._mountedToTargetRoot)));
+    if (topFoldersToPrep.length > 0 && typeof prepareTopLevelFoldersForTransfer === 'function') {
+      $('progress').textContent = `🌳 正在预热 ${topFoldersToPrep.length} 个顶层大文件夹（级联赋予 writer 权限并自动挂入接收方『我的云端硬盘』）…`;
+      const prepRes = await prepareTopLevelFoldersForTransfer({
+        sourceToken,
+        targetToken,
+        topFolders: topFoldersToPrep,
+        targetEmail,
+        onLog: msg => appendTransferLog(msg, false)
+      });
+      if (prepRes.permId && !cachedTargetPermId) {
+        cachedTargetPermId = prepRes.permId;
+      }
+      if (prepRes.grantedCount > 0) {
+        // 等待 1.2 秒让 Google Drive 后端完成对所有子目录和子文件的继承权限传播，使后续万级子文件 100% 走 1 步 PATCH
+        await new Promise(r => setTimeout(r, 1200));
+      }
+    }
+
     const workerCount = Math.min(concurrency, todoIndices.length);
     const workers = Array.from({ length: workerCount }, async (_, workerId) => {
       // 错峰启动各工作线程（间隔 65ms），形成平滑流水线，避免 12 线程同一毫秒并发冲撞 Google API 触发 403 限速等待
@@ -3916,6 +4001,14 @@ async function init() {
   $('transfer-incremental-scan-btn')?.addEventListener('click', () => handleTransferScanSource(true));
   $('transfer-start-resume-btn')?.addEventListener('click', () => handleTransferRunLoop(false));
   $('transfer-retry-failed-btn')?.addEventListener('click', () => handleTransferRunLoop(true));
+  $('transfer-priority-folder-btn')?.addEventListener('click', () => {
+    const rfVal = $('transfer-filter-root-folder')?.value || 'all';
+    if (!rfVal || rfVal === 'all') {
+      toast('请先在左侧「📁 顶层大目录」下拉框中选择一个要优先转移的文件夹');
+      return;
+    }
+    handleTransferRunLoop(false, rfVal);
+  });
 
   $('transfer-pause-btn')?.addEventListener('click', () => {
     if (state.transferRunning) {
@@ -3928,16 +4021,27 @@ async function init() {
   $('transfer-mount-to-root-btn')?.addEventListener('click', handleTransferMountToRoot);
   $('transfer-verify-compare-btn')?.addEventListener('click', handleTransferVerifyCompare);
 
+  let pendingWebAcceptOpened = false;
   $('transfer-open-web-pending-btn')?.addEventListener('click', () => {
+    pendingWebAcceptOpened = true;
     const url = 'https://drive.google.com/drive/search?q=pendingowner:me';
     try {
       chrome.tabs.create({ url });
     } catch (_e) {
       window.open?.(url, '_blank');
     }
-    appendTransferLog('🌐 已打开 Google Drive 网页端「待我接受所有权 (pendingowner:me)」汇总页：在网页按 Ctrl+A 全选 -> 右键 -> 共享 -> 接受所有权，即可一次性全部接受！', true);
-    toast('已打开待接受汇总页：在网页按 Ctrl+A 全选即可一次性接受所有文件');
+    appendTransferLog('🌐 已打开 Google Drive 网页端「待我接受所有权 (pendingowner:me)」汇总页：在网页按 Ctrl+A 全选 -> 右键 -> 共享 -> 接受所有权，切回本插件页面时将自动极速同步完成状态！', true);
+    toast('已打开待接受汇总页：在网页按 Ctrl+A 全选接受后，切回本页面将自动同步完成状态');
   });
+
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('focus', () => {
+      if (pendingWebAcceptOpened && !state.transferRunning && (state.transferState?.items || []).some(it => it.stage === 'pending_accept')) {
+        pendingWebAcceptOpened = false;
+        handleTransferVerifyCompare();
+      }
+    });
+  }
 
   $('transfer-export-passport-btn')?.addEventListener('click', () => exportAuthorizedPassportJson('', true));
   $('transfer-import-passport-btn')?.addEventListener('click', () => $('oauth-json-file')?.click());
@@ -3972,7 +4076,7 @@ async function init() {
     renderTransferWorkspace();
   });
 
-  ['transfer-filter-stage', 'transfer-filter-type'].forEach(id => {
+  ['transfer-filter-root-folder', 'transfer-filter-stage', 'transfer-filter-type'].forEach(id => {
     $(id)?.addEventListener('change', renderTransferWorkspace);
   });
 

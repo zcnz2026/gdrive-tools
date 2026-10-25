@@ -356,8 +356,14 @@
                   </button>
                 </div>
 
-                <div class="row-flex" style="gap: 5px;">
-                  <input id="transfer-filter-kw" type="text" class="input input-xs" style="width: 135px;" placeholder="搜文件/文件夹名…">
+                <div class="row-flex" style="gap: 5px; flex-wrap: wrap;">
+                  <select id="transfer-filter-root-folder" class="select select-sm" style="max-width: 240px;" title="按顶层大文件夹查看各自进度，或选中某个顶层大文件夹后点击右侧『⚡ 优先转所选目录』插队优先跑完该文件夹">
+                    <option value="all">📁 顶层大目录：全部 (全盘)</option>
+                  </select>
+                  <button id="transfer-priority-folder-btn" type="button" class="btn btn-xs warning" title="仅优先转移左侧下拉框所选『顶层大文件夹』及其内部的所有子文件夹与文件">
+                    ⚡ 优先转所选目录
+                  </button>
+                  <input id="transfer-filter-kw" type="text" class="input input-xs" style="width: 125px;" placeholder="搜文件/文件夹名…">
                   <select id="transfer-filter-stage" class="select select-sm">
                     <option value="all">状态：全部</option>
                     <option value="pending_init">⏳ 待发起转移 (仍归来源)</option>
