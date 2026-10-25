@@ -3649,7 +3649,8 @@ async function transferSingleItemOwnership({
   item,
   targetEmail,
   autoAccept = true,
-  skipTargetApiAccept = false
+  skipTargetApiAccept = false,
+  knownTargetPermId = ''
 }) {
   const normTarget = normalizeEntry(targetEmail || item.targetOwner);
   if (!sourceToken) throw new Error('缺少来源邮箱授权令牌');
@@ -3657,8 +3658,8 @@ async function transferSingleItemOwnership({
 
   const isPersonalGmail = /@(gmail|googlemail)\.com$/i.test(normTarget);
   const logs = [];
-  let permId = item.targetPermissionId || '';
-  let alreadyPending = item.stage === 'pending_accept' && Boolean(permId);
+  let permId = item.targetPermissionId || knownTargetPermId || '';
+  let alreadyPending = item.stage === 'pending_accept' && Boolean(item.targetPermissionId);
 
   if (!alreadyPending) {
     // 非 @gmail.com（如 Google Workspace 企业同域账号）优先尝试 1 步直接转移所有权
@@ -3691,7 +3692,27 @@ async function transferSingleItemOwnership({
       }
     }
 
-    // 极速两步法 Step 1：直接通过幂等 POST 授予/升级接收方为 writer 并一步拿到 permId（省去每次前置 GET /permissions 的耗时）
+    // 超高速继承捷径（1次请求完结）：因为父文件夹优先授权了 writer，子文件已自动继承接收方的固定 permId，
+    // 若已知 permId，直接尝试 1 步 PATCH pendingOwner=true（成功则省去 50% 的 POST 写配额与耗时！）
+    if (!alreadyPending && permId) {
+      try {
+        await driveApi(
+          sourceToken,
+          `/files/${encodeURIComponent(item.id)}/permissions/${encodeURIComponent(permId)}?supportsAllDrives=true&fields=id,role,pendingOwner`,
+          {
+            method: 'PATCH',
+            body: JSON.stringify({ role: 'writer', pendingOwner: true })
+          }
+        );
+        alreadyPending = true;
+        logs.push(`⚡ 已对《${item.name}》一步设为待接收 (复用继承权限 permId)`);
+      } catch (_fastPatchErr) {
+        // 若该文件不在已共享的父目录内（尚未继承 writer），清空 permId 走下方标准两步法
+        permId = '';
+      }
+    }
+
+    // 极速两步法 Step 1：直接通过幂等 POST 授予/升级接收方为 writer 并一步拿到 permId
     if (!alreadyPending && !permId) {
       try {
         const createdWriter = await driveApi(

@@ -1910,6 +1910,7 @@ async function handleTransferRunLoop(retryFailedOnly = false) {
   let lastRenderAt = 0;
   let personalGmailAcceptProbeFailures = 0;
   let skipTargetApiAccept = false;
+  let cachedTargetPermId = items.find(it => it.targetPermissionId)?.targetPermissionId || '';
   const isPersonalGmailTarget = /@(gmail|googlemail)\.com$/i.test(targetEmail);
 
   try {
@@ -1932,8 +1933,12 @@ async function handleTransferRunLoop(retryFailedOnly = false) {
             item,
             targetEmail,
             autoAccept,
-            skipTargetApiAccept
+            skipTargetApiAccept,
+            knownTargetPermId: cachedTargetPermId
           });
+          if (res.targetPermissionId && !cachedTargetPermId) {
+            cachedTargetPermId = res.targetPermissionId;
+          }
           item.stage = res.stage;
           item.currentOwner = res.currentOwner || item.currentOwner;
           item.targetPermissionId = res.targetPermissionId || item.targetPermissionId;
