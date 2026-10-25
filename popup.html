@@ -257,17 +257,23 @@
                   <button id="transfer-add-source-btn" type="button" class="btn btn-xs" title="导入或授权新的来源邮箱">+授权来源号</button>
                 </div>
                 <div class="row-flex" style="flex-wrap: wrap; gap: 6px;">
-                  <button id="transfer-scan-source-btn" type="button" class="btn primary btn-sm" title="扫描该来源账号名下所有『我是所有者 ('me' in owners)』的文件夹与文件，并自动保存记录，下次打开无需重扫">
-                    🔍 扫描来源全盘所有权文件
+                  <button id="transfer-scan-source-btn" type="button" class="btn primary btn-sm" title="4线程并发极速扫描该来源账号名下所有『我是所有者 ('me' in owners)』的文件夹与文件（单页1000条极速模式），并自动保存记录">
+                    🔍 极速多线程扫描全盘
                   </button>
                   <button id="transfer-incremental-scan-btn" type="button" class="btn btn-sm" title="不覆盖已有转移进度，仅把来源网盘新产生的文件/文件夹合并进记录">
-                    ➕ 增量补扫 (保留已有进度)
+                    ➕ 增量补扫
                   </button>
-                  <button id="transfer-start-resume-btn" type="button" class="btn warning btn-sm" title="从上次未完成的条目继续发起所有权转移（支持随时暂停与断点续传）">
-                    ▶️ 开始 / 断点续传全盘转移
+                  <select id="transfer-concurrency-select" class="select" style="width: 118px; height: 28px; font-size: 12px;" title="选择多线程并发数（扫描默认4分片并发+1000条/页；转移与接收按所选线程数并发执行）">
+                    <option value="4">⚡ 4 线程并发</option>
+                    <option value="8" selected>🚀 8 线程并发</option>
+                    <option value="12">🔥 12 线程并发</option>
+                    <option value="16">⚡ 16 线程极速</option>
+                  </select>
+                  <button id="transfer-start-resume-btn" type="button" class="btn warning btn-sm" title="使用多线程并发从上次未完成的条目继续发起所有权转移（支持随时暂停与断点续传）">
+                    ▶️ 多线程开始 / 断点续传
                   </button>
                   <button id="transfer-pause-btn" type="button" class="btn danger btn-sm" disabled>
-                    ⏸️ 暂停转移
+                    ⏸️ 暂停
                   </button>
                 </div>
               </div>

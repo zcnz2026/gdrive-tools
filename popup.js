@@ -1768,21 +1768,22 @@ async function handleTransferScanSource(mergeMode = false) {
 
         if (scanBtn) {
           scanBtn.textContent = info.hasMore
-            ? `⏳ 边扫边出：第 ${info.page} 页 (${info.total} 项)…`
+            ? `⚡ 4线程极速扫：第 ${info.page} 批 (${info.total} 项)…`
             : `✅ 已拉取完 ${info.total} 项，正在保存…`;
         }
 
+        const shardLabel = info.shardName ? `${info.shardName} ` : '';
         await appendTransferLog(
-          `📄 [边扫边展 · 第 ${info.page} 页] 本页扫出 +${info.pageAdded} 项 ➔ 累计 ${info.total} 项（📁 文件夹 ${pFolderCnt} / 📄 文件 ${pFileCnt}）${
-            info.hasMore ? '，继续扫描下一页…' : '，全部页面拉取完毕！'
+          `📄 [4线程并发 · 第 ${info.page} 批] ${shardLabel}本批 +${info.pageAdded} 项 ➔ 累计 ${info.total} 项（📁 文件夹 ${pFolderCnt} / 📄 文件 ${pFileCnt}）${
+            info.hasMore ? '，继续并发拉取…' : '，全部分片拉取完毕！'
           }`,
           false
         );
 
-        // 立即刷新看板统计卡片 + Jspreadsheet 表格，让用户每页都能实时看到文件出来
+        // 立即刷新看板统计卡片 + Jspreadsheet 表格，让用户每批都能实时看到文件出来
         renderTransferWorkspace();
 
-        // 每 3 页自动在后台存一次断点，防止中途关闭丢失
+        // 每 3 批自动在后台存一次断点，防止中途关闭丢失
         if (info.page % 3 === 0) {
           await saveOwnershipTransferState(state.transferState);
         }
@@ -1890,12 +1891,14 @@ async function handleTransferRunLoop(retryFailedOnly = false) {
     return;
   }
 
+  const concurrency = Math.max(1, Math.min(16, Number($('transfer-concurrency-select')?.value) || 8));
+
   state.transferRunning = true;
   state.transferPauseRequested = false;
   renderTransferWorkspace();
 
   await appendTransferLog(
-    `🚀 开始/续传全盘转移：来源 [${sourceEmail}] ➔ 接收 [${targetEmail}]，本次待处理 ${todoIndices.length} / 总计 ${items.length} 项（接收方Token: ${targetToken ? '已就绪·自动接管' : '未授权·仅发转移邀请'}）`,
+    `🚀 启动 ${concurrency} 线程并发全盘转移：来源 [${sourceEmail}] ➔ 接收 [${targetEmail}]，本次待处理 ${todoIndices.length} / 总计 ${items.length} 项（接收方Token: ${targetToken ? '已就绪·自动接管' : '未授权·仅发转移邀请'}）`,
     true
   );
 
@@ -1903,70 +1906,104 @@ async function handleTransferRunLoop(retryFailedOnly = false) {
   let successInRun = 0;
   let pendingInRun = 0;
   let failInRun = 0;
+  let cursor = 0;
+  let lastRenderAt = 0;
+  let personalGmailAcceptProbeFailures = 0;
+  let skipTargetApiAccept = false;
+  const isPersonalGmailTarget = /@(gmail|googlemail)\.com$/i.test(targetEmail);
 
   try {
-    for (let k = 0; k < todoIndices.length; k++) {
-      if (state.transferPauseRequested) {
-        await appendTransferLog(
-          `⏸️ 用户已暂停转移：本次已处理 ${processedInRun} 项。当前进度已自动保存，随时可点击「▶️ 断点续传」继续！`,
-          true
-        );
-        toast('已暂停转移并保存当前断点进度');
-        break;
-      }
-
-      const idx = todoIndices[k];
-      const item = items[idx];
-      $('progress').textContent = `正在转移 (${k + 1}/${todoIndices.length}): ${item.name}`;
-
-      try {
-        const res = await transferSingleItemOwnership({
-          sourceToken,
-          targetToken,
-          item,
-          targetEmail,
-          autoAccept
-        });
-        item.stage = res.stage;
-        item.currentOwner = res.currentOwner || item.currentOwner;
-        item.targetPermissionId = res.targetPermissionId || item.targetPermissionId;
-        item.statusText = res.statusText;
-        item.error = '';
-        item.updatedAt = new Date().toISOString();
-
-        if (res.stage === 'completed') successInRun++;
-        else pendingInRun++;
-
-        for (const l of res.logs || []) {
-          await appendTransferLog(`[${k + 1}/${todoIndices.length}] ${l}`, false);
+    const workerCount = Math.min(concurrency, todoIndices.length);
+    const workers = Array.from({ length: workerCount }, async (_, workerId) => {
+      while (cursor < todoIndices.length) {
+        if (state.transferPauseRequested) {
+          break;
         }
-      } catch (err) {
-        item.stage = 'failed';
-        item.statusText = `❌ 失败: ${err.message}`;
-        item.error = err.message;
-        item.updatedAt = new Date().toISOString();
-        failInRun++;
-        await appendTransferLog(`❌ [${k + 1}/${todoIndices.length}] 《${item.name}》转移失败: ${err.message}`, false);
-      }
+        const k = cursor++;
+        if (k >= todoIndices.length) break;
 
-      processedInRun++;
-      // 每处理 3 个条目自动持久化保存一次断点记录并刷新 UI，防止意外关闭丢失进度
-      if (processedInRun % 3 === 0 || k === todoIndices.length - 1) {
-        state.transferState = await saveOwnershipTransferState(state.transferState);
-        renderTransferWorkspace();
-      }
-    }
+        const idx = todoIndices[k];
+        const item = items[idx];
 
-    if (!state.transferPauseRequested) {
+        try {
+          const res = await transferSingleItemOwnership({
+            sourceToken,
+            targetToken,
+            item,
+            targetEmail,
+            autoAccept,
+            skipTargetApiAccept
+          });
+          item.stage = res.stage;
+          item.currentOwner = res.currentOwner || item.currentOwner;
+          item.targetPermissionId = res.targetPermissionId || item.targetPermissionId;
+          item.statusText = res.statusText;
+          item.error = '';
+          item.updatedAt = new Date().toISOString();
+
+          if (res.stage === 'completed') {
+            successInRun++;
+          } else {
+            pendingInRun++;
+            if (isPersonalGmailTarget && autoAccept && targetToken && !skipTargetApiAccept && !res.acceptedByApi) {
+              personalGmailAcceptProbeFailures++;
+              if (personalGmailAcceptProbeFailures >= 2) {
+                skipTargetApiAccept = true;
+                await appendTransferLog(
+                  `⚡ 智能加速已开启：检测到个人 @gmail.com 接收号需网页确认，后续条目自动跳过冗余 API 接收探测，以 ${workerCount} 线程全速设为待接收(Pending)状态！`,
+                  false
+                );
+              }
+            }
+          }
+
+          for (const l of res.logs || []) {
+            await appendTransferLog(`[T${workerId + 1} · ${k + 1}/${todoIndices.length}] ${l}`, false);
+          }
+        } catch (err) {
+          item.stage = 'failed';
+          item.statusText = `❌ 失败: ${err.message}`;
+          item.error = err.message;
+          item.updatedAt = new Date().toISOString();
+          failInRun++;
+          await appendTransferLog(
+            `❌ [T${workerId + 1} · ${k + 1}/${todoIndices.length}] 《${item.name}》转移失败: ${err.message}`,
+            false
+          );
+        }
+
+        processedInRun++;
+        $('progress').textContent = `⚡ ${workerCount}线程并发转移中 (${processedInRun}/${todoIndices.length})：已完成 ${successInRun} · 待确认 ${pendingInRun} · 失败 ${failInRun}`;
+
+        const now = Date.now();
+        if (now - lastRenderAt >= 350 || processedInRun === todoIndices.length) {
+          lastRenderAt = now;
+          renderTransferWorkspace();
+        }
+        if (processedInRun % 15 === 0) {
+          await saveOwnershipTransferState(state.transferState);
+        }
+      }
+    });
+
+    await Promise.all(workers);
+
+    if (state.transferPauseRequested) {
       await appendTransferLog(
-        `🏁 本轮转移执行完毕：处理 ${processedInRun} 项（直接完成接管 ${successInRun} 项 · 已发邀请待确认 ${pendingInRun} 项 · 失败 ${failInRun} 项）。${
+        `⏸️ 用户已暂停多线程转移：本次已处理 ${processedInRun} 项。当前进度已自动保存，随时可点击「▶️ 多线程开始 / 断点续传」继续！`,
+        true
+      );
+      toast('已暂停转移并保存当前断点进度');
+    } else {
+      await appendTransferLog(
+        `🏁 ${workerCount} 线程并发转移执行完毕：处理 ${processedInRun} 项（直接完成接管 ${successInRun} 项 · 已发邀请待确认 ${pendingInRun} 项 · 失败 ${failInRun} 项）。${
           pendingInRun > 0
-            ? '提示：对处于「待接收(Pending)」的个人号文件，可点击右侧「⚡ 接收方一键批量接受」或「🌐 网页全选接受兜底 (Ctrl+A)」一次性完成接收！'
+            ? '提示：对处于「待接收(Pending)」的个人号文件，可点击右侧「🌐 网页全选接受兜底 (Ctrl+A)」在网页汇总页全选后一键全部接受！'
             : ''
         }`,
         true
       );
-      toast(`本轮处理完成：已接管 ${successInRun} 项，待确认 ${pendingInRun} 项，失败 ${failInRun} 项`);
+      toast(`多线程处理完成：已接管 ${successInRun} 项，待确认 ${pendingInRun} 项，失败 ${failInRun} 项`);
     }
   } finally {
     state.transferRunning = false;
@@ -1998,45 +2035,67 @@ async function handleTransferAcceptAll() {
     return;
   }
 
+  const concurrency = Math.max(1, Math.min(16, Number($('transfer-concurrency-select')?.value) || 8));
+  const workerCount = Math.min(concurrency, candidates.length);
+
   const btn = $('transfer-accept-all-btn');
   if (btn) btn.disabled = true;
-  await appendTransferLog(`⚡ 接收邮箱 [${targetEmail}] 开始批量尝试通过 API 接受 ${candidates.length} 个文件的所有权…`, false);
+  await appendTransferLog(
+    `⚡ 接收邮箱 [${targetEmail}] 启动 ${workerCount} 线程并发批量接受 ${candidates.length} 个文件的所有权…`,
+    false
+  );
 
   let acceptedCount = 0;
   let stillPendingCount = 0;
+  let doneCount = 0;
+  let cursor = 0;
+  let lastRenderAt = 0;
+
   try {
-    for (let i = 0; i < candidates.length; i++) {
-      const it = candidates[i];
-      $('progress').textContent = `接收方正在接受所有权 (${i + 1}/${candidates.length}): ${it.name}`;
-      const res = await acceptSingleItemOwnership({
-        targetToken,
-        item: it,
-        targetEmail
-      });
-      it.stage = res.stage;
-      it.currentOwner = res.currentOwner || it.currentOwner;
-      it.targetPermissionId = res.targetPermissionId || it.targetPermissionId;
-      it.statusText = res.statusText;
-      it.updatedAt = new Date().toISOString();
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (cursor < candidates.length) {
+        const i = cursor++;
+        if (i >= candidates.length) break;
+        const it = candidates[i];
+        const res = await acceptSingleItemOwnership({
+          targetToken,
+          item: it,
+          targetEmail
+        });
+        it.stage = res.stage;
+        it.currentOwner = res.currentOwner || it.currentOwner;
+        it.targetPermissionId = res.targetPermissionId || it.targetPermissionId;
+        it.statusText = res.statusText;
+        it.updatedAt = new Date().toISOString();
 
-      if (res.accepted) acceptedCount++;
-      else stillPendingCount++;
+        if (res.accepted) acceptedCount++;
+        else stillPendingCount++;
+        doneCount++;
 
-      if ((i + 1) % 5 === 0 || i === candidates.length - 1) {
-        state.transferState = await saveOwnershipTransferState(state.transferState);
-        renderTransferWorkspace();
+        $('progress').textContent = `⚡ ${workerCount}线程并发接受所有权 (${doneCount}/${candidates.length}): 已接管 ${acceptedCount} 项`;
+
+        const now = Date.now();
+        if (now - lastRenderAt >= 350 || doneCount === candidates.length) {
+          lastRenderAt = now;
+          renderTransferWorkspace();
+        }
+        if (doneCount % 15 === 0) {
+          await saveOwnershipTransferState(state.transferState);
+        }
       }
-    }
+    });
+
+    await Promise.all(workers);
 
     await appendTransferLog(
-      `📥 接收方批量接受执行完毕：API 直接接管成功 ${acceptedCount} 项，仍待网页确认 ${stillPendingCount} 项。${
+      `📥 接收方 ${workerCount} 线程批量接受执行完毕：API 直接接管成功 ${acceptedCount} 项，仍待网页确认 ${stillPendingCount} 项。${
         stillPendingCount > 0
           ? '若 Google 个人号拦截了 API 自动接受，请点击右侧「🌐 网页全选接受兜底」，在打开的页面按 Ctrl+A 全选 -> 右键 -> 接受所有权，即可一次性全部完成！'
           : ''
       }`,
       true
     );
-    toast(`接收完成：已接管 ${acceptedCount} 项，待网页确认 ${stillPendingCount} 项`);
+    toast(`多线程接收完成：已接管 ${acceptedCount} 项，待网页确认 ${stillPendingCount} 项`);
   } finally {
     if (btn) btn.disabled = false;
     state.transferState = await saveOwnershipTransferState(state.transferState);
