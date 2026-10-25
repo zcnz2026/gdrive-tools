@@ -125,15 +125,26 @@ function renderAccountsUI() {
     .map((c, idx) => {
       const uid = c.uid || c.client_id;
       const name = c.fileName || `凭证 #${idx + 1}`;
-      const bound = c.boundEmail ? `已绑: ${c.boundEmail}` : '未授权';
-      const statusCls = c.boundEmail ? 'ok' : 'warning';
+      const isSa = c.client_type === 'service_account' || Boolean(c.client_email && c.private_key);
+      const typeIcon = isSa ? '🤖 服务账号' : '🖥️ OAuth客户端';
+      const boundList = Array.isArray(c.boundEmails) && c.boundEmails.length
+        ? c.boundEmails.join(', ')
+        : c.boundEmail || '';
+      const bound = boundList ? `已授权: ${boundList}` : '未授权';
+      const statusCls = boundList ? 'ok' : 'warning';
+      const btnText = isSa
+        ? '刷新令牌'
+        : boundList
+        ? '🌐 再登录其他邮箱 / 重授'
+        : '🌐 弹出浏览器登录';
       return `<div class="allow-item" style="width:100%;display:flex;align-items:center;justify-content:space-between;gap:6px;">
         <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(c.client_id)}">
-          📄 <strong>${escapeHtml(name)}</strong>
+          <strong>${escapeHtml(name)}</strong>
+          <span class="badge" style="margin-left:4px;">${typeIcon}</span>
           <span class="status-pill ${statusCls}" style="margin-left:4px;">${escapeHtml(bound)}</span>
         </span>
         <span class="row-flex" style="flex-shrink:0;">
-          <button type="button" class="btn btn-xs primary" data-action="auth-oauth-client" data-uid="${escapeHtml(uid)}">${c.boundEmail ? '重新授权' : '点击授权'}</button>
+          <button type="button" class="btn btn-xs primary" data-action="auth-oauth-client" data-uid="${escapeHtml(uid)}" title="使用此 JSON 凭证弹出浏览器选择任意 Google 邮箱登录（同一个桌面 OAuth 凭证可连续登录多个浏览器邮箱）">${btnText}</button>
           <button type="button" class="btn-text" style="color:#dc2626;" data-action="remove-oauth-client" data-uid="${escapeHtml(uid)}" title="删除此 JSON 凭证">×</button>
         </span>
       </div>`;
@@ -193,15 +204,15 @@ function updateTopBadges() {
 
 /* ==================== 导入 OAuth 桌面 JSON 凭证与多账号授权 ==================== */
 
-async function handleAuthorizeWithClient(client, prefixLabel = '') {
+async function handleAuthorizeWithClient(client, prefixLabel = '', loginHint = '') {
   setStatus(`${prefixLabel}等待 Google 授权…`);
-  $('progress').textContent = `${prefixLabel}请在弹出的 Google 页面完成登录授权（${client.fileName || client.client_id.slice(0, 12)}）…`;
+  $('progress').textContent = `${prefixLabel}请在弹出的 Google 页面选择要授权的邮箱完成登录（凭证：${client.fileName || client.client_id.slice(0, 12)}）…`;
   try {
-    const account = await authorizeWithOAuthClient(client);
+    const account = await authorizeWithOAuthClient(client, loginHint);
     state.accounts = await getAuthorizedAccounts();
     state.oauthClients = await getOAuthClients();
     renderAll();
-    $('progress').textContent = `已授权账号：${account.email}（请点击右上角「立即扫描」开始扫描）`;
+    $('progress').textContent = `已成功授权账号：${account.email}（当前共已授权 ${state.accounts.length} 个账号）`;
     toast(`${prefixLabel}已成功授权账号：${account.email}`);
     return account;
   } catch (error) {
@@ -239,29 +250,64 @@ async function handleOAuthFilesUpload(fileList) {
   if (extractedClients.length > 0) {
     state.oauthClients = await saveOAuthClients(extractedClients);
     renderAccountsUI();
-    toast(`已导入 ${extractedClients.length} 个 JSON 授权文件，开始逐一打开 Google 授权页…`);
+    toast(`已导入 ${extractedClients.length} 个 JSON 授权文件，开始逐一完成授权…`);
     let successCount = 0;
     for (let i = 0; i < extractedClients.length; i++) {
       const prefix = extractedClients.length > 1 ? `[${i + 1}/${extractedClients.length}] ` : '';
       const acc = await handleAuthorizeWithClient(extractedClients[i], prefix);
       if (acc) successCount++;
     }
-    $('progress').textContent = `已完成 ${successCount}/${extractedClients.length} 个凭证授权。请点击右上角「立即扫描」开始扫描。`;
+    $('progress').textContent = `已完成 ${successCount}/${extractedClients.length} 个凭证授权（当前共 ${state.accounts.length} 个已授权账号）。`;
   } else if (!allowlistImported) {
     toast('未识别到有效的 Google OAuth 凭证');
   }
 }
 
-async function handleAddMoreAccount() {
+async function handleAddMoreAccount(loginHint = '', roleTarget = '') {
   state.oauthClients = await getOAuthClients();
-  if (!state.oauthClients.length) {
+  // 只筛选支持弹出浏览器登录的桌面/Web OAuth 客户端凭证（排除 Service Account JSON）
+  const interactiveClients = state.oauthClients.filter(
+    c => c.client_type !== 'service_account' && c.client_id && c.client_secret
+  );
+
+  if (!interactiveClients.length) {
+    if (state.oauthClients.length > 0) {
+      toast('当前仅导入了 Service Account 服务账号 JSON（免登录机器人号）。如需授权浏览器登录的个人邮箱，请导入桌面端 OAuth Client JSON 文件！');
+    }
     $('oauth-json-file').click();
-    return;
+    return null;
   }
-  // 优先找尚未绑定账号的凭证，否则使用最后一个凭证
-  const unboundClient = state.oauthClients.find(c => !c.boundEmail);
-  const chosenClient = unboundClient || state.oauthClients[state.oauthClients.length - 1];
-  await handleAuthorizeWithClient(chosenClient);
+
+  // 轮询选择可用 OAuth 凭证（支持同一个凭证登录第2个邮箱，也支持在多个导入的凭证间自动切换尝试）
+  state.lastUsedOAuthIdx = ((state.lastUsedOAuthIdx ?? -1) + 1) % interactiveClients.length;
+  const unboundClient = interactiveClients.find(c => !c.boundEmail && !c._attemptedOnce);
+  let chosenClient = unboundClient || interactiveClients[state.lastUsedOAuthIdx];
+  chosenClient._attemptedOnce = true;
+
+  const cleanHint = typeof loginHint === 'string' ? normalizeEntry(loginHint) : '';
+  let acc = await handleAuthorizeWithClient(chosenClient, '', cleanHint);
+
+  // 如果用户导入了多个不同的 OAuth JSON 文件（如每个邮箱来自不同 Google Cloud 项目），当前凭证报错时自动尝试下一个凭证
+  if (!acc && interactiveClients.length > 1) {
+    for (const altClient of interactiveClients) {
+      if (altClient.uid === chosenClient.uid) continue;
+      toast(`正在自动切换尝试另一个 JSON 凭证（${altClient.fileName}）进行浏览器授权…`);
+      acc = await handleAuthorizeWithClient(altClient, `[切换凭证 ${altClient.fileName}] `, cleanHint);
+      if (acc) break;
+    }
+  }
+
+  if (acc && roleTarget === 'source') {
+    state.transferState.sourceEmail = normalizeEntry(acc.email);
+    state.transferState = await saveOwnershipTransferState(state.transferState);
+    renderTransferWorkspace();
+  } else if (acc && roleTarget === 'target') {
+    state.transferState.targetEmail = normalizeEntry(acc.email);
+    if ($('transfer-target-email-input')) $('transfer-target-email-input').value = normalizeEntry(acc.email);
+    state.transferState = await saveOwnershipTransferState(state.transferState);
+    renderTransferWorkspace();
+  }
+  return acc;
 }
 
 /* ==================== 左侧文件列表与右侧筛选控制 ==================== */
@@ -3392,7 +3438,7 @@ async function init() {
     await handleOAuthFilesUpload(e.target.files || []);
     e.target.value = '';
   });
-  $('add-account-btn').addEventListener('click', handleAddMoreAccount);
+  $('add-account-btn').addEventListener('click', () => handleAddMoreAccount('', ''));
 
   $('create-group-btn').addEventListener('click', async () => {
     const name = ($('new-group-name').value || '').trim();
@@ -3579,8 +3625,10 @@ async function init() {
     state.transferState = await saveOwnershipTransferState(state.transferState);
   });
 
-  $('transfer-add-source-btn')?.addEventListener('click', handleAddMoreAccount);
-  $('transfer-add-target-btn')?.addEventListener('click', handleAddMoreAccount);
+  $('transfer-add-source-btn')?.addEventListener('click', () => handleAddMoreAccount('', 'source'));
+  $('transfer-add-target-btn')?.addEventListener('click', () =>
+    handleAddMoreAccount($('transfer-target-email-input')?.value || '', 'target')
+  );
 
   $('transfer-scan-source-btn')?.addEventListener('click', () => handleTransferScanSource(false));
   $('transfer-incremental-scan-btn')?.addEventListener('click', () => handleTransferScanSource(true));

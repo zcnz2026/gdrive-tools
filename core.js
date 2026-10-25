@@ -769,7 +769,11 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
           chrome.tabs.remove(authTabId).catch(() => {});
         }
         if (err) {
-          reject(new Error(`Google 授权被拒绝或取消：${err}`));
+          const hint =
+            err === 'access_denied'
+              ? '（若第二个邮箱提示 403/未完成验证，请在 Google Cloud 控制台 -> OAuth 同意屏幕 -> 将该邮箱加入「测试用户」或点击「发布应用」，或切换使用该邮箱对应的 JSON 凭证）'
+              : '';
+          reject(new Error(`Google 授权被拒绝或取消：${err}${hint}`));
         } else {
           resolve(authCode);
         }
@@ -847,9 +851,15 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
 
   if (client.uid) {
     const allClients = await getOAuthClients();
-    const targetClient = allClients.find(c => c.uid === client.uid);
+    const targetClient = allClients.find(c => c.uid === client.uid) || allClients.find(c => c.client_id === client.client_id);
     if (targetClient) {
-      targetClient.boundEmail = savedAccount.email;
+      const prevList = Array.isArray(targetClient.boundEmails)
+        ? targetClient.boundEmails
+        : targetClient.boundEmail
+        ? [targetClient.boundEmail]
+        : [];
+      targetClient.boundEmails = [...new Set([...prevList, savedAccount.email].filter(Boolean))];
+      targetClient.boundEmail = targetClient.boundEmails.join(', ');
       await chrome.storage.local.set({ oauthClients: allClients });
     }
   }

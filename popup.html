@@ -665,16 +665,20 @@
             <!-- 设置块 1：Google 账号与桌面 JSON 授权（浅绿板块） -->
             <div class="section-block block-green">
               <div class="block-header">
-                <h2>1. 账号与桌面 JSON 授权</h2>
+                <h2>1. 账号与桌面 JSON 授权（支持多邮箱同时在线）</h2>
                 <span id="oauth-clients-info" class="meta-tag">已存凭证: 0</span>
               </div>
-              <p class="muted">直接导入从 Google Cloud 下载的桌面端（installed）或 Web 端 OAuth JSON 文件即可授权，支持多账号。</p>
+              <p class="muted">
+                💡 <strong>如何同时授权浏览器里的 2 个或多个个人邮箱？</strong><br>
+                ① <strong>桌面端 OAuth JSON（含 client_secret）</strong>：一个凭证即可登录多个邮箱！点击凭证右侧「<strong>🌐 再登录其他邮箱</strong>」，在弹出页选第 2 个邮箱即可（若第 2 个邮箱提示 403 测试受限，请在 Google Cloud 控制台 -> OAuth 同意屏幕 -> 将第 2 个邮箱加入「测试用户」或点「发布应用」）。<br>
+                ② <strong>Service Account JSON（sa-*.json 服务账号）</strong>：属于免登录机器人号，导入即自动生效，不能用于弹出浏览器登录个人 Gmail。
+              </p>
               <div class="row-flex" style="margin-top: 8px;">
                 <label class="btn primary btn-sm file-label">
-                  导入桌面 OAuth JSON 授权
+                  🔑 导入 JSON 授权文件 (可多选)
                   <input id="oauth-json-file" type="file" accept="application/json,.json" multiple>
                 </label>
-                <button id="add-account-btn" type="button" class="btn btn-sm">授权更多 Google 账号</button>
+                <button id="add-account-btn" type="button" class="btn btn-sm">🌐 弹出浏览器再授权一个 Google 邮箱</button>
               </div>
               <div id="accounts-list" class="accounts-pills" style="margin-top: 8px;"></div>
             </div>
