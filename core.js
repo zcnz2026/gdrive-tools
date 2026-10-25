@@ -759,8 +759,8 @@ async function importAuthorizedPassportFromObject(parsed) {
     let accessToken = acc.accessToken || '';
     let expiresAt = Number(acc.expiresAt) || 0;
 
-    // 如果只有 refreshToken 还没有 email（如外部 token.json），立即静默刷新并换取邮箱
-    if ((!email || !accessToken || Date.now() >= expiresAt - 60000) && acc.refreshToken && acc.clientId && acc.clientSecret) {
+    // 导入免登录通行证时，只要有 refreshToken 就优先静默刷新一次最新 accessToken（若离线暂不可达则将 expiresAt 置 0 以便首次扫描时自动刷新）
+    if (acc.refreshToken && acc.clientId && acc.clientSecret) {
       try {
         const tokenUri = acc.tokenUri || 'https://oauth2.googleapis.com/token';
         const resp = await fetch(tokenUri, {
@@ -781,9 +781,11 @@ async function importAuthorizedPassportFromObject(parsed) {
             const about = await fetchAboutUser(accessToken);
             email = normalizeEntry(about.email || '');
           }
+        } else {
+          expiresAt = 0;
         }
       } catch (_e) {
-        // 保留原 refreshToken，后续实际调用 API 时会自动重试刷新
+        expiresAt = 0;
       }
     }
 
@@ -830,33 +832,72 @@ async function refreshAccountAccessToken(account) {
     return updatedSa.accessToken;
   }
 
-  if (!account.refreshToken || !account.clientId || !account.clientSecret) {
-    throw new Error(`账号 ${account.email} 授权已过期，请重新点击授权`);
+  let clientId = account.clientId || '';
+  let clientSecret = account.clientSecret || '';
+  let tokenUri = account.tokenUri || 'https://oauth2.googleapis.com/token';
+
+  if ((!clientId || !clientSecret) && account.email) {
+    const allClients = await getOAuthClients();
+    const normEm = normalizeEntry(account.email);
+    const matchedClient =
+      allClients.find(c => c.client_id === clientId) ||
+      allClients.find(
+        c =>
+          normalizeEntry(c.boundEmail || '') === normEm ||
+          (Array.isArray(c.boundEmails) && c.boundEmails.map(normalizeEntry).includes(normEm))
+      ) ||
+      allClients.find(c => c.client_type !== 'service_account' && c.client_id && c.client_secret);
+    if (matchedClient) {
+      clientId = clientId || matchedClient.client_id;
+      clientSecret = clientSecret || matchedClient.client_secret;
+      tokenUri = account.tokenUri || matchedClient.token_uri || tokenUri;
+    }
   }
-  const tokenUri = account.tokenUri || 'https://oauth2.googleapis.com/token';
-  const response = await fetch(tokenUri, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: account.clientId,
-      client_secret: account.clientSecret,
-      refresh_token: account.refreshToken,
-      grant_type: 'refresh_token'
-    }).toString()
-  });
+
+  if (!account.refreshToken || !clientId || !clientSecret) {
+    throw new Error(`账号 ${account.email} 缺少 refreshToken 或客户端密钥，请重新授权或重新导出含完整凭证的免登录通行证 JSON`);
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 25000);
+  let response;
+  try {
+    response = await fetch(tokenUri, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      signal: controller.signal,
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: account.refreshToken,
+        grant_type: 'refresh_token'
+      }).toString()
+    });
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`刷新账号 ${account.email} 令牌超时（请检查网络是否能连接 oauth2.googleapis.com）`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+
   const data = await response.json().catch(() => ({}));
   if (!response.ok || !data.access_token) {
     throw new Error(data.error_description || data.error || `刷新令牌失败 (${response.status})`);
   }
   const updated = await saveAuthorizedAccount({
     ...account,
+    clientId,
+    clientSecret,
+    tokenUri,
     accessToken: data.access_token,
     expiresAt: Date.now() + (Number(data.expires_in) || 3500) * 1000
   });
   return updated.accessToken;
 }
 
-async function getValidTokenForAccount(email, interactive = false) {
+async function getValidTokenForAccount(email, interactive = false, forceRefresh = false) {
   const accounts = await getAuthorizedAccounts();
   const normEmail = normalizeEntry(email);
   const target = normEmail
@@ -864,13 +905,13 @@ async function getValidTokenForAccount(email, interactive = false) {
     : accounts[0];
 
   if (target) {
-    if (target.accessToken && Date.now() < (target.expiresAt || 0) - 60000) {
+    if (!forceRefresh && target.accessToken && Date.now() < (target.expiresAt || 0) - 60000) {
       return target.accessToken;
     }
     if (target.isServiceAccount && target.privateKey) {
       return refreshAccountAccessToken(target);
     }
-    if (target.refreshToken && target.clientId && target.clientSecret) {
+    if (target.refreshToken) {
       return refreshAccountAccessToken(target);
     }
     if (interactive && target.clientId && target.clientSecret) {
@@ -885,7 +926,7 @@ async function getValidTokenForAccount(email, interactive = false) {
       );
       return reauthed.accessToken;
     }
-    if (target.accessToken) return target.accessToken;
+    if (!forceRefresh && target.accessToken) return target.accessToken;
   }
 
   const manifestClientId = chrome.runtime.getManifest().oauth2?.client_id || '';
@@ -893,7 +934,7 @@ async function getValidTokenForAccount(email, interactive = false) {
     return getChromeIdentityToken(interactive);
   }
 
-  throw new Error('尚未授权账号。请先点击「🔑 导入桌面 JSON 授权」导入 Google OAuth JSON 文件完成授权。');
+  throw new Error('尚未找到可用的已授权账号令牌。请先导入免登录通行证 JSON 或点击「🌐 授权新邮箱」完成授权。');
 }
 
 function getChromeIdentityToken(interactive = true) {
@@ -2257,20 +2298,42 @@ async function runFullScan({
   await Promise.all(
     targetAccounts.map(async acc => {
       const prefix = targetAccounts.length > 1 ? `[${acc.email}] ` : '';
-      const token = await getValidTokenForAccount(acc.email, interactive);
-      const accFiles = await scanSingleAccount(
-        acc.email,
-        token,
-        onProgress,
-        prefix,
-        partialList => {
-          perAccountFiles.set(acc.email, partialList);
-          emitPartialCombined();
-        },
-        scanScope,
-        customFolderIds,
-        recursive
-      );
+      let token = await getValidTokenForAccount(acc.email, interactive, false);
+      let accFiles;
+      try {
+        accFiles = await scanSingleAccount(
+          acc.email,
+          token,
+          onProgress,
+          prefix,
+          partialList => {
+            perAccountFiles.set(acc.email, partialList);
+            emitPartialCombined();
+          },
+          scanScope,
+          customFolderIds,
+          recursive
+        );
+      } catch (err) {
+        if (/401|Invalid Credentials|UNAUTHENTICATED|authError/i.test(String(err?.message || ''))) {
+          token = await getValidTokenForAccount(acc.email, interactive, true);
+          accFiles = await scanSingleAccount(
+            acc.email,
+            token,
+            onProgress,
+            prefix,
+            partialList => {
+              perAccountFiles.set(acc.email, partialList);
+              emitPartialCombined();
+            },
+            scanScope,
+            customFolderIds,
+            recursive
+          );
+        } else {
+          throw err;
+        }
+      }
       perAccountFiles.set(acc.email, accFiles);
       emitPartialCombined();
     })
@@ -3191,48 +3254,13 @@ async function clearOwnershipTransferState() {
 }
 
 /**
- * 扫描来源邮箱名下所有「我是所有者 ('me' in owners)」的文件夹与文件（支持首次全盘扫描或增量合并扫描，无需每次重扫）
+ * 将扫描到的原始 Drive 文件数组转换为所有权转移条目列表（供每页边扫边展示与最终汇总共用）
  */
-async function scanSourceOwnedItemsForTransfer({
-  sourceEmail = '',
-  targetEmail = '',
-  existingItems = [],
-  mergeMode = false,
-  onProgress = null
-}) {
-  const normSource = normalizeEntry(sourceEmail);
-  const normTarget = normalizeEntry(targetEmail);
-  if (!normSource) {
-    throw new Error('请先在左侧选择「来源邮箱（原所有者）」');
-  }
-
-  const sourceToken = await getValidTokenForAccount(normSource, true);
-  const rawFiles = [];
-  let pageToken = '';
-  let page = 0;
-  const q = "trashed = false and 'me' in owners and mimeType != 'application/vnd.google-apps.shortcut'";
-
-  do {
-    page++;
-    if (onProgress) {
-      onProgress({
-        page,
-        count: rawFiles.length,
-        message: `正在扫描来源邮箱 (${normSource}) 我所有的文件与文件夹：第 ${page} 页（已发现 ${rawFiles.length} 项）…`
-      });
-    }
-    const res = await driveApi(
-      sourceToken,
-      `/files?pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true&q=${encodeURIComponent(q)}&fields=nextPageToken,files(id,name,mimeType,webViewLink,modifiedTime,ownedByMe,owners(emailAddress,displayName),permissions(id,type,role,emailAddress,pendingOwner))${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`
-    );
-    if (Array.isArray(res?.files)) {
-      rawFiles.push(...res.files);
-    }
-    pageToken = res?.nextPageToken || '';
-  } while (pageToken);
-
-  // 文件夹排在前面优先转移，保持层级清晰
-  rawFiles.sort((a, b) => {
+function buildTransferItemsFromRawFiles(
+  rawFiles = [],
+  { normSource = '', normTarget = '', existingItems = [], mergeMode = false, includeHistoricalMerged = false } = {}
+) {
+  const sorted = [...rawFiles].sort((a, b) => {
     const aFolder = a.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
     const bFolder = b.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
     if (aFolder !== bFolder) return aFolder - bFolder;
@@ -3241,8 +3269,12 @@ async function scanSourceOwnedItemsForTransfer({
 
   const prevById = new Map((existingItems || []).map(it => [it.id, it]));
   const nextItems = [];
+  const seenIds = new Set();
 
-  for (const f of rawFiles) {
+  for (const f of sorted) {
+    if (!f?.id || seenIds.has(f.id)) continue;
+    seenIds.add(f.id);
+
     const prev = prevById.get(f.id);
     const ownerEm = normalizeEntry(f.owners?.[0]?.emailAddress || normSource);
     const perms = Array.isArray(f.permissions) ? f.permissions : [];
@@ -3286,10 +3318,9 @@ async function scanSourceOwnedItemsForTransfer({
   }
 
   // 如果是增量合并模式，保留之前已经成功转给接收邮箱（因而不再出现在来源账号 'me' in owners 列表中）的历史完成项
-  if (mergeMode && existingItems?.length) {
-    const scannedIds = new Set(nextItems.map(x => x.id));
+  if (mergeMode && includeHistoricalMerged && existingItems?.length) {
     for (const oldItem of existingItems) {
-      if (!scannedIds.has(oldItem.id)) {
+      if (!seenIds.has(oldItem.id)) {
         if (oldItem.stage === 'completed' || oldItem.stage === 'pending_accept') {
           nextItems.push({
             ...oldItem,
@@ -3303,6 +3334,121 @@ async function scanSourceOwnedItemsForTransfer({
   }
 
   return nextItems;
+}
+
+/**
+ * 扫描来源邮箱名下所有「我是所有者 ('me' in owners)」的文件夹与文件（支持边扫边展示 onPartialItems、首次全盘扫描或增量合并扫描）
+ */
+async function scanSourceOwnedItemsForTransfer({
+  sourceEmail = '',
+  targetEmail = '',
+  existingItems = [],
+  mergeMode = false,
+  onProgress = null,
+  onPartialItems = null,
+  shouldStop = null
+}) {
+  const normSource = normalizeEntry(sourceEmail);
+  const normTarget = normalizeEntry(targetEmail);
+  if (!normSource) {
+    throw new Error('请先在左侧选择「来源邮箱（原所有者）」');
+  }
+
+  if (onProgress) {
+    onProgress({
+      phase: 'auth',
+      page: 0,
+      count: 0,
+      message: `正在校验来源邮箱 (${normSource}) 的免登录授权令牌…`
+    });
+  }
+
+  let sourceToken = await getValidTokenForAccount(normSource, true, false);
+
+  if (onProgress) {
+    onProgress({
+      phase: 'token_ready',
+      page: 0,
+      count: 0,
+      message: `✅ 来源邮箱 (${normSource}) 令牌校验通过，正在请求第 1 页文件与文件夹…`
+    });
+  }
+
+  const rawFiles = [];
+  let pageToken = '';
+  let page = 0;
+  const q = "trashed = false and 'me' in owners and mimeType != 'application/vnd.google-apps.shortcut'";
+
+  do {
+    if (shouldStop && shouldStop()) {
+      break;
+    }
+    page++;
+    if (onProgress) {
+      onProgress({
+        phase: 'scanning',
+        page,
+        count: rawFiles.length,
+        message: `正在扫描来源邮箱 (${normSource})：正在拉取第 ${page} 页（当前已发现 ${rawFiles.length} 项）…`
+      });
+    }
+
+    const apiPath = `/files?pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true&q=${encodeURIComponent(q)}&fields=nextPageToken,files(id,name,mimeType,webViewLink,modifiedTime,ownedByMe,owners(emailAddress,displayName),permissions(id,type,role,emailAddress,pendingOwner))${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`;
+
+    let res;
+    try {
+      res = await driveApi(sourceToken, apiPath);
+    } catch (apiErr) {
+      // 若导入的免登录通行证中的旧 accessToken 已失效 (401)，自动用 refreshToken 强制刷新一次并无缝重试
+      if (page === 1 && /401|Invalid Credentials|UNAUTHENTICATED|authError/i.test(String(apiErr?.message || ''))) {
+        if (onProgress) {
+          onProgress({
+            phase: 'auth_refresh',
+            page: 1,
+            count: 0,
+            message: `🔄 检测到缓存令牌已过期，正在使用免登录 refreshToken 自动换取新令牌…`
+          });
+        }
+        sourceToken = await getValidTokenForAccount(normSource, false, true);
+        res = await driveApi(sourceToken, apiPath);
+      } else {
+        throw apiErr;
+      }
+    }
+
+    const pageFiles = Array.isArray(res?.files) ? res.files : [];
+    if (pageFiles.length > 0) {
+      rawFiles.push(...pageFiles);
+    }
+    pageToken = res?.nextPageToken || '';
+
+    // 每扫完一页立即构建当前列表并触发边扫边展示回调（表格、统计卡片、进度条、日志同步刷新）
+    if (onPartialItems) {
+      const partialItems = buildTransferItemsFromRawFiles(rawFiles, {
+        normSource,
+        normTarget,
+        existingItems,
+        mergeMode,
+        includeHistoricalMerged: !pageToken
+      });
+      await onPartialItems(partialItems, {
+        page,
+        pageAdded: pageFiles.length,
+        total: partialItems.length,
+        hasMore: Boolean(pageToken)
+      });
+      // 让出 15ms 给浏览器主线程立即重绘表格与日志界面，实现丝滑的「边扫描边出来」
+      await new Promise(r => setTimeout(r, 15));
+    }
+  } while (pageToken);
+
+  return buildTransferItemsFromRawFiles(rawFiles, {
+    normSource,
+    normTarget,
+    existingItems,
+    mergeMode,
+    includeHistoricalMerged: true
+  });
 }
 
 /**

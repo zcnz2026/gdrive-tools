@@ -1717,11 +1717,21 @@ async function handleTransferScanSource(mergeMode = false) {
 
   const scanBtn = $('transfer-scan-source-btn');
   const incBtn = $('transfer-incremental-scan-btn');
-  if (scanBtn) scanBtn.disabled = true;
+  const pauseBtn = $('transfer-pause-btn');
+  const origScanBtnText = scanBtn ? scanBtn.textContent : '🔍 首次扫描我所有的文件与文件夹';
+
+  if (scanBtn) {
+    scanBtn.disabled = true;
+    scanBtn.textContent = '⏳ 正在校验令牌并连接云盘…';
+  }
   if (incBtn) incBtn.disabled = true;
+  if (pauseBtn) pauseBtn.disabled = false;
+  state.transferPauseRequested = false;
+
+  const existingSnapshotItems = Array.isArray(state.transferState.items) ? [...state.transferState.items] : [];
 
   await appendTransferLog(
-    `${mergeMode ? '➕ 启动增量补扫' : '🔍 启动首次全盘扫描'}：正在扫描来源邮箱 ${sourceEmail} 名下所有「我是所有者 ('me' in owners)」的文件夹与文件…`,
+    `${mergeMode ? '➕ 启动增量补扫' : '🔍 启动首次全盘扫描'}：正在扫描来源邮箱 ${sourceEmail} 名下所有「我是所有者 ('me' in owners)」的文件夹与文件（支持边扫描边实时展示）…`,
     false
   );
 
@@ -1729,10 +1739,53 @@ async function handleTransferScanSource(mergeMode = false) {
     const items = await scanSourceOwnedItemsForTransfer({
       sourceEmail,
       targetEmail,
-      existingItems: state.transferState.items || [],
+      existingItems: existingSnapshotItems,
       mergeMode,
-      onProgress(p) {
-        if (p?.message) $('progress').textContent = p.message;
+      shouldStop: () => Boolean(state.transferPauseRequested),
+      async onProgress(p) {
+        if (p?.message) {
+          $('progress').textContent = p.message;
+          if ($('transfer-progress-text')) {
+            $('transfer-progress-text').textContent = `⏳ ${p.message}`;
+          }
+        }
+        if (p?.phase === 'token_ready') {
+          await appendTransferLog(`🔑 免登录令牌校验通过 (${sourceEmail})，开始分页拉取云盘数据（每页结果将实时渲染至下方表格）…`, false);
+        } else if (p?.phase === 'auth_refresh') {
+          await appendTransferLog(`🔄 正在使用免登录 refreshToken 自动换取新访问令牌 (${sourceEmail})…`, false);
+        } else if (p?.phase === 'scanning' && scanBtn) {
+          scanBtn.textContent = `⏳ 正在拉取第 ${p.page} 页 (已出 ${p.count} 项)…`;
+        }
+      },
+      async onPartialItems(partialItems, info) {
+        const pFolderCnt = partialItems.filter(i => i.mimeType === 'application/vnd.google-apps.folder').length;
+        const pFileCnt = partialItems.length - pFolderCnt;
+
+        state.transferState.sourceEmail = sourceEmail;
+        if (targetEmail) state.transferState.targetEmail = targetEmail;
+        state.transferState.lastScannedAt = new Date().toISOString();
+        state.transferState.items = partialItems;
+
+        if (scanBtn) {
+          scanBtn.textContent = info.hasMore
+            ? `⏳ 边扫边出：第 ${info.page} 页 (${info.total} 项)…`
+            : `✅ 已拉取完 ${info.total} 项，正在保存…`;
+        }
+
+        await appendTransferLog(
+          `📄 [边扫边展 · 第 ${info.page} 页] 本页扫出 +${info.pageAdded} 项 ➔ 累计 ${info.total} 项（📁 文件夹 ${pFolderCnt} / 📄 文件 ${pFileCnt}）${
+            info.hasMore ? '，继续扫描下一页…' : '，全部页面拉取完毕！'
+          }`,
+          false
+        );
+
+        // 立即刷新看板统计卡片 + Jspreadsheet 表格，让用户每页都能实时看到文件出来
+        renderTransferWorkspace();
+
+        // 每 3 页自动在后台存一次断点，防止中途关闭丢失
+        if (info.page % 3 === 0) {
+          await saveOwnershipTransferState(state.transferState);
+        }
       }
     });
 
@@ -1747,8 +1800,9 @@ async function handleTransferScanSource(mergeMode = false) {
     state.transferState.items = items;
     state.transferState = await saveOwnershipTransferState(state.transferState);
 
+    const stopNote = state.transferPauseRequested ? '（已按请求提前停止并保留已扫结果）' : '';
     await appendTransferLog(
-      `✅ 扫描并保存完成：共 ${items.length} 项（文件夹 ${folderCnt} 个 / 文件 ${fileCnt} 个 · 已归接收方 ${completedCnt} 项 · 待确认 ${pendingCnt} 项）。记录已持久化保存，后续可直接断点续传！`,
+      `✅ 扫描并保存完成${stopNote}：共 ${items.length} 项（文件夹 ${folderCnt} 个 / 文件 ${fileCnt} 个 · 已归接收方 ${completedCnt} 项 · 待确认 ${pendingCnt} 项）。记录已持久化保存，后续可直接断点续传！`,
       true
     );
     $('progress').textContent = `来源邮箱 (${sourceEmail}) 全盘扫描完成：共 ${items.length} 项已保存至本地记录`;
@@ -1758,8 +1812,12 @@ async function handleTransferScanSource(mergeMode = false) {
     await appendTransferLog(`❌ 扫描来源邮箱失败：${error.message}`, true);
     toast(`扫描失败：${error.message}`);
   } finally {
-    if (scanBtn) scanBtn.disabled = false;
+    if (scanBtn) {
+      scanBtn.disabled = false;
+      scanBtn.textContent = origScanBtnText;
+    }
     if (incBtn) incBtn.disabled = false;
+    if (pauseBtn && !state.transferRunning) pauseBtn.disabled = true;
   }
 }
 
