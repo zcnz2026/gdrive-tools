@@ -1285,7 +1285,7 @@ async function driveApi(token, path, options = {}, retry = 0) {
       ...(options.headers || {})
     }
   });
-  if ((response.status === 429 || response.status === 403 || response.status >= 500) && retry < 5) {
+  if ((response.status === 429 || response.status === 403 || response.status >= 500) && retry < 8) {
     const body = await response.clone().json().catch(() => ({}));
     const reason = body?.error?.errors?.[0]?.reason;
     if (
@@ -1295,7 +1295,8 @@ async function driveApi(token, path, options = {}, retry = 0) {
     ) {
       throw new Error(body?.error?.message || `Drive API 错误 ${response.status}`);
     }
-    await new Promise(r => setTimeout(r, Math.min(1000 * 2 ** retry + Math.random() * 500, 16000)));
+    const waitMs = Math.min(280 * 1.55 ** retry + Math.random() * 180, 5000);
+    await new Promise(r => setTimeout(r, waitMs));
     return driveApi(token, path, options, retry + 1);
   }
   if (!response.ok) {
@@ -3248,7 +3249,8 @@ async function getOwnershipTransferState() {
 }
 
 async function saveOwnershipTransferState(partial = {}) {
-  const current = await getOwnershipTransferState();
+  const hasFullState = Array.isArray(partial.items) && Array.isArray(partial.logs);
+  const current = hasFullState ? partial : await getOwnershipTransferState();
   const next = {
     ...current,
     ...partial,
@@ -3256,8 +3258,8 @@ async function saveOwnershipTransferState(partial = {}) {
     targetEmail: normalizeEntry(partial.targetEmail !== undefined ? partial.targetEmail : current.targetEmail),
     lastUpdatedAt: new Date().toISOString()
   };
-  if (Array.isArray(next.logs) && next.logs.length > 600) {
-    next.logs = next.logs.slice(-600);
+  if (Array.isArray(next.logs) && next.logs.length > 400) {
+    next.logs = next.logs.slice(-400);
   }
   await safeStorageSet({ [OWNERSHIP_TRANSFER_STORAGE_KEY]: next });
   return next;

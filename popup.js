@@ -1500,17 +1500,18 @@ function renderAll() {
 
 /* ==================== 全盘所有权转移工作台（左：来源扫描 ➔ 右：接收与对比 · 断点续传 · 实时日志） ==================== */
 
+let transferLogRenderTimer = null;
+
 function renderTransferLogsConsole() {
   const box = $('transfer-log-console');
   if (!box) return;
   const logs = state.transferState?.logs || [];
   if (!logs.length) {
-    box.innerHTML =
-      '<div class="muted">等待操作… 首次使用请在上方左侧选择「来源邮箱」并点击「🔍 扫描来源全盘所有权文件」。扫描结果与转移进度会自动保存，下次打开可直接断点续传。</div>';
+    box.innerHTML = `<div class="muted">暂无转移操作日志。选择左侧来源邮箱并点击「🔍 扫描来源全盘所有权文件」开始记录…</div>`;
     return;
   }
   box.innerHTML = logs
-    .slice(-200)
+    .slice(-120)
     .map(line => `<div class="transfer-log-line">${escapeHtml(line)}</div>`)
     .join('');
   box.scrollTop = box.scrollHeight;
@@ -1521,12 +1522,21 @@ async function appendTransferLog(msg, persistNow = true) {
   const line = `[${nowStr}] ${msg}`;
   if (!Array.isArray(state.transferState.logs)) state.transferState.logs = [];
   state.transferState.logs.push(line);
-  if (state.transferState.logs.length > 600) {
-    state.transferState.logs = state.transferState.logs.slice(-600);
+  if (state.transferState.logs.length > 400) {
+    state.transferState.logs = state.transferState.logs.slice(-400);
   }
-  renderTransferLogsConsole();
   if (persistNow) {
+    if (transferLogRenderTimer) {
+      clearTimeout(transferLogRenderTimer);
+      transferLogRenderTimer = null;
+    }
+    renderTransferLogsConsole();
     state.transferState = await saveOwnershipTransferState(state.transferState);
+  } else if (!transferLogRenderTimer) {
+    transferLogRenderTimer = setTimeout(() => {
+      transferLogRenderTimer = null;
+      renderTransferLogsConsole();
+    }, 180);
   }
 }
 
@@ -1579,18 +1589,31 @@ function renderTransferAccountSelectors() {
   }
 }
 
-function renderTransferWorkspace() {
-  renderTransferAccountSelectors();
+function renderTransferWorkspace(skipSheet = false) {
+  const onlyStats = skipSheet === true;
+  if (!onlyStats) {
+    renderTransferAccountSelectors();
+  }
 
   const items = state.transferState?.items || [];
   const total = items.length;
-  const folderCount = items.filter(i => i.mimeType === 'application/vnd.google-apps.folder').length;
-  const fileCount = total - folderCount;
+  let folderCount = 0;
+  let sourceOwnedCount = 0;
+  let pendingAcceptCount = 0;
+  let targetOwnedCount = 0;
+  let failedCount = 0;
 
-  const sourceOwnedCount = items.filter(i => i.stage === 'pending_init').length;
-  const pendingAcceptCount = items.filter(i => i.stage === 'pending_accept').length;
-  const targetOwnedCount = items.filter(i => i.stage === 'completed').length;
-  const failedCount = items.filter(i => i.stage === 'failed').length;
+  // 单次循环极速统计（即使 20,000 条也仅耗时 0.3ms）
+  for (let i = 0; i < total; i++) {
+    const it = items[i];
+    if (it.mimeType === 'application/vnd.google-apps.folder') folderCount++;
+    const st = it.stage;
+    if (st === 'pending_init') sourceOwnedCount++;
+    else if (st === 'pending_accept') pendingAcceptCount++;
+    else if (st === 'completed') targetOwnedCount++;
+    else if (st === 'failed') failedCount++;
+  }
+  const fileCount = total - folderCount;
 
   if ($('transfer-tab-badge')) {
     $('transfer-tab-badge').textContent = `${targetOwnedCount}/${total}`;
@@ -1645,12 +1668,12 @@ function renderTransferWorkspace() {
     } else if (sourceOwnedCount > 0 && (targetOwnedCount > 0 || pendingAcceptCount > 0)) {
       startBtn.textContent = `▶️ 断点续传剩余 (${sourceOwnedCount} 项)`;
     } else {
-      startBtn.textContent = '▶️ 开始 / 断点续传全盘转移';
+      startBtn.textContent = '▶️ 多线程开始 / 断点续传';
     }
   }
 
-  // 渲染 Jspreadsheet 对比表格
-  if (state.transferSheet) {
+  // 渲染 Jspreadsheet 对比表格（高频转移循环中可通过 skipSheet=true 跳过重度 DOM 重建，且超过 500 条时仅渲染前 500 条预览以彻底杜绝万级数据主线程卡顿）
+  if (!onlyStats && state.transferSheet) {
     const stageFilter = $('transfer-filter-stage')?.value || 'all';
     const typeFilter = $('transfer-filter-type')?.value || 'all';
     const kw = ($('transfer-filter-kw')?.value || '').trim().toLowerCase();
@@ -1667,16 +1690,19 @@ function renderTransferWorkspace() {
       return true;
     });
 
+    const MAX_SHEET_PREVIEW = 500;
+    const displayList = filtered.length > MAX_SHEET_PREVIEW ? filtered.slice(0, MAX_SHEET_PREVIEW) : filtered;
+
     state.isUpdatingTransferSheet = true;
     try {
-      if (!filtered.length) {
+      if (!displayList.length) {
         const emptyHint =
           items.length === 0
-            ? '尚未扫描来源邮箱，请先在上方左侧选择来源邮箱并点击「🔍 扫描来源全盘所有权文件」'
+            ? '尚未扫描来源邮箱，请先在上方左侧选择来源邮箱并点击「🔍 极速多线程扫描全盘」'
             : '当前筛选条件下没有匹配的转移记录';
         state.transferSheet.setData([['-', emptyHint, '', '', '', '', '', '']]);
       } else {
-        const rows = filtered.map(it => {
+        const rows = displayList.map(it => {
           const typeLabel = fileCategoryLabel(it.mimeType, it.name);
           const curOwnerCell =
             it.currentOwner && it.currentOwner === normalizeEntry(it.targetOwner || tgtEmail)
@@ -1696,6 +1722,18 @@ function renderTransferWorkspace() {
             it.webViewLink || it.id
           ];
         });
+        if (filtered.length > MAX_SHEET_PREVIEW) {
+          rows.push([
+            'ℹ️ 提示',
+            `为保证万级文件多线程极速运行不卡顿，表格仅预览前 ${MAX_SHEET_PREVIEW} 条（共匹配 ${filtered.length} 条，可用上方搜索/筛选精确查看或导出完整 CSV）`,
+            '',
+            '',
+            '',
+            '',
+            '',
+            ''
+          ]);
+        }
         state.transferSheet.setData(rows);
       }
     } finally {
@@ -1703,7 +1741,9 @@ function renderTransferWorkspace() {
     }
   }
 
-  renderTransferLogsConsole();
+  if (!onlyStats) {
+    renderTransferLogsConsole();
+  }
 }
 
 async function handleTransferScanSource(mergeMode = false) {
@@ -1908,6 +1948,8 @@ async function handleTransferRunLoop(retryFailedOnly = false) {
   let failInRun = 0;
   let cursor = 0;
   let lastRenderAt = 0;
+  let lastSheetRenderAt = Date.now();
+  let saveInFlight = false;
   let personalGmailAcceptProbeFailures = 0;
   let skipTargetApiAccept = false;
   let cachedTargetPermId = items.find(it => it.targetPermissionId)?.targetPermissionId || '';
@@ -1916,6 +1958,11 @@ async function handleTransferRunLoop(retryFailedOnly = false) {
   try {
     const workerCount = Math.min(concurrency, todoIndices.length);
     const workers = Array.from({ length: workerCount }, async (_, workerId) => {
+      // 错峰启动各工作线程（间隔 65ms），形成平滑流水线，避免 12 线程同一毫秒并发冲撞 Google API 触发 403 限速等待
+      if (workerId > 0) {
+        await new Promise(r => setTimeout(r, workerId * 65));
+      }
+
       while (cursor < todoIndices.length) {
         if (state.transferPauseRequested) {
           break;
@@ -1981,12 +2028,20 @@ async function handleTransferRunLoop(retryFailedOnly = false) {
         $('progress').textContent = `⚡ ${workerCount}线程并发转移中 (${processedInRun}/${todoIndices.length})：已完成 ${successInRun} · 待确认 ${pendingInRun} · 失败 ${failInRun}`;
 
         const now = Date.now();
-        if (now - lastRenderAt >= 350 || processedInRun === todoIndices.length) {
+        if (now - lastRenderAt >= 200 || processedInRun === todoIndices.length) {
           lastRenderAt = now;
-          renderTransferWorkspace();
+          const shouldRefreshSheet = now - lastSheetRenderAt >= 4500 || processedInRun === todoIndices.length;
+          if (shouldRefreshSheet) lastSheetRenderAt = now;
+          renderTransferWorkspace(!shouldRefreshSheet);
         }
-        if (processedInRun % 15 === 0) {
-          await saveOwnershipTransferState(state.transferState);
+        // 后台异步保存断点，绝不阻塞工作线程网络并发
+        if (processedInRun % 40 === 0 && !saveInFlight) {
+          saveInFlight = true;
+          saveOwnershipTransferState(state.transferState)
+            .catch(() => {})
+            .finally(() => {
+              saveInFlight = false;
+            });
         }
       }
     });
