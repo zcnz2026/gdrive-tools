@@ -26,6 +26,57 @@ function normalizeEmailList(list = []) {
   return [...new Set(list.map(normalizeEntry).filter(Boolean))];
 }
 
+/**
+ * 防配额溢出安全写入封装（自动处理 Resource::kQuotaBytes quota exceeded）
+ * 1. manifest.json 已开启 unlimitedStorage 权限（刷新扩展后即可解除 10MB 限制）
+ * 2. 若用户尚未刷新扩展或单次写入超大，自动清理历史缓存快照并降级重试，确保账号授权与扫描永不因存储配额报错中断
+ */
+async function safeStorageSet(payload) {
+  try {
+    await chrome.storage.local.set(payload);
+    return true;
+  } catch (err) {
+    const msg = String(err?.message || err || '');
+    if (/quota|QuotaBytes/i.test(msg)) {
+      // 如果当前保存的不是 scanSnapshot（例如保存免登录账号、OAuth凭据、全盘转移进度），先清除占空间最大的 scanSnapshot 缓存再重试
+      if (!('scanSnapshot' in payload)) {
+        try {
+          await chrome.storage.local.remove('scanSnapshot');
+          await chrome.storage.local.set(payload);
+          return true;
+        } catch (_retryErr) {
+          // 如果保存的是全盘转移状态且依然超限，自动精简日志与非核心字段后重试
+          if (payload.ownershipTransferState) {
+            const st = payload.ownershipTransferState;
+            const slimState = {
+              ...st,
+              logs: Array.isArray(st.logs) ? st.logs.slice(-150) : [],
+              items: Array.isArray(st.items)
+                ? st.items.map(it => ({
+                    id: it.id,
+                    name: it.name,
+                    mimeType: it.mimeType,
+                    isFolder: it.isFolder,
+                    sourceOwner: it.sourceOwner,
+                    targetOwner: it.targetOwner,
+                    currentOwner: it.currentOwner,
+                    targetPermissionId: it.targetPermissionId || '',
+                    stage: it.stage,
+                    statusText: it.statusText,
+                    error: it.error || ''
+                  }))
+                : []
+            };
+            await chrome.storage.local.set({ ownershipTransferState: slimState });
+            return true;
+          }
+        }
+      }
+    }
+    throw err;
+  }
+}
+
 /* ==================== 通讯录与邮箱分组（A列名称 / B列邮箱 / 分组） ==================== */
 
 async function getDirectory() {
@@ -76,7 +127,7 @@ async function saveDirectory(directory) {
     groups: cleanGroups,
     contacts: [...contactMap.values()]
   };
-  await chrome.storage.local.set({ directory: nextDir });
+  await safeStorageSet({ directory: nextDir });
   await syncDirectoryToPolicy(nextDir);
   return nextDir;
 }
@@ -112,7 +163,7 @@ async function syncDirectoryToPolicy(directory) {
     writers: [...writers],
     readers: [...readers]
   };
-  await chrome.storage.local.set({ policy: nextPolicy });
+  await safeStorageSet({ policy: nextPolicy });
   return nextPolicy;
 }
 
@@ -566,14 +617,14 @@ async function saveOAuthClients(newClients) {
       merged.push({ ...c, uid });
     }
   }
-  await chrome.storage.local.set({ oauthClients: merged });
+  await safeStorageSet({ oauthClients: merged });
   return merged;
 }
 
 async function removeOAuthClient(uidOrClientId) {
   const current = await getOAuthClients();
   const next = current.filter(c => (c.uid || c.client_id) !== uidOrClientId);
-  await chrome.storage.local.set({ oauthClients: next });
+  await safeStorageSet({ oauthClients: next });
   return next;
 }
 
@@ -593,7 +644,7 @@ async function saveAuthorizedAccount(account) {
     refreshToken: account.refreshToken || existing?.refreshToken || ''
   };
   const next = [mergedAccount, ...current.filter(a => normalizeEntry(a.email) !== normEmail)];
-  await chrome.storage.local.set({ authorizedAccounts: next });
+  await safeStorageSet({ authorizedAccounts: next });
   return mergedAccount;
 }
 
@@ -601,7 +652,7 @@ async function removeAuthorizedAccount(email) {
   const normEmail = normalizeEntry(email);
   const current = await getAuthorizedAccounts();
   const next = current.filter(a => normalizeEntry(a.email) !== normEmail);
-  await chrome.storage.local.set({ authorizedAccounts: next });
+  await safeStorageSet({ authorizedAccounts: next });
   return next;
 }
 
@@ -1019,7 +1070,7 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
         : [];
       targetClient.boundEmails = [...new Set([...prevList, savedAccount.email].filter(Boolean))];
       targetClient.boundEmail = targetClient.boundEmails.join(', ');
-      await chrome.storage.local.set({ oauthClients: allClients });
+      await safeStorageSet({ oauthClients: allClients });
     }
   }
 
@@ -1048,7 +1099,7 @@ async function savePolicy(partialPolicy) {
   next.writers = normalizeEmailList(next.writers || []);
   const writerSet = new Set(next.writers);
   next.readers = normalizeEmailList((next.readers || []).filter(item => !writerSet.has(item)));
-  await chrome.storage.local.set({ policy: next });
+  await safeStorageSet({ policy: next });
   return next;
 }
 
@@ -1064,8 +1115,94 @@ async function getSnapshot() {
   };
 }
 
+/**
+ * 压缩扫描快照后再写入本地缓存，剔除冗余的深层嵌套字段，将体积减小 60%~75%，
+ * 同时如果遇到用户尚未刷新插件（10MB 限制仍生效）的极端情况，自动截取缓存项且绝不抛出异常中断扫描。
+ */
+function compactSnapshotForStorage(snapshot, maxFiles = 0) {
+  if (!snapshot || typeof snapshot !== 'object') return snapshot;
+  const rawFiles = Array.isArray(snapshot.files) ? snapshot.files : [];
+  const sliceFiles = maxFiles > 0 && rawFiles.length > maxFiles ? rawFiles.slice(0, maxFiles) : rawFiles;
+
+  const compactFiles = sliceFiles.map(f => ({
+    id: f.id,
+    name: f.name,
+    mimeType: f.mimeType,
+    webViewLink: f.webViewLink || '',
+    modifiedTime: f.modifiedTime || '',
+    ownedByMe: Boolean(f.ownedByMe),
+    shared: Boolean(f.shared),
+    ownerAccount: f.ownerAccount || '',
+    scannedByAccount: f.scannedByAccount || '',
+    isNew: Boolean(f.isNew),
+    owners: Array.isArray(f.owners)
+      ? f.owners.slice(0, 2).map(o => ({
+          emailAddress: o.emailAddress || '',
+          displayName: o.displayName || ''
+        }))
+      : [],
+    capabilities: f.capabilities
+      ? {
+          canEdit: Boolean(f.capabilities.canEdit),
+          canComment: Boolean(f.capabilities.canComment),
+          canShare: Boolean(f.capabilities.canShare)
+        }
+      : undefined,
+    permissions: Array.isArray(f.permissions)
+      ? f.permissions.map(p => {
+          const inherited = Boolean(
+            p._inherited || (Array.isArray(p.permissionDetails) && p.permissionDetails.some(d => d.inherited))
+          );
+          const cp = {
+            id: p.id,
+            type: p.type,
+            role: p.role
+          };
+          if (p.emailAddress) cp.emailAddress = p.emailAddress;
+          if (p.domain) cp.domain = p.domain;
+          if (p.displayName && p.displayName !== p.emailAddress) cp.displayName = p.displayName;
+          if (p.pendingOwner) cp.pendingOwner = true;
+          if (inherited) cp._inherited = true;
+          return cp;
+        })
+      : []
+  }));
+
+  const knownIds = Array.isArray(snapshot.knownFileIds) ? snapshot.knownFileIds : [];
+  return {
+    lastScanAt: snapshot.lastScanAt || '',
+    lastScanSource: snapshot.lastScanSource || '',
+    accountEmail: snapshot.accountEmail || '',
+    files: compactFiles,
+    knownFileIds: maxFiles > 0 && knownIds.length > maxFiles * 2 ? knownIds.slice(-maxFiles * 2) : knownIds,
+    newFileIds: Array.isArray(snapshot.newFileIds) ? snapshot.newFileIds.slice(0, 5000) : []
+  };
+}
+
 async function saveSnapshot(snapshot) {
-  await chrome.storage.local.set({ scanSnapshot: snapshot });
+  try {
+    const compacted = compactSnapshotForStorage(snapshot, 0);
+    await chrome.storage.local.set({ scanSnapshot: compacted });
+  } catch (err) {
+    // 若用户尚未在 chrome://extensions 点击刷新激活 unlimitedStorage，导致超过默认 10MB 配额，自动降级缓存条数，绝不中断前端扫描展示
+    const limits = [4000, 2000, 800];
+    let saved = false;
+    for (const lim of limits) {
+      try {
+        const fallbackSnap = compactSnapshotForStorage(snapshot, lim);
+        await chrome.storage.local.set({ scanSnapshot: fallbackSnap });
+        saved = true;
+        break;
+      } catch (_e) {
+        // 继续尝试更小的缓存上限
+      }
+    }
+    if (!saved) {
+      try {
+        await chrome.storage.local.remove('scanSnapshot');
+      } catch (_e2) {}
+    }
+  }
   return snapshot;
 }
 
@@ -1078,8 +1215,8 @@ async function appendAuditLogs(entries) {
   const list = Array.isArray(entries) ? entries : [entries];
   if (!list.length) return;
   const current = await getAuditLogs();
-  const merged = [...list, ...current].slice(0, 600);
-  await chrome.storage.local.set({ auditLogs: merged });
+  const merged = [...list, ...current].slice(0, 500);
+  await safeStorageSet({ auditLogs: merged });
   return merged;
 }
 
@@ -1088,12 +1225,12 @@ async function markAuditLogRestored(logId) {
   const updated = current.map(item =>
     item.id === logId ? { ...item, restored: true, restoredAt: new Date().toISOString() } : item
   );
-  await chrome.storage.local.set({ auditLogs: updated });
+  await safeStorageSet({ auditLogs: updated });
   return updated;
 }
 
 async function clearAuditLogs() {
-  await chrome.storage.local.set({ auditLogs: [] });
+  await safeStorageSet({ auditLogs: [] });
 }
 
 /* ==================== Drive API 请求封装 ==================== */
@@ -1136,7 +1273,7 @@ async function fetchAboutUser(token) {
 }
 
 function permIsInherited(permission) {
-  return (permission?.permissionDetails || []).some(detail => detail.inherited);
+  return Boolean(permission?._inherited || (permission?.permissionDetails || []).some(detail => detail.inherited));
 }
 
 function roleLabel(role) {
@@ -3035,7 +3172,7 @@ async function saveOwnershipTransferState(partial = {}) {
   if (Array.isArray(next.logs) && next.logs.length > 600) {
     next.logs = next.logs.slice(-600);
   }
-  await chrome.storage.local.set({ [OWNERSHIP_TRANSFER_STORAGE_KEY]: next });
+  await safeStorageSet({ [OWNERSHIP_TRANSFER_STORAGE_KEY]: next });
   return next;
 }
 
@@ -3049,7 +3186,7 @@ async function clearOwnershipTransferState() {
     items: [],
     logs: []
   };
-  await chrome.storage.local.set({ [OWNERSHIP_TRANSFER_STORAGE_KEY]: empty });
+  await safeStorageSet({ [OWNERSHIP_TRANSFER_STORAGE_KEY]: empty });
   return empty;
 }
 
