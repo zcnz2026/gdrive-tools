@@ -2824,3 +2824,562 @@ async function scanBatchLinksStatus({
   await Promise.all(workers);
   return results;
 }
+
+/* ==================== 全盘所有权转移中心（来源邮箱 ➔ 接收邮箱 · 断点续传 · 对比与日志） ==================== */
+
+const OWNERSHIP_TRANSFER_STORAGE_KEY = 'ownershipTransferState';
+
+async function getOwnershipTransferState() {
+  const data = await chrome.storage.local.get(OWNERSHIP_TRANSFER_STORAGE_KEY);
+  const st = data[OWNERSHIP_TRANSFER_STORAGE_KEY];
+  if (!st || typeof st !== 'object') {
+    return {
+      sourceEmail: '',
+      targetEmail: '',
+      autoAccept: true,
+      lastScannedAt: '',
+      lastUpdatedAt: '',
+      items: [],
+      logs: []
+    };
+  }
+  return {
+    sourceEmail: normalizeEntry(st.sourceEmail || ''),
+    targetEmail: normalizeEntry(st.targetEmail || ''),
+    autoAccept: st.autoAccept !== false,
+    lastScannedAt: st.lastScannedAt || '',
+    lastUpdatedAt: st.lastUpdatedAt || '',
+    items: Array.isArray(st.items) ? st.items : [],
+    logs: Array.isArray(st.logs) ? st.logs.slice(-600) : []
+  };
+}
+
+async function saveOwnershipTransferState(partial = {}) {
+  const current = await getOwnershipTransferState();
+  const next = {
+    ...current,
+    ...partial,
+    sourceEmail: normalizeEntry(partial.sourceEmail !== undefined ? partial.sourceEmail : current.sourceEmail),
+    targetEmail: normalizeEntry(partial.targetEmail !== undefined ? partial.targetEmail : current.targetEmail),
+    lastUpdatedAt: new Date().toISOString()
+  };
+  if (Array.isArray(next.logs) && next.logs.length > 600) {
+    next.logs = next.logs.slice(-600);
+  }
+  await chrome.storage.local.set({ [OWNERSHIP_TRANSFER_STORAGE_KEY]: next });
+  return next;
+}
+
+async function clearOwnershipTransferState() {
+  const empty = {
+    sourceEmail: '',
+    targetEmail: '',
+    autoAccept: true,
+    lastScannedAt: '',
+    lastUpdatedAt: '',
+    items: [],
+    logs: []
+  };
+  await chrome.storage.local.set({ [OWNERSHIP_TRANSFER_STORAGE_KEY]: empty });
+  return empty;
+}
+
+/**
+ * 扫描来源邮箱名下所有「我是所有者 ('me' in owners)」的文件夹与文件（支持首次全盘扫描或增量合并扫描，无需每次重扫）
+ */
+async function scanSourceOwnedItemsForTransfer({
+  sourceEmail = '',
+  targetEmail = '',
+  existingItems = [],
+  mergeMode = false,
+  onProgress = null
+}) {
+  const normSource = normalizeEntry(sourceEmail);
+  const normTarget = normalizeEntry(targetEmail);
+  if (!normSource) {
+    throw new Error('请先在左侧选择「来源邮箱（原所有者）」');
+  }
+
+  const sourceToken = await getValidTokenForAccount(normSource, true);
+  const rawFiles = [];
+  let pageToken = '';
+  let page = 0;
+  const q = "trashed = false and 'me' in owners and mimeType != 'application/vnd.google-apps.shortcut'";
+
+  do {
+    page++;
+    if (onProgress) {
+      onProgress({
+        page,
+        count: rawFiles.length,
+        message: `正在扫描来源邮箱 (${normSource}) 我所有的文件与文件夹：第 ${page} 页（已发现 ${rawFiles.length} 项）…`
+      });
+    }
+    const res = await driveApi(
+      sourceToken,
+      `/files?pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true&q=${encodeURIComponent(q)}&fields=nextPageToken,files(id,name,mimeType,webViewLink,modifiedTime,ownedByMe,owners(emailAddress,displayName),permissions(id,type,role,emailAddress,pendingOwner))${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`
+    );
+    if (Array.isArray(res?.files)) {
+      rawFiles.push(...res.files);
+    }
+    pageToken = res?.nextPageToken || '';
+  } while (pageToken);
+
+  // 文件夹排在前面优先转移，保持层级清晰
+  rawFiles.sort((a, b) => {
+    const aFolder = a.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+    const bFolder = b.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+    if (aFolder !== bFolder) return aFolder - bFolder;
+    return String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN');
+  });
+
+  const prevById = new Map((existingItems || []).map(it => [it.id, it]));
+  const nextItems = [];
+
+  for (const f of rawFiles) {
+    const prev = prevById.get(f.id);
+    const ownerEm = normalizeEntry(f.owners?.[0]?.emailAddress || normSource);
+    const perms = Array.isArray(f.permissions) ? f.permissions : [];
+    const targetPerm = normTarget ? perms.find(p => normalizeEntry(p.emailAddress || '') === normTarget) : null;
+
+    let stage = 'pending_init'; // 'pending_init' | 'pending_accept' | 'completed' | 'failed'
+    let statusText = '⏳ 待发起转移 (仍归来源邮箱)';
+    let currentOwner = ownerEm;
+
+    if (normTarget && ownerEm === normTarget) {
+      stage = 'completed';
+      currentOwner = normTarget;
+      statusText = '✅ 已归属接收邮箱';
+    } else if (targetPerm?.role === 'owner') {
+      stage = 'completed';
+      currentOwner = normTarget;
+      statusText = '✅ 已归属接收邮箱';
+    } else if (targetPerm?.pendingOwner === true) {
+      stage = 'pending_accept';
+      statusText = '📨 已发起邀请 (待接收邮箱确认)';
+    } else if (mergeMode && prev && (prev.stage === 'completed' || prev.stage === 'pending_accept')) {
+      stage = prev.stage;
+      statusText = prev.statusText || statusText;
+      currentOwner = prev.currentOwner || currentOwner;
+    }
+
+    nextItems.push({
+      id: f.id,
+      name: f.name || '(无名称)',
+      mimeType: f.mimeType || '',
+      webViewLink: f.webViewLink || `https://drive.google.com/open?id=${f.id}`,
+      sourceOwner: normSource,
+      targetOwner: normTarget,
+      currentOwner,
+      targetPermissionId: targetPerm?.id || prev?.targetPermissionId || '',
+      stage,
+      statusText,
+      error: '',
+      updatedAt: prev?.updatedAt || new Date().toISOString()
+    });
+  }
+
+  // 如果是增量合并模式，保留之前已经成功转给接收邮箱（因而不再出现在来源账号 'me' in owners 列表中）的历史完成项
+  if (mergeMode && existingItems?.length) {
+    const scannedIds = new Set(nextItems.map(x => x.id));
+    for (const oldItem of existingItems) {
+      if (!scannedIds.has(oldItem.id)) {
+        if (oldItem.stage === 'completed' || oldItem.stage === 'pending_accept') {
+          nextItems.push({
+            ...oldItem,
+            stage: 'completed',
+            currentOwner: normTarget || oldItem.targetOwner || oldItem.currentOwner,
+            statusText: '✅ 已转出 (不再归属来源邮箱)'
+          });
+        }
+      }
+    }
+  }
+
+  return nextItems;
+}
+
+/**
+ * 接收方账号尝试通过 API 自动接受单个文件/文件夹的所有权 (transferOwnership=true, role='owner')
+ */
+async function acceptSingleItemOwnership({ targetToken, item, targetEmail }) {
+  const normTarget = normalizeEntry(targetEmail || item.targetOwner);
+  if (!targetToken || !normTarget) {
+    return {
+      accepted: false,
+      stage: item.stage || 'pending_accept',
+      statusText: '📨 待接收 (接收邮箱尚未在插件内授权)',
+      logMsg: `接收邮箱 ${normTarget} 未授权 Token，保留待接收状态`
+    };
+  }
+
+  let permId = item.targetPermissionId || '';
+  try {
+    const permRes = await driveApi(
+      targetToken,
+      `/files/${encodeURIComponent(item.id)}/permissions?supportsAllDrives=true&fields=permissions(id,type,role,emailAddress,pendingOwner)`
+    );
+    const perms = permRes?.permissions || [];
+    const myPerm = perms.find(p => normalizeEntry(p.emailAddress || '') === normTarget);
+    if (myPerm?.role === 'owner') {
+      return {
+        accepted: true,
+        stage: 'completed',
+        currentOwner: normTarget,
+        targetPermissionId: myPerm.id,
+        statusText: '✅ 已归属接收邮箱',
+        logMsg: `核验发现 ${normTarget} 已经是《${item.name}》的所有者`
+      };
+    }
+    if (myPerm?.id) {
+      permId = myPerm.id;
+    }
+  } catch (_e) {
+    // ignore permission list error, fallback to cached permId
+  }
+
+  let acceptErr = '';
+  if (permId) {
+    try {
+      const updated = await driveApi(
+        targetToken,
+        `/files/${encodeURIComponent(item.id)}/permissions/${encodeURIComponent(permId)}?transferOwnership=true&moveToNewOwnersRoot=false&supportsAllDrives=true`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ role: 'owner' })
+        }
+      );
+      if (updated?.role === 'owner') {
+        return {
+          accepted: true,
+          stage: 'completed',
+          currentOwner: normTarget,
+          targetPermissionId: permId,
+          statusText: '✅ 接收方 API 已自动接受所有权',
+          logMsg: `接收方 ${normTarget} 已通过 API 自动接管《${item.name}》所有权`
+        };
+      }
+    } catch (err) {
+      acceptErr = err.message || 'API 接受受限';
+    }
+  } else {
+    try {
+      const created = await driveApi(
+        targetToken,
+        `/files/${encodeURIComponent(item.id)}/permissions?transferOwnership=true&moveToNewOwnersRoot=false&supportsAllDrives=true`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ type: 'user', role: 'owner', emailAddress: normTarget })
+        }
+      );
+      if (created?.role === 'owner') {
+        return {
+          accepted: true,
+          stage: 'completed',
+          currentOwner: normTarget,
+          targetPermissionId: created.id || '',
+          statusText: '✅ 接收方 API 已自动接受所有权',
+          logMsg: `接收方 ${normTarget} 已通过 API 自动接管《${item.name}》所有权`
+        };
+      }
+    } catch (err) {
+      acceptErr = err.message || 'API 接受受限';
+    }
+  }
+
+  // 再次实测该文件对接收方是否已变为 ownedByMe
+  try {
+    const checkMeta = await driveApi(
+      targetToken,
+      `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id,ownedByMe,owners(emailAddress)`
+    );
+    const realOwner = normalizeEntry(checkMeta?.owners?.[0]?.emailAddress || '');
+    if (checkMeta?.ownedByMe || realOwner === normTarget) {
+      return {
+        accepted: true,
+        stage: 'completed',
+        currentOwner: normTarget,
+        targetPermissionId: permId,
+        statusText: '✅ 已归属接收邮箱',
+        logMsg: `确认《${item.name}》当前实际所有者已变更为 ${normTarget}`
+      };
+    }
+  } catch (_e) {
+    // ignore
+  }
+
+  return {
+    accepted: false,
+    stage: 'pending_accept',
+    currentOwner: item.currentOwner || item.sourceOwner,
+    targetPermissionId: permId,
+    statusText: '📨 已发邀请(Pending) · 需网页全选确认',
+    logMsg: `《${item.name}》已处于待接收(pendingOwner)状态（Google 个人号策略需在网页汇总页全选接受：${acceptErr}）`
+  };
+}
+
+/**
+ * 单个文件/文件夹发起所有权转移（含自动前置赋予 writer + 设置 pendingOwner/transferOwnership + 可选自动调用接收方接受）
+ */
+async function transferSingleItemOwnership({
+  sourceToken,
+  targetToken = '',
+  item,
+  targetEmail,
+  autoAccept = true
+}) {
+  const normTarget = normalizeEntry(targetEmail || item.targetOwner);
+  if (!sourceToken) throw new Error('缺少来源邮箱授权令牌');
+  if (!normTarget) throw new Error('缺少接收邮箱地址');
+
+  const logs = [];
+  let permId = item.targetPermissionId || '';
+  let existingRole = '';
+  let alreadyPending = false;
+
+  // 1. 先检查该文件当前权限列表
+  try {
+    const permRes = await driveApi(
+      sourceToken,
+      `/files/${encodeURIComponent(item.id)}/permissions?supportsAllDrives=true&fields=permissions(id,type,role,emailAddress,pendingOwner)`
+    );
+    const perms = permRes?.permissions || [];
+    const targetPerm = perms.find(p => normalizeEntry(p.emailAddress || '') === normTarget);
+    if (targetPerm) {
+      permId = targetPerm.id || permId;
+      existingRole = targetPerm.role || '';
+      alreadyPending = Boolean(targetPerm.pendingOwner);
+      if (existingRole === 'owner') {
+        return {
+          stage: 'completed',
+          currentOwner: normTarget,
+          targetPermissionId: permId,
+          statusText: '✅ 已归属接收邮箱',
+          error: '',
+          logs: [`✅ 《${item.name}》所有者已经是 ${normTarget}，跳过发起`]
+        };
+      }
+    }
+  } catch (err) {
+    // 如果来源账号已经不是所有者，检查是否已经转给了接收方
+    if (targetToken) {
+      const checkRes = await acceptSingleItemOwnership({ targetToken, item, targetEmail: normTarget });
+      if (checkRes.accepted) {
+        return {
+          stage: 'completed',
+          currentOwner: normTarget,
+          targetPermissionId: checkRes.targetPermissionId || permId,
+          statusText: checkRes.statusText,
+          error: '',
+          logs: [checkRes.logMsg]
+        };
+      }
+    }
+    throw new Error(`读取《${item.name}》权限失败: ${err.message}`);
+  }
+
+  // 2. 如果尚未处于 pendingOwner，先尝试直接一步转移（同域 Workspace 账号可直接成功），若需确认则自动走 writer + pendingOwner=true
+  if (!alreadyPending) {
+    let directTransferred = false;
+    try {
+      if (permId) {
+        const directRes = await driveApi(
+          sourceToken,
+          `/files/${encodeURIComponent(item.id)}/permissions/${encodeURIComponent(permId)}?transferOwnership=true&moveToNewOwnersRoot=false&supportsAllDrives=true`,
+          {
+            method: 'PATCH',
+            body: JSON.stringify({ role: 'owner' })
+          }
+        );
+        if (directRes?.role === 'owner') {
+          directTransferred = true;
+        } else if (directRes?.pendingOwner) {
+          alreadyPending = true;
+        }
+      } else {
+        const directCreate = await driveApi(
+          sourceToken,
+          `/files/${encodeURIComponent(item.id)}/permissions?transferOwnership=true&moveToNewOwnersRoot=false&sendNotificationEmail=false&supportsAllDrives=true`,
+          {
+            method: 'POST',
+            body: JSON.stringify({ type: 'user', role: 'owner', emailAddress: normTarget })
+          }
+        );
+        permId = directCreate?.id || permId;
+        if (directCreate?.role === 'owner') {
+          directTransferred = true;
+        } else if (directCreate?.pendingOwner) {
+          alreadyPending = true;
+        }
+      }
+    } catch (_directErr) {
+      // 个人 @gmail.com 账号直接设 owner 会抛 consentRequiredForOwnershipTransfer，进入下面的标准两步法
+    }
+
+    if (directTransferred) {
+      return {
+        stage: 'completed',
+        currentOwner: normTarget,
+        targetPermissionId: permId,
+        statusText: '✅ 已直接完成所有权转移',
+        error: '',
+        logs: [`✅ 来源号已将《${item.name}》直接转移所有权给 ${normTarget}`]
+      };
+    }
+
+    // 标准两步法 Step 2A：确保接收邮箱先拥有 writer（可编辑）权限，避免 pendingOwnerWriterRequired 报错
+    if (!permId) {
+      const createdWriter = await driveApi(
+        sourceToken,
+        `/files/${encodeURIComponent(item.id)}/permissions?sendNotificationEmail=false&supportsAllDrives=true`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ type: 'user', role: 'writer', emailAddress: normTarget })
+        }
+      );
+      permId = createdWriter?.id || '';
+      logs.push(`📤 已为《${item.name}》前置添加接收方 ${normTarget} 编辑权限 (permId=${permId})`);
+    } else if (existingRole && existingRole !== 'writer' && existingRole !== 'organizer') {
+      await driveApi(
+        sourceToken,
+        `/files/${encodeURIComponent(item.id)}/permissions/${encodeURIComponent(permId)}?supportsAllDrives=true`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ role: 'writer' })
+        }
+      );
+      logs.push(`📤 已将《${item.name}》中 ${normTarget} 的权限升级为编辑者 (writer)`);
+    }
+
+    // 标准两步法 Step 2B：设置 pendingOwner: true 发起所有权转移邀请
+    if (!alreadyPending && permId) {
+      try {
+        await driveApi(
+          sourceToken,
+          `/files/${encodeURIComponent(item.id)}/permissions/${encodeURIComponent(permId)}?supportsAllDrives=true`,
+          {
+            method: 'PATCH',
+            body: JSON.stringify({ role: 'writer', pendingOwner: true })
+          }
+        );
+        alreadyPending = true;
+        logs.push(`📨 来源号已对《${item.name}》发起所有权转移邀请 (pendingOwner=true)`);
+      } catch (_err1) {
+        // 兼容部分接口要求带 transferOwnership=true 查询参数
+        await driveApi(
+          sourceToken,
+          `/files/${encodeURIComponent(item.id)}/permissions/${encodeURIComponent(permId)}?transferOwnership=true&moveToNewOwnersRoot=false&supportsAllDrives=true`,
+          {
+            method: 'PATCH',
+            body: JSON.stringify({ role: 'writer', pendingOwner: true })
+          }
+        );
+        alreadyPending = true;
+        logs.push(`📨 来源号已对《${item.name}》发起所有权转移邀请 (transferOwnership + pendingOwner=true)`);
+      }
+    }
+  } else {
+    logs.push(`ℹ️ 《${item.name}》此前已处于待 ${normTarget} 接收所有权状态 (pendingOwner=true)`);
+  }
+
+  // 3. 如果开启了接收方自动接受且接收方 Token 可用，立即用接收方 Token 尝试接管所有权
+  const updatedItem = { ...item, targetPermissionId: permId, stage: 'pending_accept' };
+  if (autoAccept && targetToken) {
+    const acceptRes = await acceptSingleItemOwnership({
+      targetToken,
+      item: updatedItem,
+      targetEmail: normTarget
+    });
+    logs.push(acceptRes.logMsg);
+    return {
+      stage: acceptRes.stage,
+      currentOwner: acceptRes.currentOwner || item.sourceOwner,
+      targetPermissionId: acceptRes.targetPermissionId || permId,
+      statusText: acceptRes.statusText,
+      error: '',
+      logs
+    };
+  }
+
+  return {
+    stage: 'pending_accept',
+    currentOwner: item.sourceOwner,
+    targetPermissionId: permId,
+    statusText: '📨 已发转移邀请 (待接收邮箱确认)',
+    error: '',
+    logs
+  };
+}
+
+/**
+ * 批量核对/对比来源邮箱与接收邮箱的实际归属状态（用于点击「核对左右邮箱实际归属」或网页端全选接受后刷新状态）
+ */
+async function verifyOwnershipTransferItems({
+  sourceToken = '',
+  targetToken = '',
+  items = [],
+  targetEmail = '',
+  onProgress = null
+}) {
+  const normTarget = normalizeEntry(targetEmail);
+  const probeToken = targetToken || sourceToken;
+  if (!probeToken) {
+    throw new Error('请至少授权来源邮箱或接收邮箱以执行归属对比核验');
+  }
+
+  let cursor = 0;
+  let done = 0;
+  const total = items.length;
+  let newlyCompleted = 0;
+  let stillPending = 0;
+  let stillSource = 0;
+
+  const workers = Array.from({ length: Math.min(8, Math.max(1, total)) }, async () => {
+    while (cursor < total) {
+      const idx = cursor++;
+      const it = items[idx];
+      try {
+        const meta = await driveApi(
+          probeToken,
+          `/files/${encodeURIComponent(it.id)}?supportsAllDrives=true&fields=id,name,ownedByMe,owners(emailAddress),permissions(id,emailAddress,role,pendingOwner)`
+        );
+        const ownerEm = normalizeEntry(meta?.owners?.[0]?.emailAddress || '');
+        const targetPerm = (meta?.permissions || []).find(
+          p => normalizeEntry(p.emailAddress || '') === normTarget
+        );
+        if (ownerEm) it.currentOwner = ownerEm;
+        if (targetPerm?.id) it.targetPermissionId = targetPerm.id;
+
+        if ((normTarget && ownerEm === normTarget) || targetPerm?.role === 'owner' || (targetToken && probeToken === targetToken && meta?.ownedByMe)) {
+          it.stage = 'completed';
+          it.currentOwner = normTarget || ownerEm;
+          it.statusText = '✅ 已归属接收邮箱 (对比确认)';
+          it.error = '';
+          newlyCompleted++;
+        } else if (targetPerm?.pendingOwner === true) {
+          it.stage = 'pending_accept';
+          it.statusText = '📨 待接收邮箱确认 (Pending)';
+          stillPending++;
+        } else {
+          it.stage = 'pending_init';
+          it.statusText = '⏳ 仍归来源邮箱 (未发起或已撤回)';
+          stillSource++;
+        }
+        it.updatedAt = new Date().toISOString();
+      } catch (_e) {
+        // keep current state if single file probe fails
+      }
+      done++;
+      if (onProgress && (done % 5 === 0 || done === total)) {
+        onProgress({
+          done,
+          total,
+          message: `正在对比左右邮箱归属状态 ${done}/${total}（已归属接收方 ${newlyCompleted} 项）…`
+        });
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  return { total, newlyCompleted, stillPending, stillSource };
+}

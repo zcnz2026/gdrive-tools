@@ -26,7 +26,20 @@ const state = {
   batchLinksSheet: null,
   isUpdatingBatchSheet: false,
   batchMasterRows: Array.from({ length: 25 }, () => ['', '', '', '', '', '', '', '']),
-  batchVisibleRowMap: Array.from({ length: 25 }, (_, i) => i)
+  batchVisibleRowMap: Array.from({ length: 25 }, (_, i) => i),
+  transferSheet: null,
+  isUpdatingTransferSheet: false,
+  transferRunning: false,
+  transferPauseRequested: false,
+  transferState: {
+    sourceEmail: '',
+    targetEmail: '',
+    autoAccept: true,
+    lastScannedAt: '',
+    lastUpdatedAt: '',
+    items: [],
+    logs: []
+  }
 };
 
 function toast(message) {
@@ -593,6 +606,34 @@ function initSpreadsheets() {
           }, 20);
         }
       }
+    });
+  }
+
+  const transferHost = $('transfer-spreadsheet-grid');
+  if (transferHost && !state.transferSheet) {
+    state.transferSheet = jspreadsheet(transferHost, {
+      data: [['-', '尚未扫描来源邮箱，请先在上方左侧选择来源邮箱并点击「🔍 扫描来源全盘所有权文件」', '', '', '', '', '', '']],
+      columns: [
+        { type: 'text', title: 'A. 类型', width: 95, readOnly: true, align: 'left' },
+        { type: 'text', title: 'B. 文件夹/文件名称', width: 220, readOnly: true, align: 'left' },
+        { type: 'text', title: 'C. 来源邮箱 (左)', width: 170, readOnly: true, align: 'left' },
+        { type: 'text', title: 'D. 接收邮箱 (右)', width: 170, readOnly: true, align: 'left' },
+        { type: 'text', title: 'E. 当前实际所有者 (对比)', width: 175, readOnly: true, align: 'left' },
+        { type: 'text', title: 'F. 转移阶段状态', width: 215, readOnly: true, align: 'left' },
+        { type: 'text', title: 'G. 更新时间 / 错误详情', width: 185, readOnly: true, align: 'left' },
+        { type: 'text', title: 'H. 文件链接 / ID', width: 175, readOnly: true, align: 'left' }
+      ],
+      minDimensions: [8, 12],
+      columnSorting: true,
+      tableOverflow: true,
+      tableWidth: '100%',
+      tableHeight: '100%',
+      pagination: 100,
+      paginationOptions: [50, 100, 200, 500],
+      allowInsertRow: false,
+      allowInsertColumn: false,
+      allowDeleteRow: false,
+      allowDeleteColumn: false
     });
   }
 }
@@ -1361,6 +1402,581 @@ function renderAll() {
   renderCollaboratorsTab();
   renderPolicyTab();
   renderLogsTab();
+  renderTransferWorkspace();
+}
+
+/* ==================== 全盘所有权转移工作台（左：来源扫描 ➔ 右：接收与对比 · 断点续传 · 实时日志） ==================== */
+
+function renderTransferLogsConsole() {
+  const box = $('transfer-log-console');
+  if (!box) return;
+  const logs = state.transferState?.logs || [];
+  if (!logs.length) {
+    box.innerHTML =
+      '<div class="muted">等待操作… 首次使用请在上方左侧选择「来源邮箱」并点击「🔍 扫描来源全盘所有权文件」。扫描结果与转移进度会自动保存，下次打开可直接断点续传。</div>';
+    return;
+  }
+  box.innerHTML = logs
+    .slice(-200)
+    .map(line => `<div class="transfer-log-line">${escapeHtml(line)}</div>`)
+    .join('');
+  box.scrollTop = box.scrollHeight;
+}
+
+async function appendTransferLog(msg, persistNow = true) {
+  const nowStr = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  const line = `[${nowStr}] ${msg}`;
+  if (!Array.isArray(state.transferState.logs)) state.transferState.logs = [];
+  state.transferState.logs.push(line);
+  if (state.transferState.logs.length > 600) {
+    state.transferState.logs = state.transferState.logs.slice(-600);
+  }
+  renderTransferLogsConsole();
+  if (persistNow) {
+    state.transferState = await saveOwnershipTransferState(state.transferState);
+  }
+}
+
+function renderTransferAccountSelectors() {
+  const srcSelect = $('transfer-source-select');
+  const tgtSelect = $('transfer-target-select');
+  const tgtInput = $('transfer-target-email-input');
+  if (!srcSelect || !tgtSelect) return;
+
+  const accounts = state.accounts || [];
+  if (!state.transferState.sourceEmail && accounts.length > 0) {
+    state.transferState.sourceEmail = normalizeEntry(accounts[0].email);
+  }
+  if (!state.transferState.targetEmail && accounts.length > 1) {
+    state.transferState.targetEmail = normalizeEntry(accounts[1].email);
+  }
+
+  const curSrc = normalizeEntry(state.transferState.sourceEmail || '');
+  const curTgt = normalizeEntry(state.transferState.targetEmail || '');
+
+  srcSelect.innerHTML =
+    `<option value="">-- 请选择已授权的来源邮箱 (${accounts.length}个可用) --</option>` +
+    accounts
+      .map(
+        a =>
+          `<option value="${escapeHtml(normalizeEntry(a.email))}" ${
+            normalizeEntry(a.email) === curSrc ? 'selected' : ''
+          }>📤 来源: ${escapeHtml(a.email)}</option>`
+      )
+      .join('');
+
+  tgtSelect.innerHTML =
+    `<option value="">-- 选已授权接收号 --</option>` +
+    accounts
+      .map(
+        a =>
+          `<option value="${escapeHtml(normalizeEntry(a.email))}" ${
+            normalizeEntry(a.email) === curTgt ? 'selected' : ''
+          }>📥 接收: ${escapeHtml(a.email)}</option>`
+      )
+      .join('');
+
+  if (tgtInput && document.activeElement !== tgtInput) {
+    tgtInput.value = curTgt;
+  }
+
+  const autoChk = $('transfer-auto-accept-chk');
+  if (autoChk) {
+    autoChk.checked = state.transferState.autoAccept !== false;
+  }
+}
+
+function renderTransferWorkspace() {
+  renderTransferAccountSelectors();
+
+  const items = state.transferState?.items || [];
+  const total = items.length;
+  const folderCount = items.filter(i => i.mimeType === 'application/vnd.google-apps.folder').length;
+  const fileCount = total - folderCount;
+
+  const sourceOwnedCount = items.filter(i => i.stage === 'pending_init').length;
+  const pendingAcceptCount = items.filter(i => i.stage === 'pending_accept').length;
+  const targetOwnedCount = items.filter(i => i.stage === 'completed').length;
+  const failedCount = items.filter(i => i.stage === 'failed').length;
+
+  if ($('transfer-tab-badge')) {
+    $('transfer-tab-badge').textContent = `${targetOwnedCount}/${total}`;
+  }
+  if ($('tf-stat-total')) $('tf-stat-total').textContent = String(total);
+  if ($('tf-stat-folders')) $('tf-stat-folders').textContent = String(folderCount);
+  if ($('tf-stat-files')) $('tf-stat-files').textContent = String(fileCount);
+  if ($('tf-stat-source-owned')) $('tf-stat-source-owned').textContent = String(sourceOwnedCount);
+  if ($('tf-stat-pending-accept')) $('tf-stat-pending-accept').textContent = String(pendingAcceptCount);
+  if ($('tf-stat-target-owned')) $('tf-stat-target-owned').textContent = String(targetOwnedCount);
+  if ($('tf-stat-failed')) $('tf-stat-failed').textContent = String(failedCount);
+
+  const processedCount = targetOwnedCount + pendingAcceptCount;
+  const pct = total > 0 ? Math.round((processedCount / total) * 100) : 0;
+  if ($('transfer-progress-bar-fill')?.style) {
+    $('transfer-progress-bar-fill').style.width = `${pct}%`;
+  }
+  if ($('transfer-progress-text')) {
+    $('transfer-progress-text').textContent = `📊 进度：已处理 ${processedCount}/${total} (${pct}%) · 已彻底转入接收方 ${targetOwnedCount} · 待接收确认 ${pendingAcceptCount} · 待发起 ${sourceOwnedCount}`;
+  }
+  if ($('transfer-saved-time')) {
+    $('transfer-saved-time').textContent = state.transferState.lastScannedAt
+      ? `💾 本地断点记录：扫描于 ${formatTime(state.transferState.lastScannedAt)} · 保存于 ${formatTime(state.transferState.lastUpdatedAt)}（可直接续传，无需重扫）`
+      : '💾 本地断点记录：尚未扫描（扫描一次后自动持久保存，无需每次重扫）';
+  }
+
+  const srcTag = $('transfer-source-status-tag');
+  if (srcTag) {
+    srcTag.textContent = total > 0 ? `已缓存 ${total} 项 (待转 ${sourceOwnedCount})` : '待扫描来源网盘';
+  }
+
+  const tgtEmail = normalizeEntry($('transfer-target-email-input')?.value || state.transferState.targetEmail || '');
+  const isTargetAuthorized = (state.accounts || []).some(a => normalizeEntry(a.email) === tgtEmail);
+  const tgtTag = $('transfer-target-status-tag');
+  if (tgtTag) {
+    if (!tgtEmail) {
+      tgtTag.textContent = '请填写或选择接收邮箱';
+    } else if (isTargetAuthorized) {
+      tgtTag.textContent = `✅ 已授权 (${tgtEmail}) · 支持API自动接受`;
+    } else {
+      tgtTag.textContent = `⚠️ 未导入Token (${tgtEmail}) · 仅发邀请`;
+    }
+  }
+
+  const startBtn = $('transfer-start-resume-btn');
+  const pauseBtn = $('transfer-pause-btn');
+  if (startBtn && pauseBtn) {
+    startBtn.disabled = state.transferRunning;
+    pauseBtn.disabled = !state.transferRunning;
+    if (state.transferRunning) {
+      startBtn.textContent = '⏳ 正在全盘转移中…';
+    } else if (sourceOwnedCount > 0 && (targetOwnedCount > 0 || pendingAcceptCount > 0)) {
+      startBtn.textContent = `▶️ 断点续传剩余 (${sourceOwnedCount} 项)`;
+    } else {
+      startBtn.textContent = '▶️ 开始 / 断点续传全盘转移';
+    }
+  }
+
+  // 渲染 Jspreadsheet 对比表格
+  if (state.transferSheet) {
+    const stageFilter = $('transfer-filter-stage')?.value || 'all';
+    const typeFilter = $('transfer-filter-type')?.value || 'all';
+    const kw = ($('transfer-filter-kw')?.value || '').trim().toLowerCase();
+
+    const filtered = items.filter(it => {
+      if (stageFilter !== 'all' && it.stage !== stageFilter) return false;
+      const isFolder = it.mimeType === 'application/vnd.google-apps.folder';
+      if (typeFilter === 'folder' && !isFolder) return false;
+      if (typeFilter === 'file' && isFolder) return false;
+      if (kw) {
+        const hay = `${it.name || ''} ${it.sourceOwner || ''} ${it.targetOwner || ''} ${it.currentOwner || ''} ${it.statusText || ''}`.toLowerCase();
+        if (!hay.includes(kw)) return false;
+      }
+      return true;
+    });
+
+    state.isUpdatingTransferSheet = true;
+    try {
+      if (!filtered.length) {
+        const emptyHint =
+          items.length === 0
+            ? '尚未扫描来源邮箱，请先在上方左侧选择来源邮箱并点击「🔍 扫描来源全盘所有权文件」'
+            : '当前筛选条件下没有匹配的转移记录';
+        state.transferSheet.setData([['-', emptyHint, '', '', '', '', '', '']]);
+      } else {
+        const rows = filtered.map(it => {
+          const typeLabel = fileCategoryLabel(it.mimeType, it.name);
+          const curOwnerCell =
+            it.currentOwner && it.currentOwner === normalizeEntry(it.targetOwner || tgtEmail)
+              ? `📥 已归接收方 (${it.currentOwner})`
+              : `📤 仍归来源方 (${it.currentOwner || it.sourceOwner})`;
+          const detailCell = it.error
+            ? `❌ ${it.error} (${formatTime(it.updatedAt)})`
+            : `${formatTime(it.updatedAt)}`;
+          return [
+            typeLabel,
+            it.name || '(无名称)',
+            it.sourceOwner || state.transferState.sourceEmail || '',
+            it.targetOwner || tgtEmail || '',
+            curOwnerCell,
+            it.statusText || '',
+            detailCell,
+            it.webViewLink || it.id
+          ];
+        });
+        state.transferSheet.setData(rows);
+      }
+    } finally {
+      state.isUpdatingTransferSheet = false;
+    }
+  }
+
+  renderTransferLogsConsole();
+}
+
+async function handleTransferScanSource(mergeMode = false) {
+  const sourceEmail = normalizeEntry($('transfer-source-select')?.value || state.transferState.sourceEmail || '');
+  const targetEmail = normalizeEntry($('transfer-target-email-input')?.value || $('transfer-target-select')?.value || state.transferState.targetEmail || '');
+
+  if (!sourceEmail) {
+    toast('请先在左侧下拉框选择「来源邮箱（原所有者）」');
+    return;
+  }
+
+  const scanBtn = $('transfer-scan-source-btn');
+  const incBtn = $('transfer-incremental-scan-btn');
+  if (scanBtn) scanBtn.disabled = true;
+  if (incBtn) incBtn.disabled = true;
+
+  await appendTransferLog(
+    `${mergeMode ? '➕ 启动增量补扫' : '🔍 启动首次全盘扫描'}：正在扫描来源邮箱 ${sourceEmail} 名下所有「我是所有者 ('me' in owners)」的文件夹与文件…`,
+    false
+  );
+
+  try {
+    const items = await scanSourceOwnedItemsForTransfer({
+      sourceEmail,
+      targetEmail,
+      existingItems: state.transferState.items || [],
+      mergeMode,
+      onProgress(p) {
+        if (p?.message) $('progress').textContent = p.message;
+      }
+    });
+
+    const folderCnt = items.filter(i => i.mimeType === 'application/vnd.google-apps.folder').length;
+    const fileCnt = items.length - folderCnt;
+    const completedCnt = items.filter(i => i.stage === 'completed').length;
+    const pendingCnt = items.filter(i => i.stage === 'pending_accept').length;
+
+    state.transferState.sourceEmail = sourceEmail;
+    if (targetEmail) state.transferState.targetEmail = targetEmail;
+    state.transferState.lastScannedAt = new Date().toISOString();
+    state.transferState.items = items;
+    state.transferState = await saveOwnershipTransferState(state.transferState);
+
+    await appendTransferLog(
+      `✅ 扫描并保存完成：共 ${items.length} 项（文件夹 ${folderCnt} 个 / 文件 ${fileCnt} 个 · 已归接收方 ${completedCnt} 项 · 待确认 ${pendingCnt} 项）。记录已持久化保存，后续可直接断点续传！`,
+      true
+    );
+    $('progress').textContent = `来源邮箱 (${sourceEmail}) 全盘扫描完成：共 ${items.length} 项已保存至本地记录`;
+    renderTransferWorkspace();
+    toast(`已扫描并保存 ${items.length} 项（文件夹 ${folderCnt} / 文件 ${fileCnt}），无需每次重扫`);
+  } catch (error) {
+    await appendTransferLog(`❌ 扫描来源邮箱失败：${error.message}`, true);
+    toast(`扫描失败：${error.message}`);
+  } finally {
+    if (scanBtn) scanBtn.disabled = false;
+    if (incBtn) incBtn.disabled = false;
+  }
+}
+
+async function handleTransferRunLoop(retryFailedOnly = false) {
+  if (state.transferRunning) return;
+
+  const sourceEmail = normalizeEntry($('transfer-source-select')?.value || state.transferState.sourceEmail || '');
+  const targetEmail = normalizeEntry($('transfer-target-email-input')?.value || $('transfer-target-select')?.value || state.transferState.targetEmail || '');
+  const autoAccept = Boolean($('transfer-auto-accept-chk')?.checked ?? true);
+
+  if (!sourceEmail) {
+    toast('请先在左侧选择「来源邮箱（原所有者）」');
+    return;
+  }
+  if (!targetEmail) {
+    toast('请先在右侧选择或输入「接收邮箱（新所有者）」');
+    return;
+  }
+  if (sourceEmail === targetEmail) {
+    toast('来源邮箱与接收邮箱不能相同');
+    return;
+  }
+
+  if (!state.transferState.items || state.transferState.items.length === 0) {
+    await handleTransferScanSource(false);
+    if (!state.transferState.items || state.transferState.items.length === 0) return;
+  }
+
+  state.transferState.sourceEmail = sourceEmail;
+  state.transferState.targetEmail = targetEmail;
+  state.transferState.autoAccept = autoAccept;
+
+  const items = state.transferState.items;
+  for (const it of items) {
+    it.targetOwner = targetEmail;
+  }
+
+  let sourceToken = '';
+  let targetToken = '';
+  try {
+    sourceToken = await getValidTokenForAccount(sourceEmail, true);
+  } catch (err) {
+    toast(`获取来源邮箱 (${sourceEmail}) 令牌失败：${err.message}`);
+    return;
+  }
+
+  const isTargetAuthorized = (state.accounts || []).some(a => normalizeEntry(a.email) === targetEmail);
+  if (isTargetAuthorized) {
+    try {
+      targetToken = await getValidTokenForAccount(targetEmail, false);
+    } catch (_e) {
+      targetToken = '';
+    }
+  }
+
+  const todoIndices = [];
+  for (let i = 0; i < items.length; i++) {
+    const st = items[i].stage;
+    if (retryFailedOnly) {
+      if (st === 'failed') todoIndices.push(i);
+    } else {
+      if (st === 'pending_init' || st === 'failed' || (st === 'pending_accept' && autoAccept && targetToken)) {
+        todoIndices.push(i);
+      }
+    }
+  }
+
+  if (!todoIndices.length) {
+    toast('当前没有待处理的条目（已全部处理完毕，或可点击「🔄 刷新左右归属对比」核验）');
+    return;
+  }
+
+  state.transferRunning = true;
+  state.transferPauseRequested = false;
+  renderTransferWorkspace();
+
+  await appendTransferLog(
+    `🚀 开始/续传全盘转移：来源 [${sourceEmail}] ➔ 接收 [${targetEmail}]，本次待处理 ${todoIndices.length} / 总计 ${items.length} 项（接收方Token: ${targetToken ? '已就绪·自动接管' : '未授权·仅发转移邀请'}）`,
+    true
+  );
+
+  let processedInRun = 0;
+  let successInRun = 0;
+  let pendingInRun = 0;
+  let failInRun = 0;
+
+  try {
+    for (let k = 0; k < todoIndices.length; k++) {
+      if (state.transferPauseRequested) {
+        await appendTransferLog(
+          `⏸️ 用户已暂停转移：本次已处理 ${processedInRun} 项。当前进度已自动保存，随时可点击「▶️ 断点续传」继续！`,
+          true
+        );
+        toast('已暂停转移并保存当前断点进度');
+        break;
+      }
+
+      const idx = todoIndices[k];
+      const item = items[idx];
+      $('progress').textContent = `正在转移 (${k + 1}/${todoIndices.length}): ${item.name}`;
+
+      try {
+        const res = await transferSingleItemOwnership({
+          sourceToken,
+          targetToken,
+          item,
+          targetEmail,
+          autoAccept
+        });
+        item.stage = res.stage;
+        item.currentOwner = res.currentOwner || item.currentOwner;
+        item.targetPermissionId = res.targetPermissionId || item.targetPermissionId;
+        item.statusText = res.statusText;
+        item.error = '';
+        item.updatedAt = new Date().toISOString();
+
+        if (res.stage === 'completed') successInRun++;
+        else pendingInRun++;
+
+        for (const l of res.logs || []) {
+          await appendTransferLog(`[${k + 1}/${todoIndices.length}] ${l}`, false);
+        }
+      } catch (err) {
+        item.stage = 'failed';
+        item.statusText = `❌ 失败: ${err.message}`;
+        item.error = err.message;
+        item.updatedAt = new Date().toISOString();
+        failInRun++;
+        await appendTransferLog(`❌ [${k + 1}/${todoIndices.length}] 《${item.name}》转移失败: ${err.message}`, false);
+      }
+
+      processedInRun++;
+      // 每处理 3 个条目自动持久化保存一次断点记录并刷新 UI，防止意外关闭丢失进度
+      if (processedInRun % 3 === 0 || k === todoIndices.length - 1) {
+        state.transferState = await saveOwnershipTransferState(state.transferState);
+        renderTransferWorkspace();
+      }
+    }
+
+    if (!state.transferPauseRequested) {
+      await appendTransferLog(
+        `🏁 本轮转移执行完毕：处理 ${processedInRun} 项（直接完成接管 ${successInRun} 项 · 已发邀请待确认 ${pendingInRun} 项 · 失败 ${failInRun} 项）。${
+          pendingInRun > 0
+            ? '提示：对处于「待接收(Pending)」的个人号文件，可点击右侧「⚡ 接收方一键批量接受」或「🌐 网页全选接受兜底 (Ctrl+A)」一次性完成接收！'
+            : ''
+        }`,
+        true
+      );
+      toast(`本轮处理完成：已接管 ${successInRun} 项，待确认 ${pendingInRun} 项，失败 ${failInRun} 项`);
+    }
+  } finally {
+    state.transferRunning = false;
+    state.transferPauseRequested = false;
+    state.transferState = await saveOwnershipTransferState(state.transferState);
+    renderTransferWorkspace();
+  }
+}
+
+async function handleTransferAcceptAll() {
+  const targetEmail = normalizeEntry($('transfer-target-email-input')?.value || $('transfer-target-select')?.value || state.transferState.targetEmail || '');
+  if (!targetEmail) {
+    toast('请先在右侧选择或输入「接收邮箱」');
+    return;
+  }
+
+  let targetToken = '';
+  try {
+    targetToken = await getValidTokenForAccount(targetEmail, true);
+  } catch (err) {
+    toast(`接收邮箱 (${targetEmail}) 尚未在插件内授权，请先点击「+授权接收号」或使用「🌐 网页全选接受兜底」`);
+    return;
+  }
+
+  const items = state.transferState.items || [];
+  const candidates = items.filter(it => it.stage === 'pending_accept' || it.stage === 'pending_init');
+  if (!candidates.length) {
+    toast('当前列表中没有待接收 (Pending) 的文件');
+    return;
+  }
+
+  const btn = $('transfer-accept-all-btn');
+  if (btn) btn.disabled = true;
+  await appendTransferLog(`⚡ 接收邮箱 [${targetEmail}] 开始批量尝试通过 API 接受 ${candidates.length} 个文件的所有权…`, false);
+
+  let acceptedCount = 0;
+  let stillPendingCount = 0;
+  try {
+    for (let i = 0; i < candidates.length; i++) {
+      const it = candidates[i];
+      $('progress').textContent = `接收方正在接受所有权 (${i + 1}/${candidates.length}): ${it.name}`;
+      const res = await acceptSingleItemOwnership({
+        targetToken,
+        item: it,
+        targetEmail
+      });
+      it.stage = res.stage;
+      it.currentOwner = res.currentOwner || it.currentOwner;
+      it.targetPermissionId = res.targetPermissionId || it.targetPermissionId;
+      it.statusText = res.statusText;
+      it.updatedAt = new Date().toISOString();
+
+      if (res.accepted) acceptedCount++;
+      else stillPendingCount++;
+
+      if ((i + 1) % 5 === 0 || i === candidates.length - 1) {
+        state.transferState = await saveOwnershipTransferState(state.transferState);
+        renderTransferWorkspace();
+      }
+    }
+
+    await appendTransferLog(
+      `📥 接收方批量接受执行完毕：API 直接接管成功 ${acceptedCount} 项，仍待网页确认 ${stillPendingCount} 项。${
+        stillPendingCount > 0
+          ? '若 Google 个人号拦截了 API 自动接受，请点击右侧「🌐 网页全选接受兜底」，在打开的页面按 Ctrl+A 全选 -> 右键 -> 接受所有权，即可一次性全部完成！'
+          : ''
+      }`,
+      true
+    );
+    toast(`接收完成：已接管 ${acceptedCount} 项，待网页确认 ${stillPendingCount} 项`);
+  } finally {
+    if (btn) btn.disabled = false;
+    state.transferState = await saveOwnershipTransferState(state.transferState);
+    renderTransferWorkspace();
+  }
+}
+
+async function handleTransferVerifyCompare() {
+  const items = state.transferState.items || [];
+  if (!items.length) {
+    toast('请先扫描来源邮箱文件后再进行左右归属对比');
+    return;
+  }
+  const sourceEmail = normalizeEntry($('transfer-source-select')?.value || state.transferState.sourceEmail || '');
+  const targetEmail = normalizeEntry($('transfer-target-email-input')?.value || $('transfer-target-select')?.value || state.transferState.targetEmail || '');
+
+  let sourceToken = '';
+  let targetToken = '';
+  if (sourceEmail) {
+    try {
+      sourceToken = await getValidTokenForAccount(sourceEmail, false);
+    } catch (_e) {}
+  }
+  if (targetEmail) {
+    try {
+      targetToken = await getValidTokenForAccount(targetEmail, false);
+    } catch (_e) {}
+  }
+
+  const btn = $('transfer-verify-compare-btn');
+  if (btn) btn.disabled = true;
+  await appendTransferLog(`🔄 开始实测对比左边来源邮箱 [${sourceEmail}] 与右边接收邮箱 [${targetEmail}] 的真实所有者归属（共 ${items.length} 项）…`, false);
+
+  try {
+    const res = await verifyOwnershipTransferItems({
+      sourceToken,
+      targetToken,
+      items,
+      targetEmail,
+      onProgress(p) {
+        if (p?.message) $('progress').textContent = p.message;
+      }
+    });
+    state.transferState = await saveOwnershipTransferState(state.transferState);
+    renderTransferWorkspace();
+    await appendTransferLog(
+      `✅ 左右归属对比核验完成：总计 ${res.total} 项 ➔ 📥 已归属接收邮箱 ${res.newlyCompleted} 项 | 📨 待接收确认(Pending) ${res.stillPending} 项 | 📤 仍归属来源邮箱 ${res.stillSource} 项`,
+      true
+    );
+    toast(`对比完成：已归接收方 ${res.newlyCompleted} 项，待确认 ${res.stillPending} 项，仍归来源 ${res.stillSource} 项`);
+  } catch (err) {
+    await appendTransferLog(`❌ 归属对比失败：${err.message}`, true);
+    toast(`对比失败：${err.message}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function exportTransferCsv() {
+  const items = state.transferState?.items || [];
+  if (!items.length) {
+    toast('暂无转移对比记录可导出');
+    return;
+  }
+  const rows = [
+    ['File ID', 'Type', 'Name', 'Source Email (Left)', 'Target Email (Right)', 'Current Actual Owner', 'Stage', 'Status Text', 'Updated At', 'Link']
+  ];
+  for (const it of items) {
+    rows.push([
+      it.id,
+      fileDetailedCategory(it.mimeType, it.name),
+      it.name || '',
+      it.sourceOwner || '',
+      it.targetOwner || '',
+      it.currentOwner || '',
+      it.stage || '',
+      it.statusText || '',
+      it.updatedAt || '',
+      it.webViewLink || ''
+    ]);
+  }
+  const csvContent = rows
+    .map(r => r.map(c => `"${String(c ?? '').replaceAll('"', '""')}"`).join(','))
+    .join('\n');
+  const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `drive-ownership-transfer-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 async function importAllowlistFromObject(parsed) {
@@ -2930,16 +3546,120 @@ async function init() {
     }
   });
 
-  // 9. 加载存储数据并首次渲染
+  // 8.5 全盘所有权转移工作台（左：来源邮箱扫描 ➔ 右：接收邮箱接受 · 对比 · 进度 · 日志 · 断点续传）
+  $('transfer-source-select')?.addEventListener('change', async e => {
+    state.transferState.sourceEmail = normalizeEntry(e.target.value || '');
+    state.transferState = await saveOwnershipTransferState(state.transferState);
+    renderTransferWorkspace();
+  });
+
+  $('transfer-target-select')?.addEventListener('change', async e => {
+    const val = normalizeEntry(e.target.value || '');
+    if (val) {
+      state.transferState.targetEmail = val;
+      if ($('transfer-target-email-input')) $('transfer-target-email-input').value = val;
+      state.transferState = await saveOwnershipTransferState(state.transferState);
+      renderTransferWorkspace();
+    }
+  });
+
+  $('transfer-target-email-input')?.addEventListener('input', async e => {
+    const val = normalizeEntry(e.target.value || '');
+    state.transferState.targetEmail = val;
+    if ($('transfer-target-select')) {
+      const matched = [...($('transfer-target-select').options || [])].some(o => o.value === val);
+      $('transfer-target-select').value = matched ? val : '';
+    }
+    state.transferState = await saveOwnershipTransferState(state.transferState);
+    renderTransferWorkspace();
+  });
+
+  $('transfer-auto-accept-chk')?.addEventListener('change', async e => {
+    state.transferState.autoAccept = Boolean(e.target.checked);
+    state.transferState = await saveOwnershipTransferState(state.transferState);
+  });
+
+  $('transfer-add-source-btn')?.addEventListener('click', handleAddMoreAccount);
+  $('transfer-add-target-btn')?.addEventListener('click', handleAddMoreAccount);
+
+  $('transfer-scan-source-btn')?.addEventListener('click', () => handleTransferScanSource(false));
+  $('transfer-incremental-scan-btn')?.addEventListener('click', () => handleTransferScanSource(true));
+  $('transfer-start-resume-btn')?.addEventListener('click', () => handleTransferRunLoop(false));
+  $('transfer-retry-failed-btn')?.addEventListener('click', () => handleTransferRunLoop(true));
+
+  $('transfer-pause-btn')?.addEventListener('click', () => {
+    if (state.transferRunning) {
+      state.transferPauseRequested = true;
+      toast('正在安全暂停，当前文件处理完毕后立即保存断点…');
+    }
+  });
+
+  $('transfer-accept-all-btn')?.addEventListener('click', handleTransferAcceptAll);
+  $('transfer-verify-compare-btn')?.addEventListener('click', handleTransferVerifyCompare);
+
+  $('transfer-open-web-pending-btn')?.addEventListener('click', () => {
+    const url = 'https://drive.google.com/drive/search?q=pendingowner:me';
+    try {
+      chrome.tabs.create({ url });
+    } catch (_e) {
+      window.open?.(url, '_blank');
+    }
+    appendTransferLog('🌐 已打开 Google Drive 网页端「待我接受所有权 (pendingowner:me)」汇总页：在网页按 Ctrl+A 全选 -> 右键 -> 共享 -> 接受所有权，即可一次性全部接受！', true);
+    toast('已打开待接受汇总页：在网页按 Ctrl+A 全选即可一次性接受所有文件');
+  });
+
+  $('transfer-export-csv-btn')?.addEventListener('click', exportTransferCsv);
+
+  $('transfer-clear-records-btn')?.addEventListener('click', async () => {
+    if (state.transferRunning) {
+      toast('请先暂停当前转移任务再清空缓存');
+      return;
+    }
+    if (!confirm('确认清空已保存的全盘转移扫描记录与断点进度？')) return;
+    state.transferState = await clearOwnershipTransferState();
+    renderTransferWorkspace();
+    toast('已清空全盘转移缓存记录');
+  });
+
+  $('transfer-clear-log-btn')?.addEventListener('click', async () => {
+    state.transferState.logs = [];
+    state.transferState = await saveOwnershipTransferState(state.transferState);
+    renderTransferLogsConsole();
+    toast('已清空转移控制台日志');
+  });
+
+  $('transfer-compare-cards')?.addEventListener('click', e => {
+    const card = e.target.closest('[data-tf-filter]');
+    if (!card) return;
+    const val = card.dataset.tfFilter || 'all';
+    document.querySelectorAll('#transfer-compare-cards .summary-card').forEach(c => {
+      c.classList.toggle('active', c.dataset.tfFilter === val);
+    });
+    if ($('transfer-filter-stage')) $('transfer-filter-stage').value = val;
+    renderTransferWorkspace();
+  });
+
+  ['transfer-filter-stage', 'transfer-filter-type'].forEach(id => {
+    $(id)?.addEventListener('change', renderTransferWorkspace);
+  });
+
+  let tfFilterDebounce = null;
+  $('transfer-filter-kw')?.addEventListener('input', () => {
+    clearTimeout(tfFilterDebounce);
+    tfFilterDebounce = setTimeout(renderTransferWorkspace, 100);
+  });
+
+  // 9. 加载存储数据并首次渲染（含全盘所有权转移断点缓存自动恢复）
   try {
-    const [policy, directory, presets, logs, oauthClients, accounts, snapshot] = await Promise.all([
+    const [policy, directory, presets, logs, oauthClients, accounts, snapshot, transferState] = await Promise.all([
       getPolicy(),
       getDirectory(),
       getFilterPresets(),
       getAuditLogs(),
       getOAuthClients(),
       getAuthorizedAccounts(),
-      getSnapshot()
+      getSnapshot(),
+      getOwnershipTransferState()
     ]);
 
     state.policy = policy;
@@ -2951,6 +3671,7 @@ async function init() {
     state.files = snapshot.files || [];
     state.newFileIds = new Set(snapshot.newFileIds || []);
     state.lastScanAt = snapshot.lastScanAt || '';
+    state.transferState = transferState;
 
     if (state.lastScanAt) {
       $('progress').textContent = `上次扫描：${formatTime(state.lastScanAt)}（共 ${state.files.length} 个文件）`;

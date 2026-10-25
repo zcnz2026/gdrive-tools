@@ -50,6 +50,10 @@
             🔗 批量链接授权（输入一批链接 + 一批邮箱）
             <span id="batch-links-parsed-info" class="tab-badge">0 链接 · 0 邮箱</span>
           </button>
+          <button type="button" class="left-tab-btn" data-left-tab="ownership-transfer">
+            👑 全盘所有权转移（来源邮箱 ➔ 接收邮箱 · 断点续传）
+            <span id="transfer-tab-badge" class="tab-badge">0/0</span>
+          </button>
         </nav>
 
         <!-- 左侧面板 1：扫描结果列表 -->
@@ -230,6 +234,150 @@
             <div class="hidden">
               <textarea id="batch-links-input"></textarea>
               <textarea id="batch-emails-input"></textarea>
+            </div>
+          </div>
+        </div>
+
+        <!-- 左侧面板 3：全盘所有权转移中心（左：来源邮箱扫描 ➔ 右：接收邮箱接受 · 对比 · 进度 · 日志 · 断点续传） -->
+        <div id="left-panel-ownership-transfer" class="left-tab-panel">
+          <div class="transfer-workspace">
+            <!-- 顶部第1层：左（来源邮箱扫描与发起） VS 右（接收邮箱接受与对比）双栏对开卡片 -->
+            <div class="transfer-dual-cards">
+              <!-- 左栏：来源邮箱（原所有者） -->
+              <div class="section-block block-blue transfer-side-card">
+                <div class="block-header">
+                  <h2>📤 左：来源邮箱（原所有者 · 只要是我所有的都转移）</h2>
+                  <span id="transfer-source-status-tag" class="meta-tag">未扫描</span>
+                </div>
+                <div class="row-flex" style="margin-bottom: 6px;">
+                  <label style="font-weight:600; white-space:nowrap;">来源账号：</label>
+                  <select id="transfer-source-select" class="select grow">
+                    <option value="">-- 请选择已授权的来源邮箱 --</option>
+                  </select>
+                  <button id="transfer-add-source-btn" type="button" class="btn btn-xs" title="导入或授权新的来源邮箱">+授权来源号</button>
+                </div>
+                <div class="row-flex" style="flex-wrap: wrap; gap: 6px;">
+                  <button id="transfer-scan-source-btn" type="button" class="btn primary btn-sm" title="扫描该来源账号名下所有『我是所有者 ('me' in owners)』的文件夹与文件，并自动保存记录，下次打开无需重扫">
+                    🔍 扫描来源全盘所有权文件
+                  </button>
+                  <button id="transfer-incremental-scan-btn" type="button" class="btn btn-sm" title="不覆盖已有转移进度，仅把来源网盘新产生的文件/文件夹合并进记录">
+                    ➕ 增量补扫 (保留已有进度)
+                  </button>
+                  <button id="transfer-start-resume-btn" type="button" class="btn warning btn-sm" title="从上次未完成的条目继续发起所有权转移（支持随时暂停与断点续传）">
+                    ▶️ 开始 / 断点续传全盘转移
+                  </button>
+                  <button id="transfer-pause-btn" type="button" class="btn danger btn-sm" disabled>
+                    ⏸️ 暂停转移
+                  </button>
+                </div>
+              </div>
+
+              <!-- 右栏：接收邮箱（新所有者） -->
+              <div class="section-block block-green transfer-side-card">
+                <div class="block-header">
+                  <h2>📥 右：接收邮箱（新所有者 · 自动接受与归属对比）</h2>
+                  <span id="transfer-target-status-tag" class="meta-tag">待设置接收方</span>
+                </div>
+                <div class="row-flex" style="margin-bottom: 6px;">
+                  <label style="font-weight:600; white-space:nowrap;">接收账号：</label>
+                  <select id="transfer-target-select" class="select" style="max-width: 195px;">
+                    <option value="">-- 选已授权接收号 --</option>
+                  </select>
+                  <input id="transfer-target-email-input" type="text" class="input grow" placeholder="或直接输入接收邮箱 (如 new@gmail.com)">
+                  <button id="transfer-add-target-btn" type="button" class="btn btn-xs" title="授权接收邮箱后，插件可在后台直接调用接收方 API 自动接受所有权">+授权接收号</button>
+                </div>
+                <div class="row-flex" style="justify-content: space-between; flex-wrap: wrap; gap: 6px;">
+                  <label class="checkbox-inline" title="勾选后，当接收邮箱已在插件内授权时，左边发起转移后右边自动调用 API 尝试立即接管所有权">
+                    <input id="transfer-auto-accept-chk" type="checkbox" checked>
+                    <span>转移时自动用接收号 API 接受所有权</span>
+                  </label>
+                  <div class="row-flex" style="flex-wrap: wrap; gap: 5px;">
+                    <button id="transfer-accept-all-btn" type="button" class="btn primary btn-sm" title="使用接收邮箱令牌，对所有『待接收(Pending)』文件一键批量调用 API 接受所有权">
+                      ⚡ 接收方一键批量接受
+                    </button>
+                    <button id="transfer-verify-compare-btn" type="button" class="btn btn-sm" title="实测对比左边来源邮箱与右边接收邮箱当前的真实所有者归属">
+                      🔄 刷新左右归属对比
+                    </button>
+                    <button id="transfer-open-web-pending-btn" type="button" class="btn btn-xs" title="若 Google 个人号安全策略要求网页确认，点击直达 pendingowner:me 汇总页，按 Ctrl+A 全选即可一次性全部接受">
+                      🌐 网页全选接受兜底
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 第2层：进度条 + 左右归属对比统计卡片 + 筛选与断点缓存控制栏 -->
+            <div class="section-block block-amber transfer-progress-section">
+              <!-- 进度条行 -->
+              <div class="row-flex" style="justify-content: space-between; margin-bottom: 5px;">
+                <div class="row-flex" style="gap: 8px;">
+                  <strong id="transfer-progress-text">📊 转移总进度：0 / 0 (0%)</strong>
+                  <span id="transfer-saved-time" class="muted">本地断点记录：尚未扫描（扫描一次后自动持久保存，无需每次重扫）</span>
+                </div>
+                <div class="row-flex" style="gap: 6px;">
+                  <button id="transfer-retry-failed-btn" type="button" class="btn btn-xs warning">🔄 仅重试失败项</button>
+                  <button id="transfer-export-csv-btn" type="button" class="btn btn-xs">📥 导出对比记录 CSV</button>
+                  <button id="transfer-clear-records-btn" type="button" class="btn btn-xs danger" title="清空已保存的扫描与转移缓存记录">🗑️ 清空缓存记录</button>
+                </div>
+              </div>
+              <div class="transfer-progress-track">
+                <div id="transfer-progress-bar-fill" class="transfer-progress-fill" style="width: 0%;"></div>
+              </div>
+
+              <!-- 左右对比统计胶囊 + 筛选栏 -->
+              <div class="row-flex" style="justify-content: space-between; flex-wrap: wrap; margin-top: 7px; gap: 6px;">
+                <div class="summary-pills" id="transfer-compare-cards">
+                  <button type="button" class="summary-card active" data-tf-filter="all">
+                    <span>📦 来源总计</span> <strong id="tf-stat-total">0</strong>
+                    <span class="muted" style="font-size:10px;">(📁<span id="tf-stat-folders">0</span> / 📄<span id="tf-stat-files">0</span>)</span>
+                  </button>
+                  <button type="button" class="summary-card" data-tf-filter="pending_init">
+                    <span>📤 仍归来源邮箱(待转)</span> <strong id="tf-stat-source-owned">0</strong>
+                  </button>
+                  <button type="button" class="summary-card warning-card" data-tf-filter="pending_accept">
+                    <span>📨 待接收方确认(Pending)</span> <strong id="tf-stat-pending-accept">0</strong>
+                  </button>
+                  <button type="button" class="summary-card new-card" data-tf-filter="completed">
+                    <span>📥 已归接收邮箱(完成)</span> <strong id="tf-stat-target-owned">0</strong>
+                  </button>
+                  <button type="button" class="summary-card danger-card" data-tf-filter="failed">
+                    <span>❌ 失败/需重试</span> <strong id="tf-stat-failed">0</strong>
+                  </button>
+                </div>
+
+                <div class="row-flex" style="gap: 5px;">
+                  <input id="transfer-filter-kw" type="text" class="input input-xs" style="width: 135px;" placeholder="搜文件/文件夹名…">
+                  <select id="transfer-filter-stage" class="select select-sm">
+                    <option value="all">状态：全部</option>
+                    <option value="pending_init">⏳ 待发起转移 (仍归来源)</option>
+                    <option value="pending_accept">📨 待接收确认 (Pending)</option>
+                    <option value="completed">✅ 已完成 (已归接收方)</option>
+                    <option value="failed">❌ 转移失败</option>
+                  </select>
+                  <select id="transfer-filter-type" class="select select-sm">
+                    <option value="all">类型：全部</option>
+                    <option value="folder">📁 仅文件夹</option>
+                    <option value="file">📄 仅文件</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <!-- 第3层：Jspreadsheet CE 左右归属对比表 + 实时打印日志控制台 -->
+            <div class="transfer-bottom-split">
+              <div class="transfer-sheet-wrap section-block block-blue">
+                <div id="transfer-spreadsheet-grid" class="jspreadsheet-host"></div>
+              </div>
+
+              <div class="transfer-log-wrap section-block">
+                <div class="block-header" style="margin-bottom: 4px;">
+                  <h2>🖨️ 实时转移与接管日志（自动持久化保存）</h2>
+                  <button id="transfer-clear-log-btn" type="button" class="btn-text">清空日志</button>
+                </div>
+                <div id="transfer-log-console" class="transfer-log-console">
+                  <div class="muted">等待操作… 首次使用请在上方左侧选择「来源邮箱」并点击「🔍 扫描来源全盘所有权文件」。扫描结果与转移进度会自动保存，下次打开可直接断点续传。</div>
+                </div>
+              </div>
             </div>
           </div>
         </div>

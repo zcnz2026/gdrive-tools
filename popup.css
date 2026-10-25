@@ -1231,6 +1231,105 @@ input[type="file"] {
   font-size: 12px;
 }
 
+/* ==================== 全盘所有权转移工作台样式 ==================== */
+.transfer-workspace {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.transfer-dual-cards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.transfer-side-card {
+  margin-bottom: 0 !important;
+  padding: 8px 10px !important;
+}
+
+.transfer-progress-section {
+  flex-shrink: 0;
+  margin-bottom: 0 !important;
+  padding: 7px 10px !important;
+}
+
+.transfer-progress-track {
+  width: 100%;
+  height: 8px;
+  background: #e2e8f0;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.transfer-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #2563eb 0%, #10b981 100%);
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+
+.transfer-bottom-split {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: 1fr 135px;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.transfer-sheet-wrap {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0 !important;
+  margin-bottom: 0 !important;
+  overflow: hidden;
+  background: #ffffff;
+}
+
+.transfer-log-wrap {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0 !important;
+  padding: 6px 10px !important;
+  background: #0f172a;
+  color: #e2e8f0;
+  border-color: #1e293b;
+}
+
+.transfer-log-wrap .block-header h2 {
+  color: #f8fafc;
+}
+
+.transfer-log-wrap .btn-text {
+  color: #93c5fd;
+}
+
+.transfer-log-console {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #cbd5e1;
+  padding-right: 4px;
+}
+
+.transfer-log-line {
+  padding: 1px 0;
+  border-bottom: 1px dashed rgba(148, 163, 184, 0.14);
+  word-break: break-all;
+}
+
 @media (max-width: 980px) {
   html, body {
     height: auto;
