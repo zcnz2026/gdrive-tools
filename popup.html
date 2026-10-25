@@ -315,6 +315,8 @@
                   <span id="transfer-saved-time" class="muted">本地断点记录：尚未扫描（扫描一次后自动持久保存，无需每次重扫）</span>
                 </div>
                 <div class="row-flex" style="gap: 6px;">
+                  <button id="transfer-export-passport-btn" type="button" class="btn btn-xs primary" title="将已授权的来源/接收账号令牌与当前扫描转移断点进度一起打包导出，复制到别的电脑导入即可免登录直接接着操作">💾 导出免登授权+进度包 (换电脑续传)</button>
+                  <button id="transfer-import-passport-btn" type="button" class="btn btn-xs" title="导入免登录授权包或 JSON 凭证">📂 导入授权/进度包</button>
                   <button id="transfer-retry-failed-btn" type="button" class="btn btn-xs warning">🔄 仅重试失败项</button>
                   <button id="transfer-export-csv-btn" type="button" class="btn btn-xs">📥 导出对比记录 CSV</button>
                   <button id="transfer-clear-records-btn" type="button" class="btn btn-xs danger" title="清空已保存的扫描与转移缓存记录">🗑️ 清空缓存记录</button>
@@ -673,12 +675,15 @@
                 ① <strong>桌面端 OAuth JSON（含 client_secret）</strong>：一个凭证即可登录多个邮箱！点击凭证右侧「<strong>🌐 再登录其他邮箱</strong>」，在弹出页选第 2 个邮箱即可（若第 2 个邮箱提示 403 测试受限，请在 Google Cloud 控制台 -> OAuth 同意屏幕 -> 将第 2 个邮箱加入「测试用户」或点「发布应用」）。<br>
                 ② <strong>Service Account JSON（sa-*.json 服务账号）</strong>：属于免登录机器人号，导入即自动生效，不能用于弹出浏览器登录个人 Gmail。
               </p>
-              <div class="row-flex" style="margin-top: 8px;">
-                <label class="btn primary btn-sm file-label">
-                  🔑 导入 JSON 授权文件 (可多选)
+              <div class="row-flex" style="margin-top: 8px; flex-wrap: wrap; gap: 6px;">
+                <label class="btn primary btn-sm file-label" title="既可导入原始 Google OAuth JSON / Service Account JSON，也可直接导入从其他电脑导出的『免登录已授权通行证 JSON』">
+                  🔑 导入 JSON 授权文件 / 免登通行证 (可多选)
                   <input id="oauth-json-file" type="file" accept="application/json,.json" multiple>
                 </label>
                 <button id="add-account-btn" type="button" class="btn btn-sm">🌐 弹出浏览器再授权一个 Google 邮箱</button>
+                <button id="export-auth-passport-btn" type="button" class="btn warning btn-sm" title="将当前所有已授权账号的 Refresh Token 与凭证打包保存为 JSON 文件，复制到别的电脑导入即可免浏览器登录直接操作">
+                  💾 导出已授权免登文件 (复制到其他电脑直接用)
+                </button>
               </div>
               <div id="accounts-list" class="accounts-pills" style="margin-top: 8px;"></div>
             </div>

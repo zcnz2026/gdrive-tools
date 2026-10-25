@@ -605,6 +605,165 @@ async function removeAuthorizedAccount(email) {
   return next;
 }
 
+/**
+ * 导出已授权账号通行证 JSON（包含 refreshToken / clientSecret / ServiceAccount 私钥及可选的全盘转移进度），
+ * 复制到任意其他电脑导入后，无需在浏览器登录 Google 账号即可直接使用所有权限管理与转移功能。
+ */
+async function buildAuthorizedPassportBundle({ onlyEmail = '', includeTransferState = true } = {}) {
+  const [oauthClients, authorizedAccounts, policy, directory, transferState] = await Promise.all([
+    getOAuthClients(),
+    getAuthorizedAccounts(),
+    getPolicy(),
+    getDirectory(),
+    getOwnershipTransferState()
+  ]);
+
+  const normOnly = normalizeEntry(onlyEmail);
+  const filteredAccounts = normOnly
+    ? authorizedAccounts.filter(a => normalizeEntry(a.email) === normOnly)
+    : authorizedAccounts;
+
+  const filteredClients = normOnly
+    ? oauthClients.filter(
+        c =>
+          c.client_id === filteredAccounts[0]?.clientId ||
+          normalizeEntry(c.boundEmail || '') === normOnly ||
+          (Array.isArray(c.boundEmails) && c.boundEmails.map(normalizeEntry).includes(normOnly))
+      )
+    : oauthClients;
+
+  const payload = {
+    bundleType: 'google_drive_auth_passport_v1',
+    exportedAt: new Date().toISOString(),
+    description: 'Google Drive 权限管理插件 - 免浏览器登录已授权通行证（复制到其他电脑导入即可直接使用）',
+    oauthClients: filteredClients,
+    authorizedAccounts: filteredAccounts
+  };
+
+  if (!normOnly) {
+    payload.policy = policy;
+    payload.directory = directory;
+    if (includeTransferState && transferState?.items?.length) {
+      payload.ownershipTransferState = transferState;
+    }
+  }
+  return payload;
+}
+
+/**
+ * 识别并导入「免登录已授权通行证 JSON」或含 refresh_token 的 token.json 文件（无需弹出浏览器登录）
+ */
+async function importAuthorizedPassportFromObject(parsed) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { imported: false, accountCount: 0, clientCount: 0, restoredTransferCount: 0 };
+  }
+
+  let rawClients = [];
+  let rawAccounts = [];
+
+  if (parsed.bundleType === 'google_drive_auth_passport_v1' || Array.isArray(parsed.authorizedAccounts)) {
+    rawClients = Array.isArray(parsed.oauthClients) ? parsed.oauthClients : [];
+    rawAccounts = Array.isArray(parsed.authorizedAccounts) ? parsed.authorizedAccounts : [];
+  } else if (
+    (parsed.refreshToken && parsed.clientId && parsed.clientSecret) ||
+    (parsed.refresh_token && parsed.client_id && parsed.client_secret)
+  ) {
+    // 兼容单账号导出或标准 Google OAuth token.json (含 refresh_token)
+    const cid = String(parsed.clientId || parsed.client_id).trim();
+    const csec = String(parsed.clientSecret || parsed.client_secret).trim();
+    const rtok = String(parsed.refreshToken || parsed.refresh_token).trim();
+    const turi = parsed.tokenUri || parsed.token_uri || 'https://oauth2.googleapis.com/token';
+    rawClients.push({
+      uid: `cred_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      fileName: 'imported_token.json',
+      client_id: cid,
+      client_secret: csec,
+      token_uri: turi,
+      redirect_uri: 'http://localhost',
+      client_type: 'installed',
+      boundEmail: normalizeEntry(parsed.email || '')
+    });
+    rawAccounts.push({
+      email: normalizeEntry(parsed.email || ''),
+      displayName: parsed.displayName || '',
+      clientId: cid,
+      clientSecret: csec,
+      refreshToken: rtok,
+      accessToken: parsed.accessToken || parsed.token || '',
+      tokenUri: turi,
+      expiresAt: Number(parsed.expiresAt) || 0
+    });
+  } else {
+    return { imported: false, accountCount: 0, clientCount: 0, restoredTransferCount: 0 };
+  }
+
+  if (rawClients.length > 0) {
+    await saveOAuthClients(rawClients);
+  }
+
+  let accountCount = 0;
+  for (const acc of rawAccounts) {
+    if (!acc || typeof acc !== 'object') continue;
+    let email = normalizeEntry(acc.email || '');
+    let accessToken = acc.accessToken || '';
+    let expiresAt = Number(acc.expiresAt) || 0;
+
+    // 如果只有 refreshToken 还没有 email（如外部 token.json），立即静默刷新并换取邮箱
+    if ((!email || !accessToken || Date.now() >= expiresAt - 60000) && acc.refreshToken && acc.clientId && acc.clientSecret) {
+      try {
+        const tokenUri = acc.tokenUri || 'https://oauth2.googleapis.com/token';
+        const resp = await fetch(tokenUri, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            client_id: acc.clientId,
+            client_secret: acc.clientSecret,
+            refresh_token: acc.refreshToken,
+            grant_type: 'refresh_token'
+          }).toString()
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok && data.access_token) {
+          accessToken = data.access_token;
+          expiresAt = Date.now() + (Number(data.expires_in) || 3500) * 1000;
+          if (!email) {
+            const about = await fetchAboutUser(accessToken);
+            email = normalizeEntry(about.email || '');
+          }
+        }
+      } catch (_e) {
+        // 保留原 refreshToken，后续实际调用 API 时会自动重试刷新
+      }
+    }
+
+    if (!email) continue;
+    await saveAuthorizedAccount({
+      ...acc,
+      email,
+      accessToken,
+      expiresAt,
+      authorizedAt: acc.authorizedAt || new Date().toISOString()
+    });
+    accountCount++;
+  }
+
+  let restoredTransferCount = 0;
+  if (parsed.ownershipTransferState && Array.isArray(parsed.ownershipTransferState.items) && parsed.ownershipTransferState.items.length > 0) {
+    const curTf = await getOwnershipTransferState();
+    if (!curTf.items || curTf.items.length === 0) {
+      await saveOwnershipTransferState(parsed.ownershipTransferState);
+      restoredTransferCount = parsed.ownershipTransferState.items.length;
+    }
+  }
+
+  return {
+    imported: rawClients.length > 0 || accountCount > 0,
+    accountCount,
+    clientCount: rawClients.length,
+    restoredTransferCount
+  };
+}
+
 async function refreshAccountAccessToken(account) {
   if (account.isServiceAccount && account.privateKey) {
     const minted = await mintServiceAccountAccessToken({

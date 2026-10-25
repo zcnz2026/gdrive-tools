@@ -157,6 +157,7 @@ function renderAccountsUI() {
         .map(
           acc => `<span class="account-pill">
             <span>✅ ${escapeHtml(acc.email)}</span>
+            <button type="button" class="btn-text" style="padding:0 3px;font-size:11px;color:#0284c7;" data-action="export-single-account" data-email="${escapeHtml(acc.email)}" title="单独导出此账号的免登录授权 JSON 文件（复制到其他电脑导入即可直接用）">💾导出</button>
             <button type="button" class="remove-acc" data-action="remove-account" data-email="${escapeHtml(acc.email)}" title="移除此账号">×</button>
           </span>`
         )
@@ -231,10 +232,24 @@ async function handleOAuthFilesUpload(fileList) {
 
   const extractedClients = [];
   let allowlistImported = false;
+  let passportAccountCount = 0;
+  let passportRestoredTransfer = 0;
 
   for (const file of files) {
     try {
       const parsed = JSON.parse(await file.text());
+      // 1. 优先识别「已授权免登录通行证 JSON」或含 refresh_token 的 token.json
+      const passportRes = await importAuthorizedPassportFromObject(parsed);
+      if (passportRes.imported) {
+        passportAccountCount += passportRes.accountCount;
+        passportRestoredTransfer += passportRes.restoredTransferCount;
+        if (parsed.policy || parsed.groups || parsed.contacts) {
+          await importAllowlistFromObject(parsed);
+        }
+        continue;
+      }
+
+      // 2. 识别常规未授权的 Google OAuth 桌面客户端 JSON 或 Service Account JSON
       const clients = extractOAuthClientsFromJson(parsed, file.name);
       if (clients.length > 0) {
         extractedClients.push(...clients);
@@ -245,6 +260,16 @@ async function handleOAuthFilesUpload(fileList) {
     } catch (error) {
       toast(`读取 ${file.name} 失败：${error.message}`);
     }
+  }
+
+  if (passportAccountCount > 0) {
+    state.accounts = await getAuthorizedAccounts();
+    state.oauthClients = await getOAuthClients();
+    state.transferState = await getOwnershipTransferState();
+    renderAll();
+    const tfMsg = passportRestoredTransfer > 0 ? `，并恢复 ${passportRestoredTransfer} 条全盘转移断点进度` : '';
+    $('progress').textContent = `已免登录导入 ${passportAccountCount} 个已授权账号${tfMsg}（无需浏览器登录，可直接操作）`;
+    toast(`✅ 已成功导入 ${passportAccountCount} 个免登录授权账号${tfMsg}！`);
   }
 
   if (extractedClients.length > 0) {
@@ -258,9 +283,31 @@ async function handleOAuthFilesUpload(fileList) {
       if (acc) successCount++;
     }
     $('progress').textContent = `已完成 ${successCount}/${extractedClients.length} 个凭证授权（当前共 ${state.accounts.length} 个已授权账号）。`;
-  } else if (!allowlistImported) {
-    toast('未识别到有效的 Google OAuth 凭证');
+  } else if (!allowlistImported && passportAccountCount === 0) {
+    toast('未识别到有效的 Google OAuth 凭证或免登录授权文件');
   }
+}
+
+async function exportAuthorizedPassportJson(onlyEmail = '', includeTransferState = true) {
+  const bundle = await buildAuthorizedPassportBundle({ onlyEmail, includeTransferState });
+  if (!bundle.authorizedAccounts.length && !bundle.oauthClients.length) {
+    toast('当前还没有已授权的账号可导出，请先完成账号授权');
+    return;
+  }
+  const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const suffix = onlyEmail ? `-${onlyEmail.split('@')[0]}` : `-all-${bundle.authorizedAccounts.length}accounts`;
+  a.download = `drive-auth-passport${suffix}-${dateStr}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  toast(
+    onlyEmail
+      ? `💾 已导出账号 ${onlyEmail} 的免登录授权文件（复制到其他电脑导入即可直接用）`
+      : `💾 已导出全部 ${bundle.authorizedAccounts.length} 个已授权账号的免登录通行证 JSON（复制到其他电脑导入即可免登录直接使用）`
+  );
 }
 
 async function handleAddMoreAccount(loginHint = '', roleTarget = '') {
@@ -3439,6 +3486,7 @@ async function init() {
     e.target.value = '';
   });
   $('add-account-btn').addEventListener('click', () => handleAddMoreAccount('', ''));
+  $('export-auth-passport-btn')?.addEventListener('click', () => exportAuthorizedPassportJson('', true));
 
   $('create-group-btn').addEventListener('click', async () => {
     const name = ($('new-group-name').value || '').trim();
@@ -3565,6 +3613,8 @@ async function init() {
       state.oauthClients = await removeOAuthClient(uid);
       renderAll();
       toast('已移除该 OAuth JSON 凭证');
+    } else if (action === 'export-single-account') {
+      await exportAuthorizedPassportJson(btn.dataset.email || '', false);
     } else if (action === 'remove-account') {
       state.accounts = await removeAuthorizedAccount(btn.dataset.email);
       if (state.activeAccount === btn.dataset.email) state.activeAccount = 'all';
@@ -3656,6 +3706,8 @@ async function init() {
     toast('已打开待接受汇总页：在网页按 Ctrl+A 全选即可一次性接受所有文件');
   });
 
+  $('transfer-export-passport-btn')?.addEventListener('click', () => exportAuthorizedPassportJson('', true));
+  $('transfer-import-passport-btn')?.addEventListener('click', () => $('oauth-json-file')?.click());
   $('transfer-export-csv-btn')?.addEventListener('click', exportTransferCsv);
 
   $('transfer-clear-records-btn')?.addEventListener('click', async () => {
