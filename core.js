@@ -3798,15 +3798,25 @@ async function prepareTopLevelFoldersForTransfer({
       // 2. 若接收方 Token 可用，开局立即将该顶层文件夹挂入接收方的『我的云端硬盘 (root)』根目录
       if (targetToken && !folder._mountedToTargetRoot) {
         try {
-          await driveApi(
-            targetToken,
-            `/files/${encodeURIComponent(folder.id)}?addParents=root&supportsAllDrives=true&fields=id`,
-            { method: 'PATCH' }
-          );
+          const prevParents = Array.isArray(folder.parents) ? folder.parents.filter(Boolean) : [];
+          const rmQuery = prevParents.length ? `&removeParents=${encodeURIComponent(prevParents.join(','))}` : '';
+          try {
+            await driveApi(
+              targetToken,
+              `/files/${encodeURIComponent(folder.id)}?addParents=root${rmQuery}&supportsAllDrives=true&fields=id,parents`,
+              { method: 'PATCH' }
+            );
+          } catch (_eInner) {
+            await driveApi(
+              targetToken,
+              `/files/${encodeURIComponent(folder.id)}?addParents=root&supportsAllDrives=true&fields=id,parents`,
+              { method: 'PATCH' }
+            );
+          }
           folder._mountedToTargetRoot = true;
           mountedCount++;
         } catch (_e2) {
-          // ignore if already in root
+          // ignore if already in root or not yet movable before acceptance
         }
       }
     }
@@ -4153,7 +4163,8 @@ async function verifyOwnershipTransferItems({
 
 /**
  * 将已转移给接收邮箱（或来自来源邮箱）的顶层文件夹与顶层文件一键归入接收邮箱的「我的云端硬盘 (My Drive)」根目录，
- * 同时 100% 保持子文件夹与内部文件的原始目录树层级结构，不会把子文件打散到根目录！
+ * 自动修复跨账号转移导致的「点开文件夹一闪而过变空 / 游离未归档 (is:unorganized)」问题，
+ * 并在上层父文件夹转移完成后自动将曾暂挂根目录的子文件夹/子文件恢复回原父文件夹，100% 保持原始目录树结构！
  */
 async function mountTransferredItemsToMyDriveRoot({
   targetToken = '',
@@ -4215,83 +4226,211 @@ async function mountTransferredItemsToMyDriveRoot({
     })
   );
 
-  // 建立所有已知文件夹 ID 集合（含接收方已拥有的文件夹 + 转移清单中的文件夹）
-  const allFolderIds = new Set();
+  // 仅将「接收方当前已实际拥有 ('me' in owners)」的文件夹计入有效父文件夹集合！
+  // （关键修复：若某子文件夹如《Suki 整理完毕》已归属接收方，但其上级文件夹仍归属旧账号，不能把未转移的上级算作已挂载父目录，否则该子文件夹会悬空变成 is:unorganized 并导致点开一闪而过！）
+  const ownedFolderIds = new Set();
   for (const f of ownedFiles) {
     if (f.mimeType === 'application/vnd.google-apps.folder') {
-      allFolderIds.add(f.id);
+      ownedFolderIds.add(f.id);
     }
   }
+
+  // 构建每个条目的「原始父文件夹 ID 映射表 (origParentMap)」，用于：
+  // 1) 当子文件夹/子文件从原父目录脱落时，自动塞回原父文件夹；
+  // 2) 当上级文件夹稍后也完成转移归属接收方时，将此前暂挂在 root 的子文件夹自动归位回上级文件夹内部！
+  const origParentMap = new Map();
+  const transferItemById = new Map();
+  const isRootId = pid => !pid || pid === 'root' || pid === targetRootId || (sourceRootId && pid === sourceRootId);
+
   for (const it of transferItems || []) {
-    if (it.mimeType === 'application/vnd.google-apps.folder') {
-      allFolderIds.add(it.id);
+    if (!it?.id) continue;
+    transferItemById.set(it.id, it);
+    if (it.origParentId && !isRootId(it.origParentId)) {
+      origParentMap.set(it.id, it.origParentId);
+    } else if (Array.isArray(it.parents)) {
+      const p = it.parents.find(pid => !isRootId(pid));
+      if (p) {
+        it.origParentId = p;
+        origParentMap.set(it.id, p);
+      }
     }
   }
 
-  // 筛选出「顶层文件夹与顶层文件」：
-  // 条件：1. 尚未在接收方的 targetRootId (我的云端硬盘根目录) 下；
-  //       2. 它的父目录为空，或者它的父目录不在 allFolderIds（即它不是某个子文件夹里的子文件，而是原本就在最外层的顶层目录/顶层文件）
-  const topLevelCandidates = ownedFiles.filter(f => {
-    const parents = Array.isArray(f.parents) ? f.parents : [];
-    if (parents.includes(targetRootId)) return false;
-    if (parents.length === 0) return true;
-    if (sourceRootId && parents.includes(sourceRootId)) return true;
-    const isInsideKnownSubfolder = parents.some(pid => allFolderIds.has(pid));
-    return !isInsideKnownSubfolder;
-  });
+  try {
+    const snap = await getSnapshot();
+    for (const sf of snap?.files || []) {
+      if (sf?.id && !origParentMap.has(sf.id) && Array.isArray(sf.parents)) {
+        const p = sf.parents.find(pid => !isRootId(pid));
+        if (p) origParentMap.set(sf.id, p);
+      }
+    }
+  } catch (_eSnap) {}
 
-  // 文件夹优先归入根目录
-  topLevelCandidates.sort((a, b) => {
-    const af = a.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
-    const bf = b.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+  // 对当前 ownedFiles 中仍保留着非 root 父目录引用的条目（例如上级文件夹尚在旧账号名下），先记下其原始父文件夹 ID
+  for (const f of ownedFiles) {
+    const parents = Array.isArray(f.parents) ? f.parents : [];
+    const nonRootParent = parents.find(pid => !isRootId(pid));
+    if (nonRootParent && !origParentMap.has(f.id)) {
+      origParentMap.set(f.id, nonRootParent);
+    }
+    const tfItem = transferItemById.get(f.id);
+    if (tfItem && nonRootParent && !tfItem.origParentId) {
+      tfItem.origParentId = nonRootParent;
+    }
+  }
+
+  // 单父目录模型安全移动辅助函数：自动携带 removeParents 替换旧父目录，彻底杜绝 Google Drive 403 Increasing the number of parents is not allowed
+  async function moveDriveItemToParent(item, destParentId) {
+    const effectiveDest = destParentId === 'root' ? targetRootId : destParentId;
+    const curParents = Array.isArray(item.parents) ? item.parents.filter(Boolean) : [];
+    const removeList = curParents.filter(pid => pid !== destParentId && pid !== effectiveDest);
+
+    if (removeList.length > 0) {
+      try {
+        await driveApi(
+          targetToken,
+          `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(
+            destParentId
+          )}&removeParents=${encodeURIComponent(removeList.join(','))}&supportsAllDrives=true&fields=id,parents`,
+          { method: 'PATCH' }
+        );
+        item.parents = [effectiveDest];
+        return { moved: true };
+      } catch (_errWithRemove) {
+        // fallback below
+      }
+    }
+
+    try {
+      await driveApi(
+        targetToken,
+        `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(destParentId)}&supportsAllDrives=true&fields=id,parents`,
+        { method: 'PATCH' }
+      );
+      item.parents = [effectiveDest];
+      return { moved: true };
+    } catch (_errDirect) {
+      // 查询实时 parents 后再精准替换或刷新元数据索引
+      const liveMeta = await driveApi(
+        targetToken,
+        `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id,parents`
+      );
+      const liveParents = Array.isArray(liveMeta?.parents) ? liveMeta.parents.filter(Boolean) : [];
+      if (liveParents.includes(effectiveDest) || liveParents.includes(destParentId)) {
+        await driveApi(targetToken, `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id`, {
+          method: 'PATCH',
+          body: JSON.stringify({ name: item.name })
+        });
+        item.parents = liveParents;
+        return { moved: false, refreshed: true };
+      }
+      const liveRemove = liveParents.filter(pid => pid !== destParentId && pid !== effectiveDest);
+      const rmParam = liveRemove.length ? `&removeParents=${encodeURIComponent(liveRemove.join(','))}` : '';
+      await driveApi(
+        targetToken,
+        `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(destParentId)}${rmParam}&supportsAllDrives=true&fields=id,parents`,
+        { method: 'PATCH' }
+      );
+      item.parents = [effectiveDest];
+      return { moved: true };
+    }
+  }
+
+  // 队列 1：子目录脱钩归位（原父文件夹 origPid 现已归属接收方 ownedFolderIds，但当前条目不在 origPid 内）
+  const restoreChildTasks = [];
+  const handledIds = new Set();
+
+  for (const f of ownedFiles) {
+    const origPid = origParentMap.get(f.id);
+    if (origPid && origPid !== f.id && ownedFolderIds.has(origPid)) {
+      const parents = Array.isArray(f.parents) ? f.parents : [];
+      if (!parents.includes(origPid)) {
+        restoreChildTasks.push({ item: f, destParentId: origPid, kind: 'restore_child' });
+        handledIds.add(f.id);
+      }
+    }
+  }
+
+  // 队列 2：顶层或悬空文件夹/文件挂入『我的云端硬盘 (root)』根目录
+  // 条件：尚未在 targetRootId 下，且当前没有任何已归属接收方的父文件夹 (ownedFolderIds) 承载它
+  const mountRootTasks = [];
+  for (const f of ownedFiles) {
+    if (handledIds.has(f.id)) continue;
+    const parents = Array.isArray(f.parents) ? f.parents : [];
+    if (parents.includes(targetRootId)) continue;
+    const isInsideOwnedSubfolder = parents.some(pid => ownedFolderIds.has(pid));
+    if (!isInsideOwnedSubfolder) {
+      mountRootTasks.push({ item: f, destParentId: 'root', kind: 'mount_root' });
+      handledIds.add(f.id);
+    }
+  }
+
+  // 排序：文件夹优先于普通文件执行，确保父容器先就位
+  const sortFoldersFirst = (a, b) => {
+    const af = a.item.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+    const bf = b.item.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
     return af - bf;
-  });
+  };
+  restoreChildTasks.sort(sortFoldersFirst);
+  mountRootTasks.sort(sortFoldersFirst);
+
+  // 队列 3：对已在目录树中但可能因跨账号转移导致网页端视图索引卡死（点开一闪而过）的已拥有文件夹，执行一次轻量元数据刷新激活索引
+  const refreshFolderTasks = [];
+  for (const f of ownedFiles) {
+    if (f.mimeType === 'application/vnd.google-apps.folder' && !handledIds.has(f.id)) {
+      refreshFolderTasks.push({ item: f, kind: 'refresh_folder' });
+    }
+  }
+
+  const allTasks = [...mountRootTasks, ...restoreChildTasks, ...refreshFolderTasks];
+  const totalTasks = allTasks.length;
 
   let mountedCount = 0;
   let mountedFolders = 0;
   let mountedFiles = 0;
+  let repairedChildCount = 0;
+  let refreshedFolderCount = 0;
   let failedCount = 0;
   let cursor = 0;
-  const totalTop = topLevelCandidates.length;
 
-  if (totalTop > 0) {
-    const workerCount = Math.min(Math.max(1, concurrency), totalTop);
-    const workers = Array.from({ length: workerCount }, async () => {
-      while (cursor < totalTop) {
+  if (totalTasks > 0) {
+    const workerCount = Math.min(Math.max(1, concurrency), totalTasks);
+    const workers = Array.from({ length: workerCount }, async (_, workerIdx) => {
+      if (workerIdx > 0) {
+        await new Promise(r => setTimeout(r, workerIdx * 50));
+      }
+      while (cursor < totalTasks) {
         const idx = cursor++;
-        if (idx >= totalTop) break;
-        const item = topLevelCandidates[idx];
-        const parents = Array.isArray(item.parents) ? item.parents : [];
-        const oldRootParent = sourceRootId && parents.includes(sourceRootId) ? sourceRootId : '';
+        if (idx >= totalTasks) break;
+        const task = allTasks[idx];
+        const { item, destParentId, kind } = task;
 
         try {
-          try {
-            const removeQuery = oldRootParent ? `&removeParents=${encodeURIComponent(oldRootParent)}` : '';
-            await driveApi(
-              targetToken,
-              `/files/${encodeURIComponent(item.id)}?addParents=root${removeQuery}&supportsAllDrives=true&fields=id,parents`,
-              { method: 'PATCH' }
-            );
-          } catch (_e1) {
-            await driveApi(
-              targetToken,
-              `/files/${encodeURIComponent(item.id)}?addParents=root&supportsAllDrives=true&fields=id,parents`,
-              { method: 'PATCH' }
-            );
+          if (kind === 'mount_root') {
+            await moveDriveItemToParent(item, 'root');
+            mountedCount++;
+            if (item.mimeType === 'application/vnd.google-apps.folder') mountedFolders++;
+            else mountedFiles++;
+          } else if (kind === 'restore_child') {
+            await moveDriveItemToParent(item, destParentId);
+            repairedChildCount++;
+          } else if (kind === 'refresh_folder') {
+            await driveApi(targetToken, `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id`, {
+              method: 'PATCH',
+              body: JSON.stringify({ name: item.name })
+            });
+            refreshedFolderCount++;
           }
-          mountedCount++;
-          if (item.mimeType === 'application/vnd.google-apps.folder') mountedFolders++;
-          else mountedFiles++;
         } catch (_err) {
           failedCount++;
         }
 
-        const done = mountedCount + failedCount;
-        if (onProgress && (done % 5 === 0 || done === totalTop)) {
+        const done = mountedCount + repairedChildCount + refreshedFolderCount + failedCount;
+        if (onProgress && (done % 5 === 0 || done === totalTasks)) {
           onProgress({
             done,
-            total: totalTop,
-            message: `📂 正在将顶层目录与文件挂入『我的云端硬盘』(${done}/${totalTop})：已挂入 ${mountedFolders} 个顶层文件夹、${mountedFiles} 个顶层文件…`
+            total: totalTasks,
+            message: `📂 正在归位并刷新目录索引 (${done}/${totalTasks})：挂入根目录 ${mountedFolders} 个文件夹/${mountedFiles} 个文件 · 归位子项 ${repairedChildCount} 个 · 激活文件夹索引 ${refreshedFolderCount} 个…`
           });
         }
       }
@@ -4301,10 +4440,12 @@ async function mountTransferredItemsToMyDriveRoot({
 
   return {
     totalOwned: ownedFiles.length,
-    totalTopLevel: totalTop,
+    totalTopLevel: mountRootTasks.length,
     mountedCount,
     mountedFolders,
     mountedFiles,
+    repairedChildCount,
+    refreshedFolderCount,
     failedCount
   };
 }

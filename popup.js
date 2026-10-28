@@ -2326,7 +2326,7 @@ async function handleTransferMountToRoot() {
   if (btn) btn.disabled = true;
 
   await appendTransferLog(
-    `📂 开始整理接收邮箱 [${targetEmail}] 的『我的云端硬盘』目录显示：自动识别所有顶层文件夹与顶层文件并挂入根目录（子文件夹内部结构 100% 保持原样）…`,
+    `📂 开始整理接收邮箱 [${targetEmail}] 的『我的云端硬盘』目录显示：自动将顶层与悬空目录挂入根目录、修复子目录脱钩归位，并强制刷新文件夹视图索引（彻底解决点开文件夹一闪而过变空）…`,
     false
   );
 
@@ -2341,11 +2341,17 @@ async function handleTransferMountToRoot() {
       }
     });
 
+    if (state.transferState?.items?.length) {
+      state.transferState = await saveOwnershipTransferState(state.transferState);
+    }
+
     await appendTransferLog(
-      `✅ 归入『我的云端硬盘』完成！接收号共拥有 ${res.totalOwned} 项，其中识别出未挂入根目录的顶层项 ${res.totalTopLevel} 个 ➔ 已成功挂入根目录 ${res.mountedCount} 个（📁 顶层文件夹 ${res.mountedFolders} 个 / 📄 顶层文件 ${res.mountedFiles} 个）。现在去网页刷新「我的云端硬盘」即可直接看到全部文件夹与文件！`,
+      `✅ 归入『我的云端硬盘』与目录索引修复完成！接收号共拥有 ${res.totalOwned} 项 ➔ 本次成功挂入根目录 ${res.mountedCount} 个（📁 文件夹 ${res.mountedFolders} 个 / 📄 文件 ${res.mountedFiles} 个）· 自动归位子目录项 ${res.repairedChildCount || 0} 个 · 刷新激活文件夹索引 ${res.refreshedFolderCount || 0} 个。现在去网页刷新即可直接看到全部文件夹与内部文件，不再一闪而过！`,
       true
     );
-    toast(`已将 ${res.mountedFolders} 个顶层文件夹、${res.mountedFiles} 个顶层文件归入「我的云端硬盘」！`);
+    toast(
+      `已完成：挂入根目录 ${res.mountedFolders} 个文件夹/${res.mountedFiles} 个文件，归位子项 ${res.repairedChildCount || 0} 个，刷新文件夹索引 ${res.refreshedFolderCount || 0} 个！`
+    );
   } catch (err) {
     await appendTransferLog(`❌ 归入『我的云端硬盘』失败：${err.message}`, true);
     toast(`操作失败：${err.message}`);
