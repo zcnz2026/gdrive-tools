@@ -2628,6 +2628,8 @@ async function handleTransferRestoreSpamAndTrash() {
   const rawDestText = ($('transfer-dest-folder-input')?.value || '').trim();
   const parsedDestIds = rawDestText.toLowerCase() === 'root' ? ['root'] : parseDriveLinksInput(rawDestText);
   const fallbackDestFolderId = parsedDestIds[0] || '';
+  const searchKeyword = ($('transfer-filter-kw')?.value || '').trim();
+  const onlyRootFolderId = $('transfer-filter-root-folder')?.value || 'all';
   const concurrency = Math.max(1, Math.min(16, Number($('transfer-concurrency-select')?.value) || 8));
 
   const btn = $('transfer-restore-spam-trash-btn');
@@ -2638,7 +2640,7 @@ async function handleTransferRestoreSpamAndTrash() {
   state.transferPauseRequested = false;
 
   await appendTransferLog(
-    `🛡️ 开始扫描『回收站 (trashed=true)』与被 Google 误判归入『垃圾内容 (Spam)』而从正常列表隐身/剥离父目录的文档…`,
+    `🛡️ 开始双账号扫描『回收站』、『垃圾内容隐身文档』与『文件夹内一闪而过文档』${searchKeyword ? `（精准搜索关键词："${searchKeyword}"）` : ''}，执行两步式「移出再移回」强制重建文件夹视图索引…`,
     false
   );
 
@@ -2650,6 +2652,8 @@ async function handleTransferRestoreSpamAndTrash() {
       sourceEmail,
       transferItems: state.transferState?.items || [],
       fallbackDestFolderId,
+      searchKeyword,
+      onlyRootFolderId,
       concurrency,
       shouldStop: () => Boolean(state.transferPauseRequested),
       onProgress(p) {
@@ -2667,12 +2671,12 @@ async function handleTransferRestoreSpamAndTrash() {
         : '';
 
     await appendTransferLog(
-      `✅ 垃圾内容与回收站扫描恢复完成！共发现 ${res.totalFound} 项异常文件（🗑️ 回收站 ${res.trashedFound} 项 / 🛡️ 疑似垃圾内容隐身或脱钩 ${res.spamOrHiddenFound} 项）➔ 已通过 API 成功恢复回收站 ${res.restoredFromTrash} 项、解除隐身并重新挂回目录 ${res.rescuedFromSpamOrOrphan} 项（受限需网页解除 ${res.failedCount} 项）。${spamWebNote}`,
+      `✅ 扫描与「一闪而过」深层修复完成！共处理 ${res.totalFound} 项文件（🗑️ 回收站恢复 ${res.restoredFromTrash} 项 / 🛡️ 脱钩隐身归位 ${res.rescuedFromSpamOrOrphan} 项 / ⚡ 文件夹内「移出再移回」重建索引修复一闪而过 ${res.fixedFlashInFolder || 0} 项 / 失败 ${res.failedCount} 项）。${spamWebNote}`,
       true
     );
-    $('progress').textContent = `恢复完成：回收站恢复 ${res.restoredFromTrash} 项 · 隐身/垃圾内容找回 ${res.rescuedFromSpamOrOrphan} 项`;
+    $('progress').textContent = `修复完成：文件夹内一闪而过修复 ${res.fixedFlashInFolder || 0} 项 · 脱钩归位 ${res.rescuedFromSpamOrOrphan} 项 · 回收站恢复 ${res.restoredFromTrash} 项`;
     toast(
-      `恢复完成：从回收站恢复 ${res.restoredFromTrash} 项，找回隐身/游离文件 ${res.rescuedFromSpamOrOrphan} 项！`
+      `修复完成：修复一闪而过 ${res.fixedFlashInFolder || 0} 项，找回隐身文件 ${res.rescuedFromSpamOrOrphan} 项，回收站恢复 ${res.restoredFromTrash} 项！`
     );
   } catch (err) {
     await appendTransferLog(`❌ 垃圾内容/回收站扫描恢复失败：${err.message}`, true);

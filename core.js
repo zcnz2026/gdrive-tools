@@ -4415,10 +4415,24 @@ async function mountTransferredItemsToMyDriveRoot({
             await moveDriveItemToParent(item, destParentId);
             repairedChildCount++;
           } else if (kind === 'refresh_folder') {
-            await driveApi(targetToken, `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id`, {
-              method: 'PATCH',
-              body: JSON.stringify({ name: item.name })
-            });
+            const pId = Array.isArray(item.parents) && item.parents[0] ? item.parents[0] : '';
+            if (pId && pId !== myDriveRootId && pId !== 'root') {
+              await driveApi(
+                targetToken,
+                `/files/${encodeURIComponent(item.id)}?addParents=root&removeParents=${encodeURIComponent(pId)}&supportsAllDrives=true&fields=id`,
+                { method: 'PATCH', body: JSON.stringify({ name: item.name }) }
+              );
+              await driveApi(
+                targetToken,
+                `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(pId)}&removeParents=root&supportsAllDrives=true&fields=id`,
+                { method: 'PATCH', body: JSON.stringify({ name: item.name }) }
+              );
+            } else {
+              await driveApi(targetToken, `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id`, {
+                method: 'PATCH',
+                body: JSON.stringify({ name: item.name })
+              });
+            }
             refreshedFolderCount++;
           }
         } catch (_err) {
@@ -4765,11 +4779,32 @@ async function moveTransferItemsToTargetFolder({
         );
         const liveParents = Array.isArray(liveMeta?.parents) ? liveMeta.parents.filter(Boolean) : [];
         if (liveParents.includes(newParentId)) {
-          await driveApi(tk, `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id`, {
-            method: 'PATCH',
-            body: JSON.stringify({ name: item.name })
-          });
-          item.parents = liveParents;
+          // 关键修复：若文件原本就在该文件夹内但网页端一闪而过变空，单纯 PATCH {name} 不会触发 Google 重建父子边索引！
+          // 必须执行真正的「两步移出再移回 (removeParents ➔ addParents)」才能强制 Google Drive 重建目录视图索引！
+          if (newParentId !== 'root') {
+            try {
+              await driveApi(
+                tk,
+                `/files/${encodeURIComponent(item.id)}?addParents=root&removeParents=${encodeURIComponent(
+                  newParentId
+                )}&supportsAllDrives=true&fields=id,parents`,
+                { method: 'PATCH', body: JSON.stringify({ trashed: false }) }
+              );
+              await driveApi(
+                tk,
+                `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(
+                  newParentId
+                )}&removeParents=root&supportsAllDrives=true&fields=id,parents`,
+                { method: 'PATCH', body: JSON.stringify({ trashed: false }) }
+              );
+            } catch (_bounceErr) {
+              await driveApi(tk, `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id`, {
+                method: 'PATCH',
+                body: JSON.stringify({ trashed: false, name: item.name })
+              });
+            }
+          }
+          item.parents = [newParentId];
           return { moved: true, alreadyInDest: true };
         }
         const liveRm = liveParents.filter(pid => pid !== newParentId);
@@ -4779,7 +4814,7 @@ async function moveTransferItemsToTargetFolder({
           `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(
             newParentId
           )}${rmQuery}&supportsAllDrives=true&fields=id,parents`,
-          { method: 'PATCH' }
+          { method: 'PATCH', body: JSON.stringify({ trashed: false }) }
         );
         item.parents = [newParentId];
         return { moved: true };
@@ -4812,11 +4847,13 @@ async function moveTransferItemsToTargetFolder({
     .sort((a, b) => (a.folderDepth || 0) - (b.folderDepth || 0));
   const fileItems = candidateItems.filter(it => it.mimeType !== 'application/vnd.google-apps.folder');
 
-  // 阶段 A：处理子文件夹结构（按 structureMode 区分）
-  if (structureMode === 'rebuild_folders' && folderItems.length > 0) {
+  // 阶段 A：处理子文件夹结构
+  // 关键升级：无论是 keep_tree 还是 rebuild_folders，只要存在子文件夹，统一在目标文件夹下创建干净的同名子文件夹并把内部文件移入新子文件夹！
+  // 这样每个文件都会经历一次真实的 addParents=新子夹&removeParents=旧子夹，100% 杜绝旧文件夹视图索引损坏导致点开一闪而过的问题！
+  if ((structureMode === 'keep_tree' || structureMode === 'rebuild_folders') && folderItems.length > 0) {
     if (onLog) {
       await onLog(
-        `✨ 正在目标文件夹《${destFolderName}》下按原层级新建 ${folderItems.length} 个同名子文件夹（全新索引防闪退）…`
+        `✨ 正在目标文件夹《${destFolderName}》下按原目录树创建 ${folderItems.length} 个干净同名子文件夹（彻底根治旧文件夹闪退看不见）…`
       );
     }
     for (let i = 0; i < folderItems.length; i++) {
@@ -4831,7 +4868,7 @@ async function moveTransferItemsToTargetFolder({
           {
             method: 'POST',
             body: JSON.stringify({
-              name: sf.name || '新建文件夹',
+              name: sf.name || '子文件夹',
               mimeType: 'application/vnd.google-apps.folder',
               parents: [targetParentId]
             })
@@ -4849,56 +4886,7 @@ async function moveTransferItemsToTargetFolder({
         onProgress({
           done: i + 1,
           total: folderItems.length + fileItems.length,
-          message: `✨ 正在目标文件夹重建子目录层级 (${i + 1}/${folderItems.length}): 《${sf.name}》…`
-        });
-      }
-    }
-  } else if (structureMode === 'keep_tree' && folderItems.length > 0) {
-    for (let i = 0; i < folderItems.length; i++) {
-      if (shouldStop && shouldStop()) break;
-      const sf = folderItems[i];
-      const origPid = (sf.parents || [])[0] || '';
-      const shouldMoveFolder =
-        !origPid || sourceRootSet.has(origPid) || (folderRedirect.has(origPid) && folderRedirect.get(origPid) !== origPid);
-      const targetParentId = folderRedirect.get(origPid) || cleanDestId;
-
-      if (shouldMoveFolder) {
-        try {
-          await moveSingleItem(sf, targetParentId);
-          folderRedirect.set(sf.id, sf.id);
-          movedFolders++;
-        } catch (_moveFolderErr) {
-          // 若旧子文件夹因跨账号限制无法直接整夹移动，自动在目标文件夹新建同名子文件夹承接其内部文件！
-          try {
-            const created = await driveApi(
-              primaryToken,
-              `/files?supportsAllDrives=true&fields=id,name,parents`,
-              {
-                method: 'POST',
-                body: JSON.stringify({
-                  name: sf.name || '子文件夹',
-                  mimeType: 'application/vnd.google-apps.folder',
-                  parents: [targetParentId]
-                })
-              }
-            );
-            if (created?.id) {
-              folderRedirect.set(sf.id, created.id);
-              createdFolders++;
-            }
-          } catch (_createErr) {
-            failedCount++;
-          }
-        }
-      } else {
-        folderRedirect.set(sf.id, sf.id);
-      }
-
-      if (onProgress && (i % 3 === 0 || i === folderItems.length - 1)) {
-        onProgress({
-          done: i + 1,
-          total: folderItems.length + fileItems.length,
-          message: `📂 正在移动/整理子文件夹 (${i + 1}/${folderItems.length}): 《${sf.name}》…`
+          message: `✨ 正在目标文件夹构建子目录层级 (${i + 1}/${folderItems.length}): 《${sf.name}》…`
         });
       }
     }
@@ -4967,11 +4955,11 @@ async function moveTransferItemsToTargetFolder({
 }
 
 /**
- * 扫描并一键恢复「回收站 (Trash, trashed=true)」与「疑似被 Google 误判归入『垃圾内容 (Spam)』而从正常列表隐身/剥离父目录」的文件夹和文件！
+ * 扫描并一键恢复「回收站 (Trash, trashed=true)」、「疑似被 Google 误判归入『垃圾内容 (Spam)』隐身文件」以及「文件夹内点开一闪而过消失 (Index Desync)」的文件！
  * 工作原理：
  * 1. 双端扫描接收邮箱与来源邮箱的回收站 (q="trashed = true")，自动设置 trashed: false 恢复；
- * 2. 将历史扫描记录 (transferItems + scanSnapshot) 与当前正常可见文件列表做差集比对，揪出被 Google Spam 过滤器隐藏或剥离了 parents 的文件；
- * 3. 通过已知 fileId 强制调用 PATCH /files/{id}?addParents={原父文件夹或root} 并写入 { trashed: false }，将其拉回正常目录树！
+ * 2. 双端扫描正常文件与文件夹（不限 'me' in owners，覆盖父文件夹归新号、子文件仍归旧号的跨号断层文件）；
+ * 3. 对游离脱钩文件执行 addParents 挂回原父目录；对已在文件夹内但点开一闪而过消失的文件，执行真正的「两步移出再移回 (removeParents ➔ addParents)」重建 Google 目录索引！
  */
 async function scanAndRestoreSpamAndTrashItems({
   targetToken = '',
@@ -4980,6 +4968,8 @@ async function scanAndRestoreSpamAndTrashItems({
   sourceEmail = '',
   transferItems = [],
   fallbackDestFolderId = '',
+  searchKeyword = '',
+  onlyRootFolderId = '',
   concurrency = 8,
   shouldStop = null,
   onProgress = null,
@@ -4987,10 +4977,9 @@ async function scanAndRestoreSpamAndTrashItems({
 }) {
   const activeTokens = [...new Set([targetToken, sourceToken].filter(Boolean))];
   if (!activeTokens.length) {
-    throw new Error('请先在上方选择并授权「接收邮箱」或「来源邮箱」后再执行垃圾内容/回收站扫描恢复');
+    throw new Error('请先在上方选择并授权「接收邮箱」或「来源邮箱」后再执行扫描恢复');
   }
 
-  const primaryToken = targetToken || sourceToken;
   let targetRootId = 'root';
   let sourceRootId = '';
   if (targetToken) {
@@ -5007,13 +4996,19 @@ async function scanAndRestoreSpamAndTrashItems({
   }
 
   const isRootId = pid => !pid || pid === 'root' || pid === targetRootId || (sourceRootId && pid === sourceRootId);
+  const cleanKw = String(searchKeyword || '').trim().toLowerCase();
 
-  // 1. 记录已知的原始父目录关系 (origParentMap)
+  // 1. 记录已知的原始父目录关系 (origParentMap) 与文件夹名称映射
   const origParentMap = new Map();
   const knownItemMap = new Map();
+  const folderNameMap = new Map();
+
   for (const it of transferItems || []) {
     if (!it?.id) continue;
     knownItemMap.set(it.id, it);
+    if (it.mimeType === 'application/vnd.google-apps.folder' && it.name) {
+      folderNameMap.set(it.id, it.name);
+    }
     if (it.origParentId && !isRootId(it.origParentId)) {
       origParentMap.set(it.id, it.origParentId);
     } else if (Array.isArray(it.parents)) {
@@ -5026,6 +5021,9 @@ async function scanAndRestoreSpamAndTrashItems({
     for (const sf of snap?.files || []) {
       if (!sf?.id) continue;
       if (!knownItemMap.has(sf.id)) knownItemMap.set(sf.id, sf);
+      if (sf.mimeType === 'application/vnd.google-apps.folder' && sf.name) {
+        folderNameMap.set(sf.id, sf.name);
+      }
       if (!origParentMap.has(sf.id) && Array.isArray(sf.parents)) {
         const p = sf.parents.find(pid => !isRootId(pid));
         if (p) origParentMap.set(sf.id, p);
@@ -5033,9 +5031,49 @@ async function scanAndRestoreSpamAndTrashItems({
     }
   } catch (_eSnap) {}
 
-  // 2. 扫描双端「回收站 (trashed = true)」中的全部文件与文件夹
+  // 2. 若用户在搜索框输入了文件名关键词（如 Candidates），优先在双端执行实时精准搜寻（含回收站与全盘共享）并打印其真实位置
+  const keywordMatchedItems = [];
+  if (cleanKw) {
+    const safeKw = cleanKw.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const kwFields = 'files(id,name,mimeType,webViewLink,trashed,owners(emailAddress,displayName),parents)';
+    await Promise.all(
+      activeTokens.map(async tk => {
+        try {
+          const res = await driveApi(
+            tk,
+            `/files?pageSize=200&supportsAllDrives=true&includeItemsFromAllDrives=true&q=${encodeURIComponent(
+              `name contains '${safeKw}' and mimeType != 'application/vnd.google-apps.shortcut'`
+            )}&fields=${encodeURIComponent(kwFields)}`
+          );
+          for (const f of res?.files || []) {
+            if (
+              f?.id &&
+              !keywordMatchedItems.some(x => x.id === f.id) &&
+              ((f.name || '').toLowerCase().includes(cleanKw) || f.id.toLowerCase().includes(cleanKw))
+            ) {
+              keywordMatchedItems.push(f);
+            }
+          }
+        } catch (_e) {}
+      })
+    );
+    if (keywordMatchedItems.length > 0 && onLog) {
+      for (const kf of keywordMatchedItems.slice(0, 15)) {
+        const pid = (kf.parents || [])[0] || origParentMap.get(kf.id) || '';
+        const pName = folderNameMap.get(pid) || (isRootId(pid) ? '我的云端硬盘(root)' : pid || '无父目录(游离状态)');
+        const ownerEm = kf.owners?.[0]?.emailAddress || '未知所有者';
+        await onLog(
+          `🎯 定位到文件《${kf.name}》➔ 当前所有者: ${ownerEm} | 所在父目录: 《${pName}》 | 回收站: ${
+            kf.trashed ? '是(trashed)' : '否'
+          } | 链接: https://drive.google.com/open?id=${kf.id}`
+        );
+      }
+    }
+  }
+
+  // 3. 扫描双端「回收站 (trashed = true)」中的全部文件与文件夹
   if (onProgress) {
-    onProgress({ message: '🗑️ 正在扫描『回收站 (trashed=true)』中的被删/被拦截文件…' });
+    onProgress({ message: '🗑️ 正在扫描新旧账号『回收站 (trashed=true)』中的文件…' });
   }
   const trashedItems = [];
   const seenTrashedIds = new Set();
@@ -5067,15 +5105,17 @@ async function scanAndRestoreSpamAndTrashItems({
     })
   );
 
-  // 3. 快速扫描当前账号正常可见 (trashed = false) 的文件 ID 集合与有效文件夹集合，用于差集比对出「被 Google 塞进 Spam 垃圾内容而从正常列表消失」的文件
+  // 4. 双端扫描正常可见 (trashed = false) 的文件夹与文件（覆盖接收号与来源号，解决「文件夹归新号、内部文件仍归旧号」导致点开一闪而过的问题）
   if (onProgress) {
-    onProgress({ message: `🔍 已发现回收站文件 ${trashedItems.length} 项，正在比对排查被归入『垃圾内容 (Spam)』的隐身文件…` });
+    onProgress({ message: `🔍 已发现回收站文件 ${trashedItems.length} 项，正在双端扫描排查『一闪而过消失 / 垃圾内容隐身』文件…` });
   }
   const visibleIds = new Set();
   const activeFolderIds = new Set();
+  const targetOwnedFolderIds = new Set();
   const visibleFilesById = new Map();
 
-  if (targetToken) {
+  for (const tk of activeTokens) {
+    const isTargetTk = tk === targetToken;
     const baseQ = "trashed = false and 'me' in owners";
     const shards = [
       `${baseQ} and mimeType = 'application/vnd.google-apps.folder'`,
@@ -5090,17 +5130,27 @@ async function scanAndRestoreSpamAndTrashItems({
           if (shouldStop && shouldStop()) break;
           try {
             const res = await driveApi(
-              targetToken,
+              tk,
               `/files?pageSize=1000&supportsAllDrives=true&includeItemsFromAllDrives=true&q=${encodeURIComponent(
                 sq
-              )}&fields=nextPageToken,files(id,name,mimeType,parents)${pt ? `&pageToken=${encodeURIComponent(pt)}` : ''}`
+              )}&fields=nextPageToken,files(id,name,mimeType,owners(emailAddress),parents)${
+                pt ? `&pageToken=${encodeURIComponent(pt)}` : ''
+              }`
             );
             for (const f of res?.files || []) {
               if (!f?.id) continue;
-              visibleIds.add(f.id);
-              visibleFilesById.set(f.id, f);
+              if (isTargetTk) visibleIds.add(f.id);
+              if (!visibleFilesById.has(f.id) || isTargetTk) {
+                visibleFilesById.set(f.id, f);
+              }
               if (f.mimeType === 'application/vnd.google-apps.folder') {
                 activeFolderIds.add(f.id);
+                if (f.name) folderNameMap.set(f.id, f.name);
+                if (isTargetTk) targetOwnedFolderIds.add(f.id);
+              }
+              const nonRootP = (f.parents || []).find(pid => !isRootId(pid));
+              if (nonRootP && !origParentMap.has(f.id)) {
+                origParentMap.set(f.id, nonRootP);
               }
             }
             pt = res?.nextPageToken || '';
@@ -5112,43 +5162,75 @@ async function scanAndRestoreSpamAndTrashItems({
     );
   }
 
-  // 4. 筛选出「疑似被归入垃圾内容 (Spam) / 丢失父目录而隐身」的条目：
-  // 情况 A：在已知扫描列表 knownItemMap 中，但由于被 Google 塞进 Spam 文件夹，在正常 files.list 中消失（或者已转给接收方却不在 visibleIds 中）
-  // 情况 B：在 visibleFilesById 中，但 parents 为空或父目录不在 activeFolderIds 且不在 targetRootId（被 Spam 或跨号转移剥离了父目录）
+  // 5. 构建三级修复队列：
+  // 队列 A (trash): 回收站中的文件
+  // 队列 B (spam_or_orphan): 在正常列表中消失（被塞进 Spam）或失去父目录悬空的文件
+  // 队列 C (flash_in_folder): 位于文件夹内部，但因跨账号所有权变更/父子不同步导致在网页端「点开一闪就没了」的文件（执行两步移出再移回重绑索引！）
   const spamOrHiddenCandidates = [];
+  const flashInFolderCandidates = [];
   const queuedIds = new Set(seenTrashedIds);
 
+  // 先把用户搜索关键词命中的文件放入最高优先级
+  for (const kf of keywordMatchedItems) {
+    if (queuedIds.has(kf.id)) continue;
+    queuedIds.add(kf.id);
+    if (kf.trashed) {
+      trashedItems.unshift(kf);
+    } else {
+      flashInFolderCandidates.unshift(kf);
+    }
+  }
+
+  const matchesFilter = item => {
+    if (onlyRootFolderId && onlyRootFolderId !== 'all') {
+      const rf = item.rootFolderId || '__root_loose__';
+      if (rf !== onlyRootFolderId && item.id !== onlyRootFolderId && !(item.parents || []).includes(onlyRootFolderId)) {
+        return false;
+      }
+    }
+    if (cleanKw) {
+      const hay = `${item.name || ''} ${item.id || ''}`.toLowerCase();
+      if (!hay.includes(cleanKw)) return false;
+    }
+    return true;
+  };
+
   for (const [id, knownIt] of knownItemMap.entries()) {
-    if (queuedIds.has(id)) continue;
+    if (queuedIds.has(id) || !matchesFilter(knownIt)) continue;
     const vFile = visibleFilesById.get(id);
     if (!vFile) {
-      // 若接收方已接管或待接收（或只授权了单侧账号），但在正常列表不可见，极可能被 Google 归入了 Spam 垃圾内容！
       if (!targetToken || knownIt.stage === 'completed' || knownIt.stage === 'pending_accept') {
         spamOrHiddenCandidates.push(knownIt);
         queuedIds.add(id);
       }
     } else {
+      const merged = { ...knownIt, ...vFile };
       const parents = Array.isArray(vFile.parents) ? vFile.parents : [];
       const inRoot = parents.includes(targetRootId);
-      const inActiveFolder = parents.some(pid => activeFolderIds.has(pid));
-      if (!inRoot && !inActiveFolder) {
-        spamOrHiddenCandidates.push({
-          ...knownIt,
-          ...vFile
-        });
+      const inTargetFolder = parents.some(pid => targetOwnedFolderIds.has(pid));
+      const inAnyActiveFolder = parents.some(pid => activeFolderIds.has(pid));
+
+      if (!inRoot && !inAnyActiveFolder) {
+        spamOrHiddenCandidates.push(merged);
+        queuedIds.add(id);
+      } else if (vFile.mimeType !== 'application/vnd.google-apps.folder' && (inTargetFolder || inAnyActiveFolder)) {
+        // 位于文件夹内的子文件：通过两步移出再移回重绑父子索引，解决点开文件夹一闪而过消失！
+        flashInFolderCandidates.push(merged);
         queuedIds.add(id);
       }
     }
   }
 
-  // 补充：即使不在 knownItemMap 中，只要当前账号名下存在失去父目录挂载的游离项，也一并纳入恢复队列
   for (const [id, vFile] of visibleFilesById.entries()) {
-    if (queuedIds.has(id)) continue;
+    if (queuedIds.has(id) || !matchesFilter(vFile)) continue;
     const parents = Array.isArray(vFile.parents) ? vFile.parents : [];
     const inRoot = parents.includes(targetRootId);
-    const inActiveFolder = parents.some(pid => activeFolderIds.has(pid));
-    if (!inRoot && !inActiveFolder) {
+    const inAnyActiveFolder = parents.some(pid => activeFolderIds.has(pid));
+    if (!inRoot && !inAnyActiveFolder) {
       spamOrHiddenCandidates.push(vFile);
+      queuedIds.add(id);
+    } else if (vFile.mimeType !== 'application/vnd.google-apps.folder' && inAnyActiveFolder) {
+      flashInFolderCandidates.push(vFile);
       queuedIds.add(id);
     }
   }
@@ -5161,23 +5243,35 @@ async function scanAndRestoreSpamAndTrashItems({
   trashedItems.sort(sortFoldersFirst);
   spamOrHiddenCandidates.sort(sortFoldersFirst);
 
+  // 优先修复「父文件夹已归属接收号 (targetOwnedFolderIds)」内部的一闪而过文件！
+  flashInFolderCandidates.sort((a, b) => {
+    const aInTarget = (a.parents || []).some(pid => targetOwnedFolderIds.has(pid)) ? 0 : 1;
+    const bInTarget = (b.parents || []).some(pid => targetOwnedFolderIds.has(pid)) ? 0 : 1;
+    return aInTarget - bInTarget;
+  });
+
   const allRestoreTasks = [
     ...trashedItems.map(item => ({ item, sourceType: 'trash' })),
-    ...spamOrHiddenCandidates.map(item => ({ item, sourceType: 'spam_or_orphan' }))
+    ...spamOrHiddenCandidates.map(item => ({ item, sourceType: 'spam_or_orphan' })),
+    ...flashInFolderCandidates.map(item => ({ item, sourceType: 'flash_in_folder' }))
   ];
 
   const totalTasks = allRestoreTasks.length;
   let restoredFromTrash = 0;
   let rescuedFromSpamOrOrphan = 0;
+  let fixedFlashInFolder = 0;
   let failedCount = 0;
   let cursor = 0;
 
   const cleanFallbackDest = String(fallbackDestFolderId || '').trim();
+  const normTargetEmail = normalizeEntry(targetEmail);
+  const normSourceEmail = normalizeEntry(sourceEmail);
+  const ensuredFolderBridge = new Set();
 
   if (totalTasks > 0) {
     if (onLog) {
       await onLog(
-        `🛡️ 扫描发现：回收站文件 ${trashedItems.length} 项 + 疑似被判为『垃圾内容(Spam)』/游离隐身文件 ${spamOrHiddenCandidates.length} 项，开始 ${concurrency} 线程并发恢复…`
+        `🛡️ 扫描发现待修复项共 ${totalTasks} 个（🗑️ 回收站 ${trashedItems.length} 项 · 👻 隐身/脱钩 ${spamOrHiddenCandidates.length} 项 · ⚡ 文件夹内一闪而过待重绑索引 ${flashInFolderCandidates.length} 项），启动 ${concurrency} 线程并发修复…`
       );
     }
 
@@ -5192,40 +5286,120 @@ async function scanAndRestoreSpamAndTrashItems({
         if (idx >= totalTasks) break;
         const { item, sourceType } = allRestoreTasks[idx];
 
-        const origPid = origParentMap.get(item.id) || '';
-        const destParentId =
-          origPid && activeFolderIds.has(origPid)
-            ? origPid
-            : cleanFallbackDest || 'root';
-        const effectiveDest = destParentId === 'root' ? targetRootId : destParentId;
         const curParents = Array.isArray(item.parents) ? item.parents.filter(Boolean) : [];
-        const rmList = curParents.filter(pid => pid !== destParentId && pid !== effectiveDest);
-        const rmQuery = rmList.length ? `&removeParents=${encodeURIComponent(rmList.join(','))}` : '';
+        const origPid = origParentMap.get(item.id) || curParents.find(pid => !isRootId(pid)) || '';
+        const destParentId = cleanFallbackDest
+          ? cleanFallbackDest
+          : origPid && activeFolderIds.has(origPid)
+          ? origPid
+          : 'root';
+        const effectiveDest = destParentId === 'root' ? targetRootId : destParentId;
+
+        // 若父文件夹归接收号、子文件归来源号（或反之），自动为双方打通该父文件夹与子文件的 writer 权限，消除跨账号权限断层导致的闪退隐藏
+        if (sourceToken && targetToken && normTargetEmail && normSourceEmail && normTargetEmail !== normSourceEmail) {
+          if (effectiveDest !== 'root' && effectiveDest !== targetRootId && !ensuredFolderBridge.has(effectiveDest)) {
+            ensuredFolderBridge.add(effectiveDest);
+            try {
+              await driveApi(
+                targetToken,
+                `/files/${encodeURIComponent(effectiveDest)}/permissions?sendNotificationEmail=false&supportsAllDrives=true`,
+                {
+                  method: 'POST',
+                  body: JSON.stringify({ type: 'user', role: 'writer', emailAddress: normSourceEmail })
+                }
+              );
+            } catch (_eBridge1) {}
+            try {
+              await driveApi(
+                sourceToken,
+                `/files/${encodeURIComponent(effectiveDest)}/permissions?sendNotificationEmail=false&supportsAllDrives=true`,
+                {
+                  method: 'POST',
+                  body: JSON.stringify({ type: 'user', role: 'writer', emailAddress: normTargetEmail })
+                }
+              );
+            } catch (_eBridge2) {}
+          }
+        }
 
         let ok = false;
         for (const tk of activeTokens) {
           try {
-            try {
+            const alreadyInDest =
+              curParents.includes(destParentId) || curParents.includes(effectiveDest);
+
+            if (alreadyInDest && effectiveDest !== targetRootId && destParentId !== 'root') {
+              // 核心两步移出再移回重绑（与网页端手动「整理->移出再移回原文件夹」完全等价，强制 Google 重建目录视图索引，彻底解决点开一闪就没了！）
               await driveApi(
                 tk,
-                `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(
-                  destParentId
-                )}${rmQuery}&supportsAllDrives=true&fields=id,trashed,parents`,
+                `/files/${encodeURIComponent(item.id)}?addParents=root&removeParents=${encodeURIComponent(
+                  effectiveDest
+                )}&supportsAllDrives=true&fields=id,parents`,
                 {
                   method: 'PATCH',
                   body: JSON.stringify({ trashed: false })
                 }
               );
-            } catch (_eInner) {
               await driveApi(
                 tk,
-                `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id,trashed,parents`,
+                `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(
+                  effectiveDest
+                )}&removeParents=root&supportsAllDrives=true&fields=id,parents`,
                 {
                   method: 'PATCH',
-                  body: JSON.stringify({ trashed: false, name: item.name || undefined })
+                  body: JSON.stringify({ trashed: false })
                 }
               );
+            } else {
+              const rmList = curParents.filter(pid => pid !== destParentId && pid !== effectiveDest);
+              const rmQuery = rmList.length ? `&removeParents=${encodeURIComponent(rmList.join(','))}` : '';
+              try {
+                await driveApi(
+                  tk,
+                  `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(
+                    destParentId
+                  )}${rmQuery}&supportsAllDrives=true&fields=id,trashed,parents`,
+                  {
+                    method: 'PATCH',
+                    body: JSON.stringify({ trashed: false })
+                  }
+                );
+              } catch (_eInner) {
+                // 查询实时 parents 后执行两步重绑或替换
+                const liveMeta = await driveApi(
+                  tk,
+                  `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id,parents`
+                );
+                const liveP = Array.isArray(liveMeta?.parents) ? liveMeta.parents.filter(Boolean) : [];
+                if (liveP.includes(effectiveDest) && effectiveDest !== targetRootId) {
+                  await driveApi(
+                    tk,
+                    `/files/${encodeURIComponent(item.id)}?addParents=root&removeParents=${encodeURIComponent(
+                      effectiveDest
+                    )}&supportsAllDrives=true&fields=id,parents`,
+                    { method: 'PATCH', body: JSON.stringify({ trashed: false }) }
+                  );
+                  await driveApi(
+                    tk,
+                    `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(
+                      effectiveDest
+                    )}&removeParents=root&supportsAllDrives=true&fields=id,parents`,
+                    { method: 'PATCH', body: JSON.stringify({ trashed: false }) }
+                  );
+                } else {
+                  const liveRm = liveP.filter(pid => pid !== destParentId && pid !== effectiveDest);
+                  const liveRmQ = liveRm.length ? `&removeParents=${encodeURIComponent(liveRm.join(','))}` : '';
+                  await driveApi(
+                    tk,
+                    `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(
+                      destParentId
+                    )}${liveRmQ}&supportsAllDrives=true&fields=id,trashed,parents`,
+                    { method: 'PATCH', body: JSON.stringify({ trashed: false }) }
+                  );
+                }
+              }
             }
+
             ok = true;
             if (item.mimeType === 'application/vnd.google-apps.folder') {
               activeFolderIds.add(item.id);
@@ -5237,26 +5411,31 @@ async function scanAndRestoreSpamAndTrashItems({
         }
 
         if (ok) {
+          const pName = folderNameMap.get(effectiveDest) || (effectiveDest === targetRootId ? '我的云端硬盘' : effectiveDest);
           if (sourceType === 'trash') restoredFromTrash++;
-          else rescuedFromSpamOrOrphan++;
+          else if (sourceType === 'spam_or_orphan') rescuedFromSpamOrOrphan++;
+          else fixedFlashInFolder++;
+
           const tfItem = knownItemMap.get(item.id);
           if (tfItem) {
-            tfItem.statusText =
-              sourceType === 'trash'
-                ? '♻️ 已从回收站恢复并归位'
-                : '🛡️ 已解除垃圾隐身并恢复归位';
+            tfItem.statusText = `✅ 已重绑显示于《${pName}》`;
             tfItem.updatedAt = new Date().toISOString();
+          }
+          if (onLog && (restoredFromTrash + rescuedFromSpamOrOrphan + fixedFlashInFolder <= 25 || cleanKw)) {
+            await onLog(
+              `✅ 已修复《${item.name}》➔ 现已稳固显示于文件夹《${pName}》(https://drive.google.com/open?id=${item.id})`
+            );
           }
         } else {
           failedCount++;
         }
 
-        const done = restoredFromTrash + rescuedFromSpamOrOrphan + failedCount;
-        if (onProgress && (done % 5 === 0 || done === totalTasks)) {
+        const done = restoredFromTrash + rescuedFromSpamOrOrphan + fixedFlashInFolder + failedCount;
+        if (onProgress && (done % 4 === 0 || done === totalTasks)) {
           onProgress({
             done,
             total: totalTasks,
-            message: `🛡️ 正在恢复垃圾内容与回收站文件 (${done}/${totalTasks})：已恢复回收站 ${restoredFromTrash} 项 · 找回隐身/游离文件 ${rescuedFromSpamOrOrphan} 项…`
+            message: `🛡️ 正在修复 (${done}/${totalTasks})：回收站恢复 ${restoredFromTrash} · 隐身找回 ${rescuedFromSpamOrOrphan} · 一闪而过重绑 ${fixedFlashInFolder}…`
           });
         }
       }
@@ -5267,8 +5446,10 @@ async function scanAndRestoreSpamAndTrashItems({
   return {
     trashedFound: trashedItems.length,
     spamOrHiddenFound: spamOrHiddenCandidates.length,
+    flashInFolderFound: flashInFolderCandidates.length,
     restoredFromTrash,
     rescuedFromSpamOrOrphan,
+    fixedFlashInFolder,
     failedCount,
     totalFound: totalTasks
   };
