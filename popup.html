@@ -276,6 +276,17 @@
                     ⏸️ 暂停
                   </button>
                 </div>
+                <div class="row-flex" style="margin-top: 6px; padding-top: 6px; border-top: 1px dashed rgba(37,99,235,0.22); gap: 6px; flex-wrap: wrap;">
+                  <label style="font-weight:600; white-space:nowrap; color:#1d4ed8;">📁 指定源文件夹：</label>
+                  <input id="transfer-source-folder-input" type="text" class="input input-xs grow" placeholder="粘贴要扫描的文件夹链接或ID（支持多个，即使网页点开一闪而过也能扫出全部文件）">
+                  <label class="checkbox-inline" style="font-size:11px;" title="勾选后自动递归扫描该文件夹下的所有子文件夹与深层文件">
+                    <input id="transfer-source-folder-recursive" type="checkbox" checked>
+                    <span>含子目录</span>
+                  </label>
+                  <button id="transfer-scan-folder-btn" type="button" class="btn primary btn-xs" title="定向扫描输入框指定的源文件夹及其内部所有子文件夹和文件（不限新旧账号所有者，双端合并扫描）">
+                    🔍 扫描指定文件夹
+                  </button>
+                </div>
               </div>
 
               <!-- 右栏：接收邮箱（新所有者） -->
@@ -311,6 +322,21 @@
                       🌐 网页全选接受兜底
                     </button>
                   </div>
+                </div>
+                <div class="row-flex" style="margin-top: 6px; padding-top: 6px; border-top: 1px dashed rgba(22,163,74,0.25); gap: 6px; flex-wrap: wrap;">
+                  <label style="font-weight:600; white-space:nowrap; color:#15803d;">🎯 目标文件夹：</label>
+                  <input id="transfer-dest-folder-input" type="text" class="input input-xs grow" placeholder="粘贴目标文件夹链接或ID（将左侧扫出的文件移入此文件夹）">
+                  <select id="transfer-move-structure-mode" class="select select-sm" style="max-width: 175px;" title="选择移入目标文件夹时的目录结构方式">
+                    <option value="keep_tree" selected>🌳 保持子目录结构移入</option>
+                    <option value="rebuild_folders">✨ 重建新子目录并移入(防闪退)</option>
+                    <option value="flatten_files">📄 仅提取全部文件平铺移入</option>
+                  </select>
+                  <button id="transfer-move-to-dest-btn" type="button" class="btn primary btn-xs" title="将当前扫描列表中的文件/子文件夹一键批量移动到右侧指定的『目标文件夹』中">
+                    📂 转移文件到目标文件夹
+                  </button>
+                  <button id="transfer-own-and-move-btn" type="button" class="btn warning btn-xs" title="先对扫描出的文件执行所有权转移，再自动把它们全部移入右侧指定的『目标文件夹』">
+                    👑 转所有权+移入目标夹
+                  </button>
                 </div>
               </div>
             </div>

@@ -2360,6 +2360,234 @@ async function handleTransferMountToRoot() {
   }
 }
 
+async function handleTransferScanSpecificFolder() {
+  if (state.transferRunning) {
+    toast('当前有正在运行的转移任务，请先暂停后再扫描指定文件夹');
+    return;
+  }
+
+  const rawFolderText = $('transfer-source-folder-input')?.value || '';
+  const folderIds = parseDriveLinksInput(rawFolderText);
+  if (!folderIds.length) {
+    $('transfer-source-folder-input')?.focus?.();
+    toast('请先在左侧「📁 指定源文件夹」输入框粘贴 1 个或多个 Google Drive 文件夹链接或文件夹 ID');
+    return;
+  }
+
+  const sourceEmail = normalizeEntry($('transfer-source-select')?.value || state.transferState.sourceEmail || '');
+  const targetEmail = normalizeEntry(
+    $('transfer-target-email-input')?.value || $('transfer-target-select')?.value || state.transferState.targetEmail || ''
+  );
+  if (!sourceEmail && !targetEmail) {
+    toast('请先在上方选择已授权的「来源邮箱」或「接收邮箱」');
+    return;
+  }
+
+  const recursive = Boolean($('transfer-source-folder-recursive')?.checked ?? true);
+  const btn = $('transfer-scan-folder-btn');
+  const pauseBtn = $('transfer-pause-btn');
+  const origText = btn ? btn.textContent : '🔍 扫描指定文件夹';
+
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '⏳ 正在扫描指定夹…';
+  }
+  if (pauseBtn) pauseBtn.disabled = false;
+  state.transferPauseRequested = false;
+
+  await appendTransferLog(
+    `📁 启动指定源文件夹定向扫描：共指定 ${folderIds.length} 个源文件夹（${recursive ? '递归扫描所有子文件夹与深层文件' : '仅扫描直属子项'}，即使网页端点开一闪而过也能 100% 扫出内部全部文件）…`,
+    false
+  );
+
+  try {
+    const items = await scanSpecificFoldersForTransfer({
+      sourceEmail,
+      targetEmail,
+      folderIds,
+      recursive,
+      existingItems: state.transferState.items || [],
+      mergeMode: false,
+      shouldStop: () => Boolean(state.transferPauseRequested),
+      onProgress(p) {
+        if (p?.message) {
+          $('progress').textContent = p.message;
+          if ($('transfer-progress-text')) $('transfer-progress-text').textContent = `⏳ ${p.message}`;
+        }
+      },
+      async onPartialItems(partialItems, info) {
+        state.transferState.sourceEmail = sourceEmail;
+        if (targetEmail) state.transferState.targetEmail = targetEmail;
+        state.transferState.sourceFolderIds = folderIds;
+        state.transferState.lastScannedAt = new Date().toISOString();
+        state.transferState.items = partialItems;
+
+        if (btn) {
+          btn.textContent = `⏳ 已扫出 ${info.total} 项…`;
+        }
+        renderTransferWorkspace();
+      }
+    });
+
+    const folderCnt = items.filter(i => i.mimeType === 'application/vnd.google-apps.folder').length;
+    const fileCnt = items.length - folderCnt;
+
+    state.transferState.sourceEmail = sourceEmail;
+    if (targetEmail) state.transferState.targetEmail = targetEmail;
+    state.transferState.sourceFolderIds = folderIds;
+    state.transferState.lastScannedAt = new Date().toISOString();
+    state.transferState.items = items;
+    state.transferState = await saveOwnershipTransferState(state.transferState);
+
+    await appendTransferLog(
+      `✅ 指定源文件夹扫描完成：共扫出 ${items.length} 项（📁 文件夹 ${folderCnt} 个 / 📄 文件 ${fileCnt} 个）。您现在可以在右侧粘贴「🎯 目标文件夹」链接并点击「📂 转移文件到目标文件夹」或「👑 转所有权+移入目标夹」！`,
+      true
+    );
+    $('progress').textContent = `指定源文件夹扫描完成：共 ${items.length} 项（文件夹 ${folderCnt} / 文件 ${fileCnt}）`;
+    renderTransferWorkspace();
+    toast(`已扫出指定文件夹内共 ${items.length} 项（文件夹 ${folderCnt} / 文件 ${fileCnt}）`);
+  } catch (err) {
+    await appendTransferLog(`❌ 扫描指定源文件夹失败：${err.message}`, true);
+    toast(`扫描指定文件夹失败：${err.message}`);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = origText;
+    }
+    if (pauseBtn && !state.transferRunning) pauseBtn.disabled = true;
+  }
+}
+
+async function handleTransferMoveToDestFolder(withOwnershipTransferFirst = false) {
+  if (state.transferRunning) {
+    toast('当前有正在运行的任务，请等待或暂停后再操作');
+    return;
+  }
+
+  const rawDestText = ($('transfer-dest-folder-input')?.value || '').trim();
+  const parsedDestIds = rawDestText.toLowerCase() === 'root' ? ['root'] : parseDriveLinksInput(rawDestText);
+  const destFolderId = parsedDestIds[0] || '';
+  if (!destFolderId) {
+    $('transfer-dest-folder-input')?.focus?.();
+    toast('请先在右侧「🎯 目标文件夹」输入框粘贴目标文件夹链接或文件夹 ID');
+    return;
+  }
+
+  // 若尚未扫描任何文件，且左侧填了指定源文件夹，自动先扫描指定源文件夹
+  if (!state.transferState?.items?.length) {
+    const srcFolderIds = parseDriveLinksInput($('transfer-source-folder-input')?.value || '');
+    if (srcFolderIds.length > 0) {
+      await handleTransferScanSpecificFolder();
+    }
+    if (!state.transferState?.items?.length) {
+      toast('请先点击左侧「🔍 扫描指定文件夹」（或「🔍 极速多线程扫描全盘」）扫描要转移的文件');
+      return;
+    }
+  }
+
+  // 如果用户点击的是「👑 转所有权+移入目标夹」，且左右账号不同，先执行一轮多线程所有权转移
+  const sourceEmail = normalizeEntry($('transfer-source-select')?.value || state.transferState.sourceEmail || '');
+  const targetEmail = normalizeEntry(
+    $('transfer-target-email-input')?.value || $('transfer-target-select')?.value || state.transferState.targetEmail || ''
+  );
+
+  if (withOwnershipTransferFirst && sourceEmail && targetEmail && sourceEmail !== targetEmail) {
+    await handleTransferRunLoop(false);
+  }
+
+  let sourceToken = '';
+  let targetToken = '';
+  if (sourceEmail) {
+    try {
+      sourceToken = await getValidTokenForAccount(sourceEmail, false);
+    } catch (_e) {}
+  }
+  if (targetEmail) {
+    try {
+      targetToken = await getValidTokenForAccount(targetEmail, false);
+    } catch (_e) {}
+  }
+  if (!sourceToken && !targetToken) {
+    toast('请先授权来源邮箱或接收邮箱后再执行转移到目标文件夹');
+    return;
+  }
+
+  const structureMode = $('transfer-move-structure-mode')?.value || 'keep_tree';
+  const concurrency = Math.max(1, Math.min(16, Number($('transfer-concurrency-select')?.value) || 8));
+  const selectedRootFilter = $('transfer-filter-root-folder')?.value || 'all';
+  const allItems = state.transferState.items || [];
+  const itemsToMove =
+    selectedRootFilter && selectedRootFilter !== 'all'
+      ? allItems.filter(it => (it.rootFolderId || '__root_loose__') === selectedRootFilter)
+      : allItems;
+
+  const sourceFolderIds =
+    parseDriveLinksInput($('transfer-source-folder-input')?.value || '').length > 0
+      ? parseDriveLinksInput($('transfer-source-folder-input')?.value || '')
+      : state.transferState.sourceFolderIds || [];
+
+  const moveBtn = $('transfer-move-to-dest-btn');
+  const ownMoveBtn = $('transfer-own-and-move-btn');
+  const pauseBtn = $('transfer-pause-btn');
+  if (moveBtn) moveBtn.disabled = true;
+  if (ownMoveBtn) ownMoveBtn.disabled = true;
+  if (pauseBtn) pauseBtn.disabled = false;
+  state.transferRunning = true;
+  state.transferPauseRequested = false;
+
+  const modeLabel =
+    structureMode === 'rebuild_folders'
+      ? '✨ 重建同名新子目录并移入文件(防闪退)'
+      : structureMode === 'flatten_files'
+      ? '📄 提取全部文件平铺移入'
+      : '🌳 保持原内部子目录结构移入';
+
+  await appendTransferLog(
+    `📂 开始将 ${itemsToMove.length} 个扫描条目批量转移至目标文件夹 [${destFolderId}]（模式：${modeLabel} · ${concurrency} 线程并发）…`,
+    false
+  );
+
+  try {
+    const res = await moveTransferItemsToTargetFolder({
+      sourceToken,
+      targetToken,
+      sourceEmail,
+      targetEmail,
+      items: itemsToMove,
+      sourceFolderIds,
+      destFolderId,
+      structureMode,
+      concurrency,
+      shouldStop: () => Boolean(state.transferPauseRequested),
+      onProgress(p) {
+        if (p?.message) $('progress').textContent = p.message;
+      },
+      onLog: msg => appendTransferLog(msg, false)
+    });
+
+    state.transferState = await saveOwnershipTransferState(state.transferState);
+    renderTransferWorkspace();
+
+    await appendTransferLog(
+      `✅ 转移文件到目标文件夹《${res.destFolderName}》完成！共移动文件 ${res.movedFiles} 个 · 移动原文件夹 ${res.movedFolders} 个 · 新建子文件夹 ${res.createdFolders} 个（失败 ${res.failedCount} 个）。现在去网页打开目标文件夹《${res.destFolderName}》即可直接查看全部内容！`,
+      true
+    );
+    $('progress').textContent = `已转移至目标文件夹《${res.destFolderName}》：文件 ${res.movedFiles} 个 / 文件夹 ${
+      res.movedFolders + res.createdFolders
+    } 个`;
+    toast(`已成功将 ${res.movedFiles} 个文件（及 ${res.movedFolders + res.createdFolders} 个子目录）转移至《${res.destFolderName}》！`);
+  } catch (err) {
+    await appendTransferLog(`❌ 转移文件到目标文件夹失败：${err.message}`, true);
+    toast(`转移到目标文件夹失败：${err.message}`);
+  } finally {
+    state.transferRunning = false;
+    state.transferPauseRequested = false;
+    if (moveBtn) moveBtn.disabled = false;
+    if (ownMoveBtn) ownMoveBtn.disabled = false;
+    if (pauseBtn) pauseBtn.disabled = true;
+  }
+}
+
 function exportTransferCsv() {
   const items = state.transferState?.items || [];
   if (!items.length) {
@@ -4005,8 +4233,11 @@ async function init() {
 
   $('transfer-scan-source-btn')?.addEventListener('click', () => handleTransferScanSource(false));
   $('transfer-incremental-scan-btn')?.addEventListener('click', () => handleTransferScanSource(true));
+  $('transfer-scan-folder-btn')?.addEventListener('click', handleTransferScanSpecificFolder);
   $('transfer-start-resume-btn')?.addEventListener('click', () => handleTransferRunLoop(false));
   $('transfer-retry-failed-btn')?.addEventListener('click', () => handleTransferRunLoop(true));
+  $('transfer-move-to-dest-btn')?.addEventListener('click', () => handleTransferMoveToDestFolder(false));
+  $('transfer-own-and-move-btn')?.addEventListener('click', () => handleTransferMoveToDestFolder(true));
   $('transfer-priority-folder-btn')?.addEventListener('click', () => {
     const rfVal = $('transfer-filter-root-folder')?.value || 'all';
     if (!rfVal || rfVal === 'all') {

@@ -4449,3 +4449,519 @@ async function mountTransferredItemsToMyDriveRoot({
     failedCount
   };
 }
+
+/**
+ * 定向扫描 1 个或多个指定的 Google Drive 源文件夹（递归遍历其内部所有子文件夹与文件），
+ * 即使该文件夹在网页端点开一闪而过变空，API 仍能通过 '<folderId>' in parents 100% 扫出内部所有文件！
+ * 若同时授权了来源邮箱与接收邮箱，自动双端合并扫描，不论文件当前归属新号还是旧号都能全部扫出。
+ */
+async function scanSpecificFoldersForTransfer({
+  sourceEmail = '',
+  targetEmail = '',
+  folderIds = [],
+  recursive = true,
+  existingItems = [],
+  mergeMode = false,
+  onProgress = null,
+  onPartialItems = null,
+  shouldStop = null
+}) {
+  const cleanFolderIds = [...new Set((folderIds || []).map(x => String(x || '').trim()).filter(Boolean))];
+  if (!cleanFolderIds.length) {
+    throw new Error('请先输入或粘贴至少 1 个要扫描的「源文件夹」链接或文件夹 ID');
+  }
+
+  const normSource = normalizeEntry(sourceEmail);
+  const normTarget = normalizeEntry(targetEmail);
+
+  let sourceToken = '';
+  let targetToken = '';
+  if (normSource) {
+    try {
+      sourceToken = await getValidTokenForAccount(normSource, false, false);
+    } catch (_e) {}
+  }
+  if (normTarget) {
+    try {
+      targetToken = await getValidTokenForAccount(normTarget, false, false);
+    } catch (_e) {}
+  }
+  if (!sourceToken && normSource) {
+    sourceToken = await getValidTokenForAccount(normSource, true, false);
+  }
+  if (!sourceToken && !targetToken && normTarget) {
+    targetToken = await getValidTokenForAccount(normTarget, true, false);
+  }
+
+  const activeTokens = [...new Set([sourceToken, targetToken].filter(Boolean))];
+  if (!activeTokens.length) {
+    throw new Error('请先在上方选择并授权「来源邮箱」或「接收邮箱」后再扫描指定文件夹');
+  }
+
+  const fastFields =
+    'nextPageToken,files(id,name,mimeType,webViewLink,modifiedTime,ownedByMe,owners(emailAddress,displayName),parents)';
+  const singleFields =
+    'id,name,mimeType,webViewLink,modifiedTime,ownedByMe,owners(emailAddress,displayName),parents';
+
+  const rawFiles = [];
+  const seenFileIds = new Set();
+  const rootFolderIdSet = new Set(cleanFolderIds);
+
+  // 1. 先拉取指定的源文件夹自身元数据
+  for (const fid of cleanFolderIds) {
+    if (shouldStop && shouldStop()) break;
+    for (const tk of activeTokens) {
+      try {
+        const meta = await driveApi(
+          tk,
+          `/files/${encodeURIComponent(fid)}?supportsAllDrives=true&fields=${encodeURIComponent(singleFields)}`
+        );
+        if (meta?.id && !seenFileIds.has(meta.id)) {
+          meta._isScannedSourceRoot = true;
+          seenFileIds.add(meta.id);
+          rawFiles.push(meta);
+        }
+        break;
+      } catch (_e) {
+        // try next token
+      }
+    }
+  }
+
+  // 2. BFS 逐层扫描文件夹内部的全部子文件夹与文件（支持双账号令牌互补扫描，不漏任何跨账号子项）
+  let currentLevelFolderIds = [...cleanFolderIds];
+  const visitedFolders = new Set(cleanFolderIds);
+  let depth = 0;
+  let batchSeq = 0;
+
+  while (currentLevelFolderIds.length > 0) {
+    if (shouldStop && shouldStop()) break;
+    depth++;
+    const nextLevelFolderIds = [];
+    const chunkSize = 15;
+
+    for (let i = 0; i < currentLevelFolderIds.length; i += chunkSize) {
+      if (shouldStop && shouldStop()) break;
+      const chunk = currentLevelFolderIds.slice(i, i + chunkSize);
+      const parentClause = chunk.map(id => `'${id.replace(/'/g, "\\'")}' in parents`).join(' or ');
+      const q = `trashed = false and mimeType != 'application/vnd.google-apps.shortcut' and (${parentClause})`;
+
+      let addedInBatch = 0;
+      await Promise.all(
+        activeTokens.map(async tk => {
+          let pageToken = '';
+          do {
+            if (shouldStop && shouldStop()) break;
+            try {
+              const res = await driveApi(
+                tk,
+                `/files?pageSize=1000&supportsAllDrives=true&includeItemsFromAllDrives=true&q=${encodeURIComponent(
+                  q
+                )}&fields=${encodeURIComponent(fastFields)}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`
+              );
+              for (const f of res?.files || []) {
+                if (!f?.id) continue;
+                if (!seenFileIds.has(f.id)) {
+                  seenFileIds.add(f.id);
+                  rawFiles.push(f);
+                  addedInBatch++;
+                }
+                if (
+                  recursive &&
+                  f.mimeType === 'application/vnd.google-apps.folder' &&
+                  !visitedFolders.has(f.id)
+                ) {
+                  visitedFolders.add(f.id);
+                  nextLevelFolderIds.push(f.id);
+                }
+              }
+              pageToken = res?.nextPageToken || '';
+            } catch (_errPage) {
+              pageToken = '';
+            }
+          } while (pageToken);
+        })
+      );
+
+      batchSeq++;
+      if (onProgress) {
+        onProgress({
+          phase: 'scanning',
+          page: batchSeq,
+          count: rawFiles.length,
+          message: `📁 正在扫描指定文件夹第 ${depth} 层目录（已发现 ${rawFiles.length} 项）…`
+        });
+      }
+
+      if (onPartialItems && addedInBatch > 0) {
+        const partialItems = buildTransferItemsFromRawFiles(rawFiles, {
+          normSource: normSource || normTarget,
+          normTarget,
+          existingItems,
+          mergeMode,
+          includeHistoricalMerged: false
+        });
+        for (const it of partialItems) {
+          if (rootFolderIdSet.has(it.id)) it.isScannedSourceRoot = true;
+        }
+        await onPartialItems(partialItems, {
+          page: batchSeq,
+          shardName: `📁第${depth}层`,
+          pageAdded: addedInBatch,
+          total: partialItems.length,
+          hasMore: nextLevelFolderIds.length > 0 || i + chunkSize < currentLevelFolderIds.length
+        });
+      }
+    }
+
+    currentLevelFolderIds = nextLevelFolderIds;
+  }
+
+  const finalItems = buildTransferItemsFromRawFiles(rawFiles, {
+    normSource: normSource || normTarget,
+    normTarget,
+    existingItems,
+    mergeMode,
+    includeHistoricalMerged: mergeMode
+  });
+  for (const it of finalItems) {
+    if (rootFolderIdSet.has(it.id)) it.isScannedSourceRoot = true;
+  }
+  return finalItems;
+}
+
+/**
+ * 将扫描出的源文件夹内部文件/子文件夹批量转移（移动）到指定的「目标文件夹 (destFolderId)」
+ * 支持 3 种结构模式：
+ * - 'keep_tree': 保持原内部子文件夹层级移入目标文件夹（若某旧子文件夹因跨号受限无法直接移动，自动在目标文件夹新建同名子文件夹承接）
+ * - 'rebuild_folders': 在目标文件夹下按原层级镜像新建全新的同名子文件夹，并将所有文件移入新子文件夹（100% 根治旧文件夹点开闪退变空！）
+ * - 'flatten_files': 忽略子目录结构，将所有文件直接提取平铺移入目标文件夹
+ */
+async function moveTransferItemsToTargetFolder({
+  sourceToken = '',
+  targetToken = '',
+  sourceEmail = '',
+  targetEmail = '',
+  items = [],
+  sourceFolderIds = [],
+  destFolderId = '',
+  structureMode = 'keep_tree',
+  concurrency = 8,
+  shouldStop = null,
+  onProgress = null,
+  onLog = null
+}) {
+  const cleanDestId = String(destFolderId || '').trim();
+  if (!cleanDestId) {
+    throw new Error('请先在右侧输入或粘贴「目标文件夹」链接或文件夹 ID');
+  }
+  if (!Array.isArray(items) || !items.length) {
+    throw new Error('当前列表中没有可移动的文件，请先扫描指定源文件夹或全盘文件');
+  }
+
+  const tokens = [...new Set([targetToken, sourceToken].filter(Boolean))];
+  if (!tokens.length) {
+    throw new Error('请先授权接收邮箱或来源邮箱后再执行转移到目标文件夹');
+  }
+  const primaryToken = targetToken || sourceToken;
+
+  // 1. 校验目标文件夹是否存在，并自动打通来源号与接收号对目标文件夹的协作写入权限
+  let destFolderName = cleanDestId === 'root' ? '我的云端硬盘 (root)' : cleanDestId;
+  if (cleanDestId !== 'root') {
+    let destMeta = null;
+    for (const tk of tokens) {
+      try {
+        destMeta = await driveApi(
+          tk,
+          `/files/${encodeURIComponent(cleanDestId)}?supportsAllDrives=true&fields=id,name,mimeType,owners(emailAddress)`
+        );
+        if (destMeta?.id) break;
+      } catch (_e) {}
+    }
+    if (!destMeta?.id) {
+      throw new Error(`无法访问目标文件夹 (${cleanDestId})，请确认目标文件夹链接/ID 正确且当前授权账号有权限访问`);
+    }
+    if (destMeta.mimeType && destMeta.mimeType !== 'application/vnd.google-apps.folder') {
+      throw new Error(`您输入的目标 ID (${destMeta.name || cleanDestId}) 不是一个文件夹，请粘贴正确的目标文件夹链接`);
+    }
+    destFolderName = destMeta.name || cleanDestId;
+
+    // 若来源号和接收号都已授权，确保双方都对目标文件夹拥有 writer 权限，以便双方名下的文件都能直接移入目标文件夹
+    const destOwner = normalizeEntry(destMeta.owners?.[0]?.emailAddress || '');
+    const normSource = normalizeEntry(sourceEmail);
+    const normTarget = normalizeEntry(targetEmail);
+    if (targetToken && normSource && destOwner === normTarget && normSource !== normTarget) {
+      try {
+        await driveApi(
+          targetToken,
+          `/files/${encodeURIComponent(cleanDestId)}/permissions?sendNotificationEmail=false&supportsAllDrives=true`,
+          {
+            method: 'POST',
+            body: JSON.stringify({ type: 'user', role: 'writer', emailAddress: normSource })
+          }
+        );
+      } catch (_e) {}
+    } else if (sourceToken && normTarget && destOwner === normSource && normSource !== normTarget) {
+      try {
+        await driveApi(
+          sourceToken,
+          `/files/${encodeURIComponent(cleanDestId)}/permissions?sendNotificationEmail=false&supportsAllDrives=true`,
+          {
+            method: 'POST',
+            body: JSON.stringify({ type: 'user', role: 'writer', emailAddress: normTarget })
+          }
+        );
+      } catch (_e) {}
+    }
+  }
+
+  // 2. 识别「源根容器文件夹集合 (sourceRootSet)」：
+  // 如果用户指定了源文件夹 S，我们是把 S 里面的子文件夹和文件移到目标文件夹 destFolderId，而不是把 S 移进自己
+  const sourceRootSet = new Set((sourceFolderIds || []).filter(Boolean));
+  for (const it of items) {
+    if (it.isScannedSourceRoot) sourceRootSet.add(it.id);
+  }
+  if (sourceRootSet.has(cleanDestId)) {
+    throw new Error('「源文件夹」与「目标文件夹」不能是同一个文件夹！请粘贴另一个目标文件夹链接');
+  }
+
+  // 判断源根文件夹内部是否有子项；如果有子项，则排除源根外壳本身，只移动其内部子文件夹与文件
+  const hasChildrenOfSourceRoots =
+    sourceRootSet.size > 0 && items.some(it => !sourceRootSet.has(it.id));
+
+  // 单条目跨令牌安全移动辅助函数（自动携带 removeParents 替换原父目录）
+  async function moveSingleItem(item, newParentId) {
+    const normItemOwner = normalizeEntry(item.currentOwner || '');
+    const normTarget = normalizeEntry(targetEmail);
+    const orderedTokens =
+      normItemOwner && normTarget && normItemOwner === normTarget && targetToken
+        ? [...new Set([targetToken, sourceToken].filter(Boolean))]
+        : [...new Set([sourceToken, targetToken].filter(Boolean))];
+
+    let lastErr = null;
+    for (const tk of orderedTokens) {
+      try {
+        const curParents = Array.isArray(item.parents) ? item.parents.filter(Boolean) : [];
+        const rmList = curParents.filter(pid => pid !== newParentId);
+        if (rmList.length > 0) {
+          try {
+            await driveApi(
+              tk,
+              `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(
+                newParentId
+              )}&removeParents=${encodeURIComponent(rmList.join(','))}&supportsAllDrives=true&fields=id,parents`,
+              { method: 'PATCH' }
+            );
+            item.parents = [newParentId];
+            return { moved: true };
+          } catch (_e1) {
+            // fallback to live parents check
+          }
+        }
+
+        const liveMeta = await driveApi(
+          tk,
+          `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id,parents`
+        );
+        const liveParents = Array.isArray(liveMeta?.parents) ? liveMeta.parents.filter(Boolean) : [];
+        if (liveParents.includes(newParentId)) {
+          await driveApi(tk, `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id`, {
+            method: 'PATCH',
+            body: JSON.stringify({ name: item.name })
+          });
+          item.parents = liveParents;
+          return { moved: true, alreadyInDest: true };
+        }
+        const liveRm = liveParents.filter(pid => pid !== newParentId);
+        const rmQuery = liveRm.length ? `&removeParents=${encodeURIComponent(liveRm.join(','))}` : '';
+        await driveApi(
+          tk,
+          `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(
+            newParentId
+          )}${rmQuery}&supportsAllDrives=true&fields=id,parents`,
+          { method: 'PATCH' }
+        );
+        item.parents = [newParentId];
+        return { moved: true };
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr || new Error('移动文件失败');
+  }
+
+  let movedFolders = 0;
+  let createdFolders = 0;
+  let movedFiles = 0;
+  let failedCount = 0;
+
+  // 建立「原父文件夹 ID ➔ 目标父文件夹 ID」重定向映射
+  const folderRedirect = new Map();
+  for (const rid of sourceRootSet) {
+    folderRedirect.set(rid, cleanDestId);
+  }
+
+  const candidateItems = items.filter(it => {
+    if (!it?.id || it.id === cleanDestId) return false;
+    if (hasChildrenOfSourceRoots && sourceRootSet.has(it.id)) return false;
+    return true;
+  });
+
+  const folderItems = candidateItems
+    .filter(it => it.mimeType === 'application/vnd.google-apps.folder')
+    .sort((a, b) => (a.folderDepth || 0) - (b.folderDepth || 0));
+  const fileItems = candidateItems.filter(it => it.mimeType !== 'application/vnd.google-apps.folder');
+
+  // 阶段 A：处理子文件夹结构（按 structureMode 区分）
+  if (structureMode === 'rebuild_folders' && folderItems.length > 0) {
+    if (onLog) {
+      await onLog(
+        `✨ 正在目标文件夹《${destFolderName}》下按原层级新建 ${folderItems.length} 个同名子文件夹（全新索引防闪退）…`
+      );
+    }
+    for (let i = 0; i < folderItems.length; i++) {
+      if (shouldStop && shouldStop()) break;
+      const sf = folderItems[i];
+      const origPid = (sf.parents || [])[0] || '';
+      const targetParentId = folderRedirect.get(origPid) || cleanDestId;
+      try {
+        const created = await driveApi(
+          primaryToken,
+          `/files?supportsAllDrives=true&fields=id,name,parents`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              name: sf.name || '新建文件夹',
+              mimeType: 'application/vnd.google-apps.folder',
+              parents: [targetParentId]
+            })
+          }
+        );
+        if (created?.id) {
+          folderRedirect.set(sf.id, created.id);
+          createdFolders++;
+        }
+      } catch (err) {
+        failedCount++;
+        if (onLog) await onLog(`❌ 创建子文件夹《${sf.name}》失败: ${err.message}`);
+      }
+      if (onProgress) {
+        onProgress({
+          done: i + 1,
+          total: folderItems.length + fileItems.length,
+          message: `✨ 正在目标文件夹重建子目录层级 (${i + 1}/${folderItems.length}): 《${sf.name}》…`
+        });
+      }
+    }
+  } else if (structureMode === 'keep_tree' && folderItems.length > 0) {
+    for (let i = 0; i < folderItems.length; i++) {
+      if (shouldStop && shouldStop()) break;
+      const sf = folderItems[i];
+      const origPid = (sf.parents || [])[0] || '';
+      const shouldMoveFolder =
+        !origPid || sourceRootSet.has(origPid) || (folderRedirect.has(origPid) && folderRedirect.get(origPid) !== origPid);
+      const targetParentId = folderRedirect.get(origPid) || cleanDestId;
+
+      if (shouldMoveFolder) {
+        try {
+          await moveSingleItem(sf, targetParentId);
+          folderRedirect.set(sf.id, sf.id);
+          movedFolders++;
+        } catch (_moveFolderErr) {
+          // 若旧子文件夹因跨账号限制无法直接整夹移动，自动在目标文件夹新建同名子文件夹承接其内部文件！
+          try {
+            const created = await driveApi(
+              primaryToken,
+              `/files?supportsAllDrives=true&fields=id,name,parents`,
+              {
+                method: 'POST',
+                body: JSON.stringify({
+                  name: sf.name || '子文件夹',
+                  mimeType: 'application/vnd.google-apps.folder',
+                  parents: [targetParentId]
+                })
+              }
+            );
+            if (created?.id) {
+              folderRedirect.set(sf.id, created.id);
+              createdFolders++;
+            }
+          } catch (_createErr) {
+            failedCount++;
+          }
+        }
+      } else {
+        folderRedirect.set(sf.id, sf.id);
+      }
+
+      if (onProgress && (i % 3 === 0 || i === folderItems.length - 1)) {
+        onProgress({
+          done: i + 1,
+          total: folderItems.length + fileItems.length,
+          message: `📂 正在移动/整理子文件夹 (${i + 1}/${folderItems.length}): 《${sf.name}》…`
+        });
+      }
+    }
+  }
+
+  // 阶段 B：多线程并发将文件移入对应的目标文件夹（或对应的目标子文件夹）
+  let fileCursor = 0;
+  const totalFiles = fileItems.length;
+  if (totalFiles > 0) {
+    const workerCount = Math.min(Math.max(1, concurrency), totalFiles);
+    const workers = Array.from({ length: workerCount }, async (_, workerIdx) => {
+      if (workerIdx > 0) {
+        await new Promise(r => setTimeout(r, workerIdx * 55));
+      }
+      while (fileCursor < totalFiles) {
+        if (shouldStop && shouldStop()) break;
+        const idx = fileCursor++;
+        if (idx >= totalFiles) break;
+        const file = fileItems[idx];
+        const origPid = (file.parents || [])[0] || '';
+
+        let destPid = cleanDestId;
+        if (structureMode === 'flatten_files') {
+          destPid = cleanDestId;
+        } else if (folderRedirect.has(origPid)) {
+          destPid = folderRedirect.get(origPid);
+        } else if (origPid && !sourceRootSet.has(origPid)) {
+          destPid = origPid;
+        }
+
+        try {
+          await moveSingleItem(file, destPid);
+          movedFiles++;
+          file.statusText = `📂 已移入目标文件夹《${destFolderName}》`;
+          file.updatedAt = new Date().toISOString();
+        } catch (err) {
+          failedCount++;
+          file.error = err.message;
+          if (onLog) {
+            await onLog(`❌ 移动文件《${file.name}》失败: ${err.message}`);
+          }
+        }
+
+        const doneFiles = movedFiles + failedCount;
+        if (onProgress && (doneFiles % 4 === 0 || doneFiles === totalFiles)) {
+          onProgress({
+            done: folderItems.length + doneFiles,
+            total: folderItems.length + totalFiles,
+            message: `📂 正在将文件移入《${destFolderName}》(${doneFiles}/${totalFiles})：已成功移入 ${movedFiles} 个文件…`
+          });
+        }
+      }
+    });
+    await Promise.all(workers);
+  }
+
+  return {
+    destFolderId: cleanDestId,
+    destFolderName,
+    movedFolders,
+    createdFolders,
+    movedFiles,
+    failedCount,
+    totalProcessed: movedFolders + createdFolders + movedFiles + failedCount
+  };
+}
