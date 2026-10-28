@@ -856,7 +856,7 @@ function renderScanSpreadsheet(filtered = []) {
 
       const pubMode = getFilePublicModeId(file);
       const collabSummary = summarizeFileCollaborators(file, ownerEmail);
-      const linkText = file.webViewLink || `https://drive.google.com/open?id=${file.id}`;
+      const linkText = formatDriveCanonicalLink(file);
 
       return [isSelected, typeLabel, nameCell, ownerCell, statusText, pubMode, collabSummary, linkText];
     });
@@ -1762,7 +1762,7 @@ function renderTransferWorkspace(skipSheet = false) {
             curOwnerCell,
             it.statusText || '',
             detailCell,
-            it.webViewLink || it.id
+            formatDriveCanonicalLink(it)
           ];
         });
         if (filtered.length > MAX_SHEET_PREVIEW) {
@@ -2695,21 +2695,53 @@ function exportTransferCsv() {
     toast('暂无转移对比记录可导出');
     return;
   }
+  const hierarchyMap = buildDriveHierarchyInfo(items);
+  const orderedItems = sortItemsByHierarchyTree(items, hierarchyMap);
   const rows = [
-    ['File ID', 'Type', 'Name', 'Source Email (Left)', 'Target Email (Right)', 'Current Actual Owner', 'Stage', 'Status Text', 'Updated At', 'Link']
+    [
+      '层级 (Level)',
+      '完整层级路径 (Full Path)',
+      '所在目录路径 (Folder Path)',
+      '层级缩进名称 (Tree Name)',
+      '名称 (Name)',
+      '类型 (Type)',
+      '文件/文件夹专属链接 (Link)',
+      '所属父文件夹 (Parent Folder)',
+      '父文件夹链接 (Parent Folder Link)',
+      '顶层根文件夹 (Root Folder)',
+      '顶层根文件夹链接 (Root Folder Link)',
+      'File ID',
+      'Source Email (Left)',
+      'Target Email (Right)',
+      'Current Actual Owner',
+      'Stage',
+      'Status Text',
+      'Updated At'
+    ]
   ];
-  for (const it of items) {
+  for (const it of orderedItems) {
+    const h = hierarchyMap.get(it.id) || {};
+    const typeLabel = fileCategoryLabel(it.mimeType, it.name);
+    const canonicalLink = h.canonicalLink || formatDriveCanonicalLink(it);
     rows.push([
-      it.id,
-      fileDetailedCategory(it.mimeType, it.name),
+      h.levelLabel || it.levelLabel || '第 1 层',
+      h.fullPath || it.fullPath || it.name || '',
+      h.folderPath || it.folderPath || '根目录',
+      h.treeDisplayName || it.treeDisplayName || it.name || '',
       it.name || '',
+      typeLabel,
+      canonicalLink,
+      h.parentFolderName || it.parentFolderName || '',
+      h.parentFolderLink || it.parentFolderLink || '',
+      h.rootFolderName || it.rootFolderName || '',
+      h.rootFolderLink || it.rootFolderLink || '',
+      it.id,
       it.sourceOwner || '',
       it.targetOwner || '',
       it.currentOwner || '',
       it.stage || '',
       it.statusText || '',
-      it.updatedAt || '',
-      it.webViewLink || ''
+      it.updatedAt || ''
     ]);
   }
   const csvContent = rows
@@ -3285,17 +3317,29 @@ function exportCsv() {
   const scoped = getScopedFilesByAccount();
   if (!scoped.length) return;
   const contactLookup = buildContactLookup(state.directory);
+  const hierarchyMap = buildDriveHierarchyInfo(state.files?.length ? state.files : scoped);
+  const orderedScoped = sortItemsByHierarchyTree(scoped, hierarchyMap);
   const rows = [
     [
+      '层级 (Level)',
+      '完整层级路径 (Full Path)',
+      '所在目录路径 (Folder Path)',
+      '层级缩进名称 (Tree Name)',
+      '文件/文件夹名称 (File Name)',
+      '类型 (Type)',
+      '文件/文件夹专属链接 (File Link)',
+      '所属父文件夹 (Parent Folder)',
+      '父文件夹链接 (Parent Folder Link)',
+      '顶层根文件夹 (Root Folder)',
+      '顶层根文件夹链接 (Root Folder Link)',
       'File ID',
-      'File Name',
       'Core Series',
       'Category',
       'Owner Account',
       'Group Coverage',
       'Permission ID',
       'Role',
-      'Type',
+      'Permission Type',
       'Email/Domain',
       'Contact Name',
       'Status',
@@ -3303,32 +3347,54 @@ function exportCsv() {
     ]
   ];
 
-  for (const file of scoped) {
+  for (const file of orderedScoped) {
+    const h = hierarchyMap.get(file.id) || {};
     const core = extractCoreFileName(file.name || '');
     const cat = fileDetailedCategory(file.mimeType, file.name);
+    const typeLabel = fileCategoryLabel(file.mimeType, file.name);
+    const canonicalLink = h.canonicalLink || formatDriveCanonicalLink(file);
     const owner = file.ownerAccount || file.owners?.[0]?.emailAddress || '';
     const covStr = getFileGroupCoverage(file, state.directory)
       .map(c => `${c.groupName}(${c.grantedCount}/${c.totalCount})`)
       .join('; ');
 
-    for (const p of file.permissions || []) {
-      const ev = evaluatePermission(p, state.policy, owner);
-      const contact = contactLookup.get(normalizeEntry(p.emailAddress || ''));
-      rows.push([
-        file.id,
-        file.name,
-        core,
-        cat,
-        owner,
-        covStr,
-        p.id,
-        p.role,
-        p.type,
-        p.emailAddress || p.domain || '',
-        contact?.name || p.displayName || '',
-        ev.status,
-        ev.reason
-      ]);
+    const baseCols = [
+      h.levelLabel || '第 1 层',
+      h.fullPath || file.name || '',
+      h.folderPath || '根目录',
+      h.treeDisplayName || file.name || '',
+      file.name || '',
+      typeLabel,
+      canonicalLink,
+      h.parentFolderName || '',
+      h.parentFolderLink || '',
+      h.rootFolderName || '',
+      h.rootFolderLink || '',
+      file.id,
+      core,
+      cat,
+      owner,
+      covStr
+    ];
+
+    const perms = Array.isArray(file.permissions) ? file.permissions : [];
+    if (!perms.length) {
+      rows.push([...baseCols, '', '', '', '', '', '', '']);
+    } else {
+      for (const p of perms) {
+        const ev = evaluatePermission(p, state.policy, owner);
+        const contact = contactLookup.get(normalizeEntry(p.emailAddress || ''));
+        rows.push([
+          ...baseCols,
+          p.id,
+          p.role,
+          p.type,
+          p.emailAddress || p.domain || '',
+          contact?.name || p.displayName || '',
+          ev.status,
+          ev.reason
+        ]);
+      }
     }
   }
 

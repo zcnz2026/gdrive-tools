@@ -357,6 +357,8 @@ function fileCategory(mimeType = '', fileName = '') {
 }
 
 function fileCategoryLabel(mimeType = '', fileName = '') {
+  const m = String(mimeType).toLowerCase();
+  if (m === 'application/vnd.google-apps.form') return '📋 Google 表单';
   const det = fileDetailedCategory(mimeType, fileName);
   const labels = {
     sheet: '📊 Google 表格',
@@ -369,6 +371,210 @@ function fileCategoryLabel(mimeType = '', fileName = '') {
     other: '📦 其他文件'
   };
   return labels[det] || '📄 文件';
+}
+
+/**
+ * 根据文件/文件夹的真实 MIME 类型生成专属标准直达链接：
+ * - 文件夹 (folder) -> https://drive.google.com/drive/folders/{id}
+ * - Google 表格 (spreadsheet) -> https://docs.google.com/spreadsheets/d/{id}/edit
+ * - Google 文档 (document) -> https://docs.google.com/document/d/{id}/edit
+ * - Google 幻灯片 (presentation) -> https://docs.google.com/presentation/d/{id}/edit
+ * - Google 表单 (form) -> https://docs.google.com/forms/d/{id}/edit
+ * - 其他文件 -> 优先使用非通用 webViewLink，否则生成 https://drive.google.com/file/d/{id}/view
+ */
+function formatDriveCanonicalLink(itemOrId, mimeType = '', webViewLink = '') {
+  let id = '';
+  let mime = mimeType;
+  let rawLink = webViewLink;
+  if (itemOrId && typeof itemOrId === 'object') {
+    id = String(itemOrId.id || itemOrId.fileId || '').trim();
+    mime = String(itemOrId.mimeType || mimeType || '').trim();
+    rawLink = String(itemOrId.webViewLink || webViewLink || '').trim();
+  } else {
+    id = String(itemOrId || '').trim();
+  }
+  if (!id) return rawLink || '';
+
+  const m = mime.toLowerCase();
+  if (m === 'application/vnd.google-apps.folder') {
+    return `https://drive.google.com/drive/folders/${id}`;
+  }
+  if (m === 'application/vnd.google-apps.spreadsheet') {
+    return `https://docs.google.com/spreadsheets/d/${id}/edit`;
+  }
+  if (m === 'application/vnd.google-apps.document') {
+    return `https://docs.google.com/document/d/${id}/edit`;
+  }
+  if (m === 'application/vnd.google-apps.presentation') {
+    return `https://docs.google.com/presentation/d/${id}/edit`;
+  }
+  if (m === 'application/vnd.google-apps.form') {
+    return `https://docs.google.com/forms/d/${id}/edit`;
+  }
+  if (m === 'application/vnd.google-apps.drawing') {
+    return `https://docs.google.com/drawings/d/${id}/edit`;
+  }
+  if (m === 'application/vnd.google-apps.script') {
+    return `https://script.google.com/d/${id}/edit`;
+  }
+  if (rawLink && /^https?:\/\//i.test(rawLink) && !rawLink.includes('drive.google.com/open?id=')) {
+    return rawLink;
+  }
+  return `https://drive.google.com/file/d/${id}/view`;
+}
+
+/**
+ * 为任意文件/文件夹集合（如指定文件夹递归扫描结果或全盘扫描结果）计算完整目录树层级信息：
+ * 返回 Map<id, {
+ *   depth, levelNumber, levelLabel,
+ *   folderPath, fullPath, treeDisplayName,
+ *   parentFolderId, parentFolderName, parentFolderLink,
+ *   rootFolderId, rootFolderName, rootFolderLink,
+ *   canonicalLink
+ * }>
+ */
+function buildDriveHierarchyInfo(items = []) {
+  const folderMap = new Map();
+  for (const it of items || []) {
+    if (it && it.id && it.mimeType === 'application/vnd.google-apps.folder') {
+      folderMap.set(it.id, it);
+    }
+  }
+
+  const hierarchyMap = new Map();
+  for (const it of items || []) {
+    if (!it || !it.id) continue;
+    const ancestors = [];
+    const visited = new Set([it.id]);
+    let cur = it;
+    while (cur) {
+      const pList = Array.isArray(cur.parents) ? cur.parents : [];
+      const parentFolder = pList.map(pid => folderMap.get(pid)).find(Boolean);
+      if (!parentFolder || visited.has(parentFolder.id)) break;
+      visited.add(parentFolder.id);
+      ancestors.unshift(parentFolder);
+      cur = parentFolder;
+    }
+
+    const depth = ancestors.length;
+    const levelNumber = depth + 1;
+    const levelLabel = `第 ${levelNumber} 层`;
+    const isFolder = it.mimeType === 'application/vnd.google-apps.folder';
+    const itemName = it.name || '(无名称)';
+
+    const folderPath =
+      ancestors.length > 0
+        ? ancestors.map(a => a.name || a.id).join(' / ')
+        : it.folderPath || (isFolder ? '顶层目录' : '根目录');
+    const fullPath =
+      ancestors.length > 0
+        ? [...ancestors.map(a => a.name || a.id), itemName].join(' / ')
+        : it.fullPath || itemName;
+    const treeDisplayName = `${'　'.repeat(depth)}${depth > 0 ? '├─ ' : ''}${itemName}`;
+
+    const immediateParent = ancestors.length > 0 ? ancestors[ancestors.length - 1] : null;
+    const rawParentId = (Array.isArray(it.parents) && it.parents[0]) || it.parentFolderId || '';
+    const parentFolderId = immediateParent ? immediateParent.id : rawParentId;
+    const isMyDriveRoot = parentFolderId === 'root' || /^0A[a-zA-Z0-9_-]+PVA$/.test(parentFolderId);
+    const parentFolderName = immediateParent
+      ? immediateParent.name || immediateParent.id
+      : isMyDriveRoot
+      ? '我的云端硬盘 (My Drive)'
+      : it.parentFolderName || (rawParentId ? '上级目录' : '根目录');
+    const parentFolderLink = isMyDriveRoot
+      ? 'https://drive.google.com/drive/my-drive'
+      : parentFolderId
+      ? `https://drive.google.com/drive/folders/${parentFolderId}`
+      : '';
+
+    const topAncestor = ancestors.length > 0 ? ancestors[0] : isFolder ? it : null;
+    const rootFolderId = topAncestor ? topAncestor.id : it.rootFolderId || '';
+    const rootFolderName = topAncestor
+      ? topAncestor.name || topAncestor.id
+      : it.rootFolderName || '根目录直属文件';
+    const rootFolderLink =
+      rootFolderId && rootFolderId !== '__root_loose__'
+        ? `https://drive.google.com/drive/folders/${rootFolderId}`
+        : '';
+
+    const canonicalLink = formatDriveCanonicalLink(it);
+
+    hierarchyMap.set(it.id, {
+      depth,
+      levelNumber,
+      levelLabel,
+      folderPath,
+      fullPath,
+      treeDisplayName,
+      parentFolderId,
+      parentFolderName,
+      parentFolderLink,
+      rootFolderId,
+      rootFolderName,
+      rootFolderLink,
+      canonicalLink
+    });
+  }
+
+  return hierarchyMap;
+}
+
+/**
+ * 将扫描出的文件/文件夹按目录树深度优先（DFS）顺序排列：
+ * 父文件夹 -> 内部子文件夹（递归展开）与内部文件，使导出的 CSV 打开即呈现清晰的树状目录结构
+ */
+function sortItemsByHierarchyTree(items = [], existingHierarchyMap = null) {
+  if (!Array.isArray(items) || items.length <= 1) return [...(items || [])];
+  const hMap = existingHierarchyMap || buildDriveHierarchyInfo(items);
+  const itemById = new Map(items.map(it => [it.id, it]));
+  const childrenByParent = new Map();
+  const rootItems = [];
+
+  for (const it of items) {
+    if (!it?.id) continue;
+    const pList = Array.isArray(it.parents) ? it.parents : [];
+    const parentInSet = pList.find(pid => pid !== it.id && itemById.has(pid));
+    if (parentInSet) {
+      if (!childrenByParent.has(parentInSet)) childrenByParent.set(parentInSet, []);
+      childrenByParent.get(parentInSet).push(it);
+    } else {
+      rootItems.push(it);
+    }
+  }
+
+  const compareSibling = (a, b) => {
+    const aFolder = a.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+    const bFolder = b.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+    if (aFolder !== bFolder) return aFolder - bFolder;
+    return String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN');
+  };
+
+  rootItems.sort(compareSibling);
+  for (const list of childrenByParent.values()) {
+    list.sort(compareSibling);
+  }
+
+  const ordered = [];
+  const visited = new Set();
+  function dfs(node) {
+    if (!node?.id || visited.has(node.id)) return;
+    visited.add(node.id);
+    ordered.push(node);
+    const kids = childrenByParent.get(node.id) || [];
+    for (const child of kids) {
+      dfs(child);
+    }
+  }
+
+  for (const r of rootItems) {
+    dfs(r);
+  }
+  for (const it of items) {
+    if (it?.id && !visited.has(it.id)) {
+      dfs(it);
+    }
+  }
+  return ordered;
 }
 
 /**
@@ -1169,7 +1375,8 @@ function compactSnapshotForStorage(snapshot, maxFiles = 0) {
     id: f.id,
     name: f.name,
     mimeType: f.mimeType,
-    webViewLink: f.webViewLink || '',
+    webViewLink: formatDriveCanonicalLink(f),
+    parents: Array.isArray(f.parents) ? f.parents : [],
     modifiedTime: f.modifiedTime || '',
     ownedByMe: Boolean(f.ownedByMe),
     shared: Boolean(f.shared),
@@ -2002,6 +2209,7 @@ async function enforceFilesByPolicy(fallbackToken, files, policy, fallbackOwnerE
 function normalizeScannedFileItem(file, accountEmail = '') {
   file.ownerAccount = normalizeEntry(accountEmail || file.owners?.[0]?.emailAddress || '');
   file.scannedByAccount = normalizeEntry(accountEmail || '');
+  file.webViewLink = formatDriveCanonicalLink(file);
   if (Array.isArray(file.permissions) && file.permissions.length > 0) {
     file.permissionsLoading = false;
     file.permissionError = '';
@@ -3338,6 +3546,7 @@ function enrichTransferItemsWithTree(items = []) {
   function resolveRootAndDepth(item) {
     if (rootCache.has(item.id)) return rootCache.get(item.id);
     const visited = new Set([item.id]);
+    const ancestors = [];
     let cur = item;
     let depth = 0;
     while (cur) {
@@ -3347,6 +3556,7 @@ function enrichTransferItemsWithTree(items = []) {
         break;
       }
       visited.add(parentFolder.id);
+      ancestors.unshift(parentFolder);
       cur = parentFolder;
       depth++;
     }
@@ -3359,7 +3569,46 @@ function enrichTransferItemsWithTree(items = []) {
         : cur !== item
         ? cur.name || '(顶层文件夹)'
         : '📄 根目录直属单文件';
-    const res = { isTopLevelFolder, depth, rootFolderId, rootFolderName };
+    const itemName = item.name || '(无名称)';
+    const folderPath =
+      ancestors.length > 0
+        ? ancestors.map(a => a.name || a.id).join(' / ')
+        : isFolder
+        ? '顶层目录'
+        : '根目录';
+    const fullPath =
+      ancestors.length > 0
+        ? [...ancestors.map(a => a.name || a.id), itemName].join(' / ')
+        : itemName;
+    const immediateParent = ancestors.length > 0 ? ancestors[ancestors.length - 1] : null;
+    const rawParentId = (Array.isArray(item.parents) && item.parents[0]) || '';
+    const parentFolderId = immediateParent ? immediateParent.id : rawParentId;
+    const parentFolderName = immediateParent
+      ? immediateParent.name || immediateParent.id
+      : rawParentId
+      ? '上级目录'
+      : '根目录';
+    const parentFolderLink = parentFolderId
+      ? `https://drive.google.com/drive/folders/${parentFolderId}`
+      : '';
+    const rootFolderLink =
+      rootFolderId && rootFolderId !== '__root_loose__'
+        ? `https://drive.google.com/drive/folders/${rootFolderId}`
+        : '';
+    const res = {
+      isTopLevelFolder,
+      depth,
+      levelLabel: `第 ${depth + 1} 层`,
+      folderPath,
+      fullPath,
+      treeDisplayName: `${'　'.repeat(depth)}${depth > 0 ? '├─ ' : ''}${itemName}`,
+      parentFolderId,
+      parentFolderName,
+      parentFolderLink,
+      rootFolderId,
+      rootFolderName,
+      rootFolderLink
+    };
     rootCache.set(item.id, res);
     return res;
   }
@@ -3368,8 +3617,17 @@ function enrichTransferItemsWithTree(items = []) {
     const info = resolveRootAndDepth(it);
     it.isTopLevelFolder = info.isTopLevelFolder;
     it.folderDepth = info.depth;
+    it.levelLabel = info.levelLabel;
+    it.folderPath = info.folderPath;
+    it.fullPath = info.fullPath;
+    it.treeDisplayName = info.treeDisplayName;
+    it.parentFolderId = info.parentFolderId;
+    it.parentFolderName = info.parentFolderName;
+    it.parentFolderLink = info.parentFolderLink;
     it.rootFolderId = info.rootFolderId;
     it.rootFolderName = info.rootFolderName;
+    it.rootFolderLink = info.rootFolderLink;
+    it.webViewLink = formatDriveCanonicalLink(it);
   }
 
   items.sort((a, b) => {
