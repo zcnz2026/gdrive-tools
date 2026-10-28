@@ -2019,10 +2019,10 @@ async function handleTransferRunLoop(retryFailedOnly = false, onlyRootFolderId =
   const isPersonalGmailTarget = /@(gmail|googlemail)\.com$/i.test(targetEmail);
 
   try {
-    // 【阶段 0：顶层大文件夹剪枝预热 + 开局自动挂入接收方『我的云端硬盘』根目录】
-    const topFoldersToPrep = todoIndices
-      .map(idx => items[idx])
-      .filter(it => it.isTopLevelFolder && (!it.targetPermissionId || (targetToken && !it._mountedToTargetRoot)));
+    // 【阶段 0：顶层大文件夹剪枝预热 + 开局自动挂入接收方『我的云端硬盘』根目录（全量检查 items 以防子文件单独发送 POST 触发 Google 垃圾内容误判）】
+    const topFoldersToPrep = items.filter(
+      it => it.isTopLevelFolder && (!it.targetPermissionId || (targetToken && !it._mountedToTargetRoot))
+    );
     if (topFoldersToPrep.length > 0 && typeof prepareTopLevelFoldersForTransfer === 'function') {
       $('progress').textContent = `🌳 正在预热 ${topFoldersToPrep.length} 个顶层大文件夹（级联赋予 writer 权限并自动挂入接收方『我的云端硬盘』）…`;
       const prepRes = await prepareTopLevelFoldersForTransfer({
@@ -2584,6 +2584,103 @@ async function handleTransferMoveToDestFolder(withOwnershipTransferFirst = false
     state.transferPauseRequested = false;
     if (moveBtn) moveBtn.disabled = false;
     if (ownMoveBtn) ownMoveBtn.disabled = false;
+    if (pauseBtn) pauseBtn.disabled = true;
+  }
+}
+
+async function handleTransferRestoreSpamAndTrash() {
+  if (state.transferRunning) {
+    toast('当前有正在运行的任务，请先暂停后再执行垃圾内容/回收站恢复');
+    return;
+  }
+
+  const sourceEmail = normalizeEntry($('transfer-source-select')?.value || state.transferState.sourceEmail || '');
+  const targetEmail = normalizeEntry(
+    $('transfer-target-email-input')?.value || $('transfer-target-select')?.value || state.transferState.targetEmail || ''
+  );
+  if (!targetEmail && !sourceEmail) {
+    toast('请先在上方选择或输入「接收邮箱」或「来源邮箱」');
+    return;
+  }
+
+  let targetToken = '';
+  let sourceToken = '';
+  if (targetEmail) {
+    try {
+      targetToken = await getValidTokenForAccount(targetEmail, false);
+    } catch (_e) {}
+  }
+  if (sourceEmail) {
+    try {
+      sourceToken = await getValidTokenForAccount(sourceEmail, false);
+    } catch (_e) {}
+  }
+  if (!targetToken && targetEmail) {
+    try {
+      targetToken = await getValidTokenForAccount(targetEmail, true);
+    } catch (_e) {}
+  }
+  if (!targetToken && !sourceToken) {
+    toast('请先在插件内授权接收邮箱或来源邮箱后再执行恢复');
+    return;
+  }
+
+  const rawDestText = ($('transfer-dest-folder-input')?.value || '').trim();
+  const parsedDestIds = rawDestText.toLowerCase() === 'root' ? ['root'] : parseDriveLinksInput(rawDestText);
+  const fallbackDestFolderId = parsedDestIds[0] || '';
+  const concurrency = Math.max(1, Math.min(16, Number($('transfer-concurrency-select')?.value) || 8));
+
+  const btn = $('transfer-restore-spam-trash-btn');
+  const pauseBtn = $('transfer-pause-btn');
+  if (btn) btn.disabled = true;
+  if (pauseBtn) pauseBtn.disabled = false;
+  state.transferRunning = true;
+  state.transferPauseRequested = false;
+
+  await appendTransferLog(
+    `🛡️ 开始扫描『回收站 (trashed=true)』与被 Google 误判归入『垃圾内容 (Spam)』而从正常列表隐身/剥离父目录的文档…`,
+    false
+  );
+
+  try {
+    const res = await scanAndRestoreSpamAndTrashItems({
+      targetToken,
+      sourceToken,
+      targetEmail,
+      sourceEmail,
+      transferItems: state.transferState?.items || [],
+      fallbackDestFolderId,
+      concurrency,
+      shouldStop: () => Boolean(state.transferPauseRequested),
+      onProgress(p) {
+        if (p?.message) $('progress').textContent = p.message;
+      },
+      onLog: msg => appendTransferLog(msg, false)
+    });
+
+    state.transferState = await saveOwnershipTransferState(state.transferState);
+    renderTransferWorkspace();
+
+    const spamWebNote =
+      res.failedCount > 0 || res.totalFound === 0
+        ? ' 💡 提示：若部分文件被 Google 强锁在网页端『垃圾内容 (Spam)』视图中，请点击右侧「🧹 网页『垃圾内容』全选解除」按钮，在打开的网页按 Ctrl+A 全选 -> 右键点击「不是垃圾内容」，切回本页面将自动把它们归位！'
+        : '';
+
+    await appendTransferLog(
+      `✅ 垃圾内容与回收站扫描恢复完成！共发现 ${res.totalFound} 项异常文件（🗑️ 回收站 ${res.trashedFound} 项 / 🛡️ 疑似垃圾内容隐身或脱钩 ${res.spamOrHiddenFound} 项）➔ 已通过 API 成功恢复回收站 ${res.restoredFromTrash} 项、解除隐身并重新挂回目录 ${res.rescuedFromSpamOrOrphan} 项（受限需网页解除 ${res.failedCount} 项）。${spamWebNote}`,
+      true
+    );
+    $('progress').textContent = `恢复完成：回收站恢复 ${res.restoredFromTrash} 项 · 隐身/垃圾内容找回 ${res.rescuedFromSpamOrOrphan} 项`;
+    toast(
+      `恢复完成：从回收站恢复 ${res.restoredFromTrash} 项，找回隐身/游离文件 ${res.rescuedFromSpamOrOrphan} 项！`
+    );
+  } catch (err) {
+    await appendTransferLog(`❌ 垃圾内容/回收站扫描恢复失败：${err.message}`, true);
+    toast(`恢复失败：${err.message}`);
+  } finally {
+    state.transferRunning = false;
+    state.transferPauseRequested = false;
+    if (btn) btn.disabled = false;
     if (pauseBtn) pauseBtn.disabled = true;
   }
 }
@@ -4256,9 +4353,11 @@ async function init() {
 
   $('transfer-accept-all-btn')?.addEventListener('click', handleTransferAcceptAll);
   $('transfer-mount-to-root-btn')?.addEventListener('click', handleTransferMountToRoot);
+  $('transfer-restore-spam-trash-btn')?.addEventListener('click', handleTransferRestoreSpamAndTrash);
   $('transfer-verify-compare-btn')?.addEventListener('click', handleTransferVerifyCompare);
 
   let pendingWebAcceptOpened = false;
+  let pendingWebSpamOpened = false;
   $('transfer-open-web-pending-btn')?.addEventListener('click', () => {
     pendingWebAcceptOpened = true;
     const url = 'https://drive.google.com/drive/search?q=pendingowner:me';
@@ -4271,11 +4370,30 @@ async function init() {
     toast('已打开待接受汇总页：在网页按 Ctrl+A 全选接受后，切回本页面将自动同步完成状态');
   });
 
+  $('transfer-open-web-spam-btn')?.addEventListener('click', () => {
+    pendingWebSpamOpened = true;
+    const url = 'https://drive.google.com/drive/spam';
+    try {
+      chrome.tabs.create({ url });
+    } catch (_e) {
+      window.open?.(url, '_blank');
+    }
+    appendTransferLog(
+      '🧹 已打开 Google Drive 网页端「垃圾内容 (drive.google.com/drive/spam)」文件夹：请在网页按 Ctrl+A 全选所有被误判的文件 -> 右键点击「不是垃圾内容 (Not spam)」；操作完切回本插件窗口时，将自动把恢复出来的文件重新归位回原文件夹！',
+      true
+    );
+    toast('已打开『垃圾内容』页：按 Ctrl+A 全选 -> 右键「不是垃圾内容」，切回本页将自动归位目录！');
+  });
+
   if (typeof window !== 'undefined' && window.addEventListener) {
     window.addEventListener('focus', () => {
       if (pendingWebAcceptOpened && !state.transferRunning && (state.transferState?.items || []).some(it => it.stage === 'pending_accept')) {
         pendingWebAcceptOpened = false;
         handleTransferVerifyCompare();
+      }
+      if (pendingWebSpamOpened && !state.transferRunning) {
+        pendingWebSpamOpened = false;
+        handleTransferMountToRoot();
       }
     });
   }

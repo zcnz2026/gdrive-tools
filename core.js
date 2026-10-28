@@ -4965,3 +4965,311 @@ async function moveTransferItemsToTargetFolder({
     totalProcessed: movedFolders + createdFolders + movedFiles + failedCount
   };
 }
+
+/**
+ * 扫描并一键恢复「回收站 (Trash, trashed=true)」与「疑似被 Google 误判归入『垃圾内容 (Spam)』而从正常列表隐身/剥离父目录」的文件夹和文件！
+ * 工作原理：
+ * 1. 双端扫描接收邮箱与来源邮箱的回收站 (q="trashed = true")，自动设置 trashed: false 恢复；
+ * 2. 将历史扫描记录 (transferItems + scanSnapshot) 与当前正常可见文件列表做差集比对，揪出被 Google Spam 过滤器隐藏或剥离了 parents 的文件；
+ * 3. 通过已知 fileId 强制调用 PATCH /files/{id}?addParents={原父文件夹或root} 并写入 { trashed: false }，将其拉回正常目录树！
+ */
+async function scanAndRestoreSpamAndTrashItems({
+  targetToken = '',
+  sourceToken = '',
+  targetEmail = '',
+  sourceEmail = '',
+  transferItems = [],
+  fallbackDestFolderId = '',
+  concurrency = 8,
+  shouldStop = null,
+  onProgress = null,
+  onLog = null
+}) {
+  const activeTokens = [...new Set([targetToken, sourceToken].filter(Boolean))];
+  if (!activeTokens.length) {
+    throw new Error('请先在上方选择并授权「接收邮箱」或「来源邮箱」后再执行垃圾内容/回收站扫描恢复');
+  }
+
+  const primaryToken = targetToken || sourceToken;
+  let targetRootId = 'root';
+  let sourceRootId = '';
+  if (targetToken) {
+    try {
+      const rm = await driveApi(targetToken, '/files/root?fields=id');
+      targetRootId = rm?.id || 'root';
+    } catch (_e) {}
+  }
+  if (sourceToken) {
+    try {
+      const srm = await driveApi(sourceToken, '/files/root?fields=id');
+      sourceRootId = srm?.id || '';
+    } catch (_e) {}
+  }
+
+  const isRootId = pid => !pid || pid === 'root' || pid === targetRootId || (sourceRootId && pid === sourceRootId);
+
+  // 1. 记录已知的原始父目录关系 (origParentMap)
+  const origParentMap = new Map();
+  const knownItemMap = new Map();
+  for (const it of transferItems || []) {
+    if (!it?.id) continue;
+    knownItemMap.set(it.id, it);
+    if (it.origParentId && !isRootId(it.origParentId)) {
+      origParentMap.set(it.id, it.origParentId);
+    } else if (Array.isArray(it.parents)) {
+      const p = it.parents.find(pid => !isRootId(pid));
+      if (p) origParentMap.set(it.id, p);
+    }
+  }
+  try {
+    const snap = await getSnapshot();
+    for (const sf of snap?.files || []) {
+      if (!sf?.id) continue;
+      if (!knownItemMap.has(sf.id)) knownItemMap.set(sf.id, sf);
+      if (!origParentMap.has(sf.id) && Array.isArray(sf.parents)) {
+        const p = sf.parents.find(pid => !isRootId(pid));
+        if (p) origParentMap.set(sf.id, p);
+      }
+    }
+  } catch (_eSnap) {}
+
+  // 2. 扫描双端「回收站 (trashed = true)」中的全部文件与文件夹
+  if (onProgress) {
+    onProgress({ message: '🗑️ 正在扫描『回收站 (trashed=true)』中的被删/被拦截文件…' });
+  }
+  const trashedItems = [];
+  const seenTrashedIds = new Set();
+  const trashFields = 'nextPageToken,files(id,name,mimeType,webViewLink,trashed,owners(emailAddress,displayName),parents)';
+
+  await Promise.all(
+    activeTokens.map(async tk => {
+      let pt = '';
+      do {
+        if (shouldStop && shouldStop()) break;
+        try {
+          const res = await driveApi(
+            tk,
+            `/files?pageSize=1000&supportsAllDrives=true&includeItemsFromAllDrives=true&q=${encodeURIComponent(
+              "trashed = true and mimeType != 'application/vnd.google-apps.shortcut'"
+            )}&fields=${encodeURIComponent(trashFields)}${pt ? `&pageToken=${encodeURIComponent(pt)}` : ''}`
+          );
+          for (const f of res?.files || []) {
+            if (f?.id && !seenTrashedIds.has(f.id)) {
+              seenTrashedIds.add(f.id);
+              trashedItems.push(f);
+            }
+          }
+          pt = res?.nextPageToken || '';
+        } catch (_e) {
+          pt = '';
+        }
+      } while (pt);
+    })
+  );
+
+  // 3. 快速扫描当前账号正常可见 (trashed = false) 的文件 ID 集合与有效文件夹集合，用于差集比对出「被 Google 塞进 Spam 垃圾内容而从正常列表消失」的文件
+  if (onProgress) {
+    onProgress({ message: `🔍 已发现回收站文件 ${trashedItems.length} 项，正在比对排查被归入『垃圾内容 (Spam)』的隐身文件…` });
+  }
+  const visibleIds = new Set();
+  const activeFolderIds = new Set();
+  const visibleFilesById = new Map();
+
+  if (targetToken) {
+    const baseQ = "trashed = false and 'me' in owners";
+    const shards = [
+      `${baseQ} and mimeType = 'application/vnd.google-apps.folder'`,
+      `${baseQ} and mimeType != 'application/vnd.google-apps.folder' and modifiedTime >= '2025-01-01T00:00:00'`,
+      `${baseQ} and mimeType != 'application/vnd.google-apps.folder' and modifiedTime >= '2023-01-01T00:00:00' and modifiedTime < '2025-01-01T00:00:00'`,
+      `${baseQ} and mimeType != 'application/vnd.google-apps.folder' and modifiedTime < '2023-01-01T00:00:00'`
+    ];
+    await Promise.all(
+      shards.map(async sq => {
+        let pt = '';
+        do {
+          if (shouldStop && shouldStop()) break;
+          try {
+            const res = await driveApi(
+              targetToken,
+              `/files?pageSize=1000&supportsAllDrives=true&includeItemsFromAllDrives=true&q=${encodeURIComponent(
+                sq
+              )}&fields=nextPageToken,files(id,name,mimeType,parents)${pt ? `&pageToken=${encodeURIComponent(pt)}` : ''}`
+            );
+            for (const f of res?.files || []) {
+              if (!f?.id) continue;
+              visibleIds.add(f.id);
+              visibleFilesById.set(f.id, f);
+              if (f.mimeType === 'application/vnd.google-apps.folder') {
+                activeFolderIds.add(f.id);
+              }
+            }
+            pt = res?.nextPageToken || '';
+          } catch (_e) {
+            pt = '';
+          }
+        } while (pt);
+      })
+    );
+  }
+
+  // 4. 筛选出「疑似被归入垃圾内容 (Spam) / 丢失父目录而隐身」的条目：
+  // 情况 A：在已知扫描列表 knownItemMap 中，但由于被 Google 塞进 Spam 文件夹，在正常 files.list 中消失（或者已转给接收方却不在 visibleIds 中）
+  // 情况 B：在 visibleFilesById 中，但 parents 为空或父目录不在 activeFolderIds 且不在 targetRootId（被 Spam 或跨号转移剥离了父目录）
+  const spamOrHiddenCandidates = [];
+  const queuedIds = new Set(seenTrashedIds);
+
+  for (const [id, knownIt] of knownItemMap.entries()) {
+    if (queuedIds.has(id)) continue;
+    const vFile = visibleFilesById.get(id);
+    if (!vFile) {
+      // 若接收方已接管或待接收（或只授权了单侧账号），但在正常列表不可见，极可能被 Google 归入了 Spam 垃圾内容！
+      if (!targetToken || knownIt.stage === 'completed' || knownIt.stage === 'pending_accept') {
+        spamOrHiddenCandidates.push(knownIt);
+        queuedIds.add(id);
+      }
+    } else {
+      const parents = Array.isArray(vFile.parents) ? vFile.parents : [];
+      const inRoot = parents.includes(targetRootId);
+      const inActiveFolder = parents.some(pid => activeFolderIds.has(pid));
+      if (!inRoot && !inActiveFolder) {
+        spamOrHiddenCandidates.push({
+          ...knownIt,
+          ...vFile
+        });
+        queuedIds.add(id);
+      }
+    }
+  }
+
+  // 补充：即使不在 knownItemMap 中，只要当前账号名下存在失去父目录挂载的游离项，也一并纳入恢复队列
+  for (const [id, vFile] of visibleFilesById.entries()) {
+    if (queuedIds.has(id)) continue;
+    const parents = Array.isArray(vFile.parents) ? vFile.parents : [];
+    const inRoot = parents.includes(targetRootId);
+    const inActiveFolder = parents.some(pid => activeFolderIds.has(pid));
+    if (!inRoot && !inActiveFolder) {
+      spamOrHiddenCandidates.push(vFile);
+      queuedIds.add(id);
+    }
+  }
+
+  const sortFoldersFirst = (a, b) => {
+    const af = a.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+    const bf = b.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+    return af - bf;
+  };
+  trashedItems.sort(sortFoldersFirst);
+  spamOrHiddenCandidates.sort(sortFoldersFirst);
+
+  const allRestoreTasks = [
+    ...trashedItems.map(item => ({ item, sourceType: 'trash' })),
+    ...spamOrHiddenCandidates.map(item => ({ item, sourceType: 'spam_or_orphan' }))
+  ];
+
+  const totalTasks = allRestoreTasks.length;
+  let restoredFromTrash = 0;
+  let rescuedFromSpamOrOrphan = 0;
+  let failedCount = 0;
+  let cursor = 0;
+
+  const cleanFallbackDest = String(fallbackDestFolderId || '').trim();
+
+  if (totalTasks > 0) {
+    if (onLog) {
+      await onLog(
+        `🛡️ 扫描发现：回收站文件 ${trashedItems.length} 项 + 疑似被判为『垃圾内容(Spam)』/游离隐身文件 ${spamOrHiddenCandidates.length} 项，开始 ${concurrency} 线程并发恢复…`
+      );
+    }
+
+    const workerCount = Math.min(Math.max(1, concurrency), totalTasks);
+    const workers = Array.from({ length: workerCount }, async (_, workerIdx) => {
+      if (workerIdx > 0) {
+        await new Promise(r => setTimeout(r, workerIdx * 55));
+      }
+      while (cursor < totalTasks) {
+        if (shouldStop && shouldStop()) break;
+        const idx = cursor++;
+        if (idx >= totalTasks) break;
+        const { item, sourceType } = allRestoreTasks[idx];
+
+        const origPid = origParentMap.get(item.id) || '';
+        const destParentId =
+          origPid && activeFolderIds.has(origPid)
+            ? origPid
+            : cleanFallbackDest || 'root';
+        const effectiveDest = destParentId === 'root' ? targetRootId : destParentId;
+        const curParents = Array.isArray(item.parents) ? item.parents.filter(Boolean) : [];
+        const rmList = curParents.filter(pid => pid !== destParentId && pid !== effectiveDest);
+        const rmQuery = rmList.length ? `&removeParents=${encodeURIComponent(rmList.join(','))}` : '';
+
+        let ok = false;
+        for (const tk of activeTokens) {
+          try {
+            try {
+              await driveApi(
+                tk,
+                `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(
+                  destParentId
+                )}${rmQuery}&supportsAllDrives=true&fields=id,trashed,parents`,
+                {
+                  method: 'PATCH',
+                  body: JSON.stringify({ trashed: false })
+                }
+              );
+            } catch (_eInner) {
+              await driveApi(
+                tk,
+                `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id,trashed,parents`,
+                {
+                  method: 'PATCH',
+                  body: JSON.stringify({ trashed: false, name: item.name || undefined })
+                }
+              );
+            }
+            ok = true;
+            if (item.mimeType === 'application/vnd.google-apps.folder') {
+              activeFolderIds.add(item.id);
+            }
+            break;
+          } catch (_errTk) {
+            // try next token
+          }
+        }
+
+        if (ok) {
+          if (sourceType === 'trash') restoredFromTrash++;
+          else rescuedFromSpamOrOrphan++;
+          const tfItem = knownItemMap.get(item.id);
+          if (tfItem) {
+            tfItem.statusText =
+              sourceType === 'trash'
+                ? '♻️ 已从回收站恢复并归位'
+                : '🛡️ 已解除垃圾隐身并恢复归位';
+            tfItem.updatedAt = new Date().toISOString();
+          }
+        } else {
+          failedCount++;
+        }
+
+        const done = restoredFromTrash + rescuedFromSpamOrOrphan + failedCount;
+        if (onProgress && (done % 5 === 0 || done === totalTasks)) {
+          onProgress({
+            done,
+            total: totalTasks,
+            message: `🛡️ 正在恢复垃圾内容与回收站文件 (${done}/${totalTasks})：已恢复回收站 ${restoredFromTrash} 项 · 找回隐身/游离文件 ${rescuedFromSpamOrOrphan} 项…`
+          });
+        }
+      }
+    });
+    await Promise.all(workers);
+  }
+
+  return {
+    trashedFound: trashedItems.length,
+    spamOrHiddenFound: spamOrHiddenCandidates.length,
+    restoredFromTrash,
+    rescuedFromSpamOrOrphan,
+    failedCount,
+    totalFound: totalTasks
+  };
+}
