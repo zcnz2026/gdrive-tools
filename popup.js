@@ -18,6 +18,8 @@ const state = {
   selectedTypeCats: new Set(ALL_TYPE_CATS), // 默认全选所有文件类型
   selectedBatchGroups: new Set(),
   expandedPermFileIds: new Set(), // 记录哪些文件展开了完整权限明细（默认全部收起为单行统计）
+  inspectedFileId: '',
+  rightPaneCollapsed: false,
   coreNameFilter: '',
   scanSheet: null,
   scanSheetFileIds: [],
@@ -61,6 +63,28 @@ function escapeHtml(value = '') {
   }[c]));
 }
 
+function sanitizeExternalUrl(url = '') {
+  if (!url) return '#';
+  try {
+    const parsed = new URL(String(url).trim());
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+      return parsed.toString();
+    }
+  } catch (_e) {
+    // reject invalid or non-http(s) URLs such as javascript: or data:
+  }
+  return '#';
+}
+
+function escapeCsvCell(value = '') {
+  let str = String(value ?? '');
+  // 防御电子表格公式注入（CSV / DDE Injection，CWE-1236）
+  if (/^[=+\-@\t\r]/.test(str)) {
+    str = `'${str}`;
+  }
+  return `"${str.replaceAll('"', '""')}"`;
+}
+
 function formatTime(iso = '') {
   if (!iso) return '尚未扫描';
   const d = new Date(iso);
@@ -73,6 +97,64 @@ function setStatus(text, ok = false) {
   if (!node) return;
   node.textContent = text;
   node.classList.toggle('ok', ok);
+}
+
+function setRightPaneCollapsed(collapsed) {
+  state.rightPaneCollapsed = Boolean(collapsed);
+  const ws = $('main-split-workspace');
+  if (ws) ws.classList.toggle('right-collapsed', state.rightPaneCollapsed);
+  const btn = $('toggle-right-pane-btn');
+  if (btn) {
+    btn.textContent = state.rightPaneCollapsed ? '展开侧栏 ◂' : '收起侧栏 ▸';
+  }
+}
+
+let activeDryRunResolve = null;
+
+function closeDryRunModal(confirmed = false) {
+  const modal = $('dry-run-modal');
+  if (modal) modal.classList.add('hidden');
+  if (activeDryRunResolve) {
+    const fn = activeDryRunResolve;
+    activeDryRunResolve = null;
+    fn(Boolean(confirmed));
+  }
+}
+
+function confirmWithDryRunModal({ title = '批量权限变更预演确认', summaryHtml = '', previewItems = [], confirmText = '确认执行变更', isDanger = false, fallbackText = '' }) {
+  const modal = $('dry-run-modal');
+  if (!modal) {
+    return Promise.resolve(confirm(fallbackText || title));
+  }
+  $('dry-run-title').textContent = title;
+  $('dry-run-summary').innerHTML = summaryHtml;
+  const body = $('dry-run-body');
+  if (!previewItems.length) {
+    body.innerHTML = `<div class="muted">即将按上述范围执行变更</div>`;
+  } else {
+    const shown = previewItems.slice(0, 80);
+    body.innerHTML =
+      shown
+        .map(
+          it => `<div class="dry-run-item">
+            <strong>${escapeHtml(it.title || '')}</strong>
+            <div>${escapeHtml(it.detail || '')}</div>
+          </div>`
+        )
+        .join('') +
+      (previewItems.length > shown.length
+        ? `<div class="muted" style="text-align:center;padding:4px;">… 及另外 ${previewItems.length - shown.length} 项</div>`
+        : '');
+  }
+  const confirmBtn = $('dry-run-confirm-btn');
+  if (confirmBtn) {
+    confirmBtn.textContent = confirmText;
+    confirmBtn.className = isDanger ? 'btn danger' : 'btn primary';
+  }
+  modal.classList.remove('hidden');
+  return new Promise(resolve => {
+    activeDryRunResolve = resolve;
+  });
 }
 
 async function resolveTokenForFile(file, interactive = true) {
@@ -226,6 +308,132 @@ async function handleAuthorizeWithClient(client, prefixLabel = '', loginHint = '
   }
 }
 
+function requestPassportPasswordModal({ mode = 'encrypt', title = '', description = '', submitLabel = '', onVerify }) {
+  return new Promise(resolve => {
+    const modal = $('passport-pwd-modal');
+    const titleEl = $('passport-pwd-title');
+    const descEl = $('passport-pwd-desc');
+    const labelEl = $('passport-pwd-label');
+    const inputEl = $('passport-pwd-input');
+    const confirmGroupEl = $('passport-pwd-confirm-group');
+    const confirmInputEl = $('passport-pwd-confirm-input');
+    const toggleBtn = $('passport-pwd-toggle-btn');
+    const errorEl = $('passport-pwd-error');
+    const submitBtn = $('passport-pwd-submit-btn');
+    const cancelBtn = $('passport-pwd-cancel-btn');
+    const closeBtn = $('passport-pwd-close-btn');
+
+    const isEncrypt = mode === 'encrypt';
+    titleEl.textContent = title || (isEncrypt ? '设置通行证加密主密码' : '输入通行证解密主密码');
+    descEl.textContent =
+      description ||
+      (isEncrypt
+        ? '导出文件将使用 PBKDF2-SHA256 + AES-256-GCM 强加密保护 Refresh Token 与私钥，请牢记此密码（遗忘无法找回）。'
+        : '检测到该免登录通行证受主密码加密保护，请输入导出时设置的主密码。');
+    labelEl.textContent = isEncrypt ? `设置主密码（至少 ${PASSPORT_MIN_PASSWORD_LENGTH} 位）` : '通行证主密码';
+    inputEl.type = 'password';
+    inputEl.value = '';
+    confirmInputEl.type = 'password';
+    confirmInputEl.value = '';
+    toggleBtn.textContent = '显示密码';
+    confirmGroupEl.classList.toggle('hidden', !isEncrypt);
+    errorEl.textContent = '';
+    errorEl.classList.add('hidden');
+    submitBtn.disabled = false;
+    submitBtn.textContent = submitLabel || (isEncrypt ? '确认加密并导出' : '解密并导入');
+
+    let busy = false;
+    const showError = msg => {
+      errorEl.textContent = msg;
+      errorEl.classList.remove('hidden');
+    };
+
+    const cleanupAndClose = result => {
+      inputEl.value = '';
+      confirmInputEl.value = '';
+      inputEl.type = 'password';
+      confirmInputEl.type = 'password';
+      modal.classList.add('hidden');
+      submitBtn.removeEventListener('click', handleSubmit);
+      cancelBtn.removeEventListener('click', handleCancel);
+      closeBtn.removeEventListener('click', handleCancel);
+      toggleBtn.removeEventListener('click', handleToggleVisibility);
+      modal.removeEventListener('keydown', handleKeydown);
+      resolve(result);
+    };
+
+    const handleCancel = () => {
+      if (busy) return;
+      cleanupAndClose(null);
+    };
+
+    const handleToggleVisibility = () => {
+      const nextType = inputEl.type === 'password' ? 'text' : 'password';
+      inputEl.type = nextType;
+      confirmInputEl.type = nextType;
+      toggleBtn.textContent = nextType === 'password' ? '显示密码' : '隐藏密码';
+      inputEl.focus();
+    };
+
+    const handleSubmit = async () => {
+      if (busy) return;
+      errorEl.classList.add('hidden');
+      const pwd = inputEl.value;
+      if (!pwd) {
+        showError('请输入主密码');
+        inputEl.focus();
+        return;
+      }
+      if (isEncrypt) {
+        if (pwd.length < PASSPORT_MIN_PASSWORD_LENGTH) {
+          showError(`主密码长度不能少于 ${PASSPORT_MIN_PASSWORD_LENGTH} 位`);
+          inputEl.focus();
+          return;
+        }
+        if (pwd !== confirmInputEl.value) {
+          showError('两次输入的主密码不一致，请重新核对');
+          confirmInputEl.focus();
+          return;
+        }
+      }
+
+      busy = true;
+      submitBtn.disabled = true;
+      const origLabel = submitBtn.textContent;
+      submitBtn.textContent = isEncrypt ? '正在加密…' : '正在解密…';
+      try {
+        const verifiedResult = onVerify ? await onVerify(pwd) : pwd;
+        cleanupAndClose(verifiedResult);
+      } catch (err) {
+        busy = false;
+        submitBtn.disabled = false;
+        submitBtn.textContent = origLabel;
+        showError(err?.message || '操作失败，请检查主密码是否正确');
+        inputEl.select();
+      }
+    };
+
+    const handleKeydown = e => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        handleCancel();
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        handleSubmit();
+      }
+    };
+
+    submitBtn.addEventListener('click', handleSubmit);
+    cancelBtn.addEventListener('click', handleCancel);
+    closeBtn.addEventListener('click', handleCancel);
+    toggleBtn.addEventListener('click', handleToggleVisibility);
+    modal.addEventListener('keydown', handleKeydown);
+
+    modal.classList.remove('hidden');
+    setTimeout(() => inputEl.focus(), 20);
+  });
+}
+
 async function handleOAuthFilesUpload(fileList) {
   const files = [...fileList];
   if (!files.length) return;
@@ -234,16 +442,41 @@ async function handleOAuthFilesUpload(fileList) {
   let allowlistImported = false;
   let passportAccountCount = 0;
   let passportRestoredTransfer = 0;
+  let legacyPlaintextPassportCount = 0;
+  let cancelledCount = 0;
 
   for (const file of files) {
     try {
-      const parsed = JSON.parse(await file.text());
-      // 1. 优先识别「已授权免登录通行证 JSON」或含 refresh_token 的 token.json
+      let parsed = JSON.parse(await file.text());
+      let wasEncryptedPassport = false;
+
+      // 0. 检测是否为主密码加密的 v2 免登录通行证 JSON
+      if (isEncryptedPassportBundle(parsed)) {
+        const decryptedObj = await requestPassportPasswordModal({
+          mode: 'decrypt',
+          title: '解密免登录通行证',
+          description: `文件「${file.name}」受主密码加密保护，请输入导出时设置的主密码以解密导入：`,
+          submitLabel: '解密并导入',
+          onVerify: pwd => decryptAuthorizedPassportBundle(parsed, pwd)
+        });
+        if (!decryptedObj) {
+          cancelledCount++;
+          toast(`已取消解密文件：${file.name}`);
+          continue;
+        }
+        parsed = decryptedObj;
+        wasEncryptedPassport = true;
+      }
+
+      // 1. 识别「已授权免登录通行证 JSON」（解密后的 v2 或兼容旧版明文 v1 / token.json）
       const passportRes = await importAuthorizedPassportFromObject(parsed);
       if (passportRes.imported) {
+        if (!wasEncryptedPassport) {
+          legacyPlaintextPassportCount++;
+        }
         passportAccountCount += passportRes.accountCount;
         passportRestoredTransfer += passportRes.restoredTransferCount;
-        if (parsed.policy || parsed.groups || parsed.contacts) {
+        if (parsed.policy || parsed.directory || parsed.groups || parsed.contacts) {
           await importAllowlistFromObject(parsed);
         }
         continue;
@@ -268,8 +501,10 @@ async function handleOAuthFilesUpload(fileList) {
     state.transferState = await getOwnershipTransferState();
     renderAll();
     const tfMsg = passportRestoredTransfer > 0 ? `，并恢复 ${passportRestoredTransfer} 条全盘转移断点进度` : '';
-    $('progress').textContent = `已免登录导入 ${passportAccountCount} 个已授权账号${tfMsg}（无需浏览器登录，可直接操作）`;
-    toast(`✅ 已成功导入 ${passportAccountCount} 个免登录授权账号${tfMsg}！`);
+    const legacyTip =
+      legacyPlaintextPassportCount > 0 ? '（检测到旧版明文通行证，建议重新导出生成加密版备份并销毁旧明文文件）' : '';
+    $('progress').textContent = `已免登录导入 ${passportAccountCount} 个已授权账号${tfMsg}${legacyTip}`;
+    toast(`✅ 已成功导入 ${passportAccountCount} 个免登录授权账号${tfMsg}！${legacyTip}`);
   }
 
   if (extractedClients.length > 0) {
@@ -283,7 +518,7 @@ async function handleOAuthFilesUpload(fileList) {
       if (acc) successCount++;
     }
     $('progress').textContent = `已完成 ${successCount}/${extractedClients.length} 个凭证授权（当前共 ${state.accounts.length} 个已授权账号）。`;
-  } else if (!allowlistImported && passportAccountCount === 0) {
+  } else if (!allowlistImported && passportAccountCount === 0 && cancelledCount === 0) {
     toast('未识别到有效的 Google OAuth 凭证或免登录授权文件');
   }
 }
@@ -294,19 +529,34 @@ async function exportAuthorizedPassportJson(onlyEmail = '', includeTransferState
     toast('当前还没有已授权的账号可导出，请先完成账号授权');
     return;
   }
-  const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
+
+  const targetDesc = onlyEmail
+    ? `即将使用 PBKDF2 + AES-256-GCM 加密导出账号「${onlyEmail}」的免登录通行证，请设置至少 ${PASSPORT_MIN_PASSWORD_LENGTH} 位主密码：`
+    : `即将使用 PBKDF2 + AES-256-GCM 加密导出全部 ${bundle.authorizedAccounts.length} 个已授权账号的免登录通行证，请设置至少 ${PASSPORT_MIN_PASSWORD_LENGTH} 位主密码：`;
+
+  const encryptedEnvelope = await requestPassportPasswordModal({
+    mode: 'encrypt',
+    title: '加密导出免登录通行证',
+    description: targetDesc,
+    submitLabel: '确认加密并导出',
+    onVerify: pwd => encryptAuthorizedPassportBundle(bundle, pwd)
+  });
+
+  if (!encryptedEnvelope) return;
+
+  const blob = new Blob([JSON.stringify(encryptedEnvelope, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
   const dateStr = new Date().toISOString().slice(0, 10);
   const suffix = onlyEmail ? `-${onlyEmail.split('@')[0]}` : `-all-${bundle.authorizedAccounts.length}accounts`;
-  a.download = `drive-auth-passport${suffix}-${dateStr}.json`;
+  a.download = `drive-auth-passport${suffix}-${dateStr}-encrypted.json`;
   a.click();
   URL.revokeObjectURL(url);
   toast(
     onlyEmail
-      ? `💾 已导出账号 ${onlyEmail} 的免登录授权文件（复制到其他电脑导入即可直接用）`
-      : `💾 已导出全部 ${bundle.authorizedAccounts.length} 个已授权账号的免登录通行证 JSON（复制到其他电脑导入即可免登录直接使用）`
+      ? `🔒 已加密导出账号 ${onlyEmail} 的免登录通行证（导入时需输入刚才设置的主密码）`
+      : `🔒 已加密导出全部 ${bundle.authorizedAccounts.length} 个账号的免登录通行证 JSON（导入时需输入主密码解锁）`
   );
 }
 
@@ -617,6 +867,10 @@ function initSpreadsheets() {
       allowInsertColumn: false,
       allowDeleteRow: false,
       allowDeleteColumn: false,
+      parseFormulas: false,
+      autoCasting: false,
+      stripHTML: true,
+      stripHTMLOnCopy: true,
       columnSorting: true,
       onchange(instance, cell, x, y, value) {
         if (state.isUpdatingScanSheet) return;
@@ -639,6 +893,20 @@ function initSpreadsheets() {
         } else if (col === 5 && value) {
           handleScanSheetPublicChange(fileId, row, value);
         }
+      },
+      onselection(instance, x1, y1) {
+        if (state.isUpdatingScanSheet) return;
+        const row = Number(y1);
+        const fileId = state.scanSheetFileIds[row];
+        if (!fileId) return;
+        state.inspectedFileId = fileId;
+        if (state.rightPaneCollapsed) {
+          setRightPaneCollapsed(false);
+        }
+        if (state.activeTab !== 'ops') {
+          switchTab('ops');
+        }
+        renderFileInspector();
       }
     });
   }
@@ -667,6 +935,10 @@ function initSpreadsheets() {
       tableHeight: '100%',
       allowInsertColumn: false,
       allowDeleteColumn: false,
+      parseFormulas: false,
+      autoCasting: false,
+      stripHTML: true,
+      stripHTMLOnCopy: true,
       onchange(instance, cell, x, y, value) {
         if (state.isUpdatingBatchSheet) return;
         const col = Number(x);
@@ -726,7 +998,11 @@ function initSpreadsheets() {
       allowInsertRow: false,
       allowInsertColumn: false,
       allowDeleteRow: false,
-      allowDeleteColumn: false
+      allowDeleteColumn: false,
+      parseFormulas: false,
+      autoCasting: false,
+      stripHTML: true,
+      stripHTMLOnCopy: true
     });
   }
 }
@@ -1080,6 +1356,119 @@ function syncInputsToBatchSheet() {
   syncBatchSheetToInputs();
 }
 
+function renderFileInspector() {
+  const card = $('file-inspector-card');
+  if (!card) return;
+  const file = state.files.find(f => f.id === state.inspectedFileId);
+  if (!file) {
+    card.classList.add('hidden');
+    return;
+  }
+
+  card.classList.remove('hidden');
+  const ownerEmail = file.ownerAccount || file.owners?.[0]?.emailAddress || '';
+  const typeLabel = fileCategoryLabel(file.mimeType, file.name);
+  const canonicalLink = formatDriveCanonicalLink(file);
+  const evalStat = evaluateFile(file, state.policy, ownerEmail);
+
+  $('inspector-file-type').textContent = typeLabel;
+  $('inspector-file-name').textContent = file.name || '(未命名文件)';
+  $('inspector-file-name').title = file.name || '';
+  const openLinkEl = $('inspector-open-link');
+  if (openLinkEl) {
+    openLinkEl.href = sanitizeExternalUrl(canonicalLink);
+  }
+
+  // 合规状态与快捷修正按钮
+  const statusPillHtml = evalStat.hasActionableViolation
+    ? `<span class="status-pill danger">存在违规 (${evalStat.removeCount} 移除 / ${evalStat.downgradeCount} 降级)</span>
+       <button type="button" class="btn warning btn-xs" data-action="inspector-enforce-file" data-file-id="${escapeHtml(file.id)}">一键修正此文件</button>`
+    : `<span class="status-pill ok">符合白名单策略</span>`;
+
+  $('inspector-meta-bar').innerHTML = `
+    <span>所属账号：<strong>${escapeHtml(ownerEmail || '未知')}</strong></span>
+    <span class="row-flex">${statusPillHtml}</span>
+  `;
+
+  // 分组覆盖率与一键补齐按钮
+  const coverages = getFileGroupCoverage(file, state.directory);
+  const covBox = $('inspector-group-coverage');
+  if (!coverages.length) {
+    covBox.innerHTML = '';
+  } else {
+    covBox.innerHTML = coverages
+      .map(c => {
+        const isPartial = c.status === 'partial';
+        const completeBtn = isPartial
+          ? `<button type="button" class="btn-text" data-action="inspector-complete-group" data-file-id="${escapeHtml(file.id)}" data-group="${escapeHtml(c.groupName)}" title="为该文件补齐此组缺失成员的权限">+补齐</button>`
+          : '';
+        return `<span class="group-cov-badge ${isPartial ? 'partial' : ''}">
+          <span>${escapeHtml(c.groupName)}: ${c.grantedCount}/${c.totalCount}人</span>
+          ${completeBtn}
+        </span>`;
+      })
+      .join('');
+  }
+
+  // 协作者列表渲染
+  const contactLookup = buildContactLookup(state.directory);
+  const perms = file.permissions || [];
+  const listNode = $('inspector-perm-list');
+  if (!perms.length) {
+    listNode.innerHTML = `<div class="muted" style="padding:6px 0;">仅所有者自己可见，暂无其他协作者或公开链接</div>`;
+    return;
+  }
+
+  listNode.innerHTML = perms
+    .map(p => {
+      const ev = evaluatePermission(p, state.policy, ownerEmail);
+      const isOwner = p.role === 'owner' || normalizeEntry(p.emailAddress || '') === normalizeEntry(ownerEmail);
+      const inherited = permIsInherited(p);
+      let labelText = permissionLabel(p, contactLookup);
+      if (p.type === 'anyone') labelText = '公开链接 (知道链接的任何人)';
+      else if (p.type === 'domain') labelText = `域内共享 (@${p.domain || ''})`;
+
+      if (isOwner) {
+        return `<div class="inspector-perm-row">
+          <div class="inspector-perm-info" title="${escapeHtml(labelText)}">
+            <strong>${escapeHtml(labelText)}</strong>
+          </div>
+          <span class="badge">所有者</span>
+        </div>`;
+      }
+
+      if (inherited) {
+        return `<div class="inspector-perm-row">
+          <div class="inspector-perm-info" title="${escapeHtml(labelText)}">
+            <span>${escapeHtml(labelText)}</span>
+            <span class="muted"> (${escapeHtml(roleLabel(p.role))} · 继承自上级目录)</span>
+          </div>
+          <span class="badge">继承</span>
+        </div>`;
+      }
+
+      const roleSelectHtml = `
+        <select class="perm-select" data-action="inspector-role-change" data-file-id="${escapeHtml(file.id)}" data-perm-id="${escapeHtml(p.id)}">
+          <option value="writer" ${p.role === 'writer' || p.role === 'organizer' || p.role === 'fileOrganizer' ? 'selected' : ''}>可编辑</option>
+          <option value="commenter" ${p.role === 'commenter' ? 'selected' : ''}>可评论</option>
+          <option value="reader" ${p.role === 'reader' ? 'selected' : ''}>仅查看</option>
+        </select>
+      `;
+
+      return `<div class="inspector-perm-row ${escapeHtml(ev.status)}">
+        <div class="inspector-perm-info" title="${escapeHtml(labelText)} (${escapeHtml(ev.reason)})">
+          <strong>${escapeHtml(labelText)}</strong>
+          ${ev.status !== 'compliant' ? `<span class="muted"> · ${escapeHtml(ev.reason)}</span>` : ''}
+        </div>
+        <div class="row-flex" style="flex-shrink:0;">
+          ${roleSelectHtml}
+          <button type="button" class="btn danger btn-xs" data-action="inspector-remove-perm" data-file-id="${escapeHtml(file.id)}" data-perm-id="${escapeHtml(p.id)}">移除</button>
+        </div>
+      </div>`;
+    })
+    .join('');
+}
+
 function renderFilesTab() {
   const filtered = getFilteredFiles();
 
@@ -1087,6 +1476,9 @@ function renderFilesTab() {
   const validIds = new Set(state.files.map(f => f.id));
   for (const id of [...state.selectedFileIds]) {
     if (!validIds.has(id)) state.selectedFileIds.delete(id);
+  }
+  if (state.inspectedFileId && !validIds.has(state.inspectedFileId)) {
+    state.inspectedFileId = '';
   }
 
   const curStatusFilter = $('file-status-filter')?.value || 'all';
@@ -1103,6 +1495,7 @@ function renderFilesTab() {
 
   updateBatchButtons();
   renderScanSpreadsheet(filtered);
+  renderFileInspector();
 }
 
 function updateBatchButtons() {
@@ -1432,12 +1825,29 @@ function renderPolicyTab() {
   $('policy-public-rule').value = state.policy.publicLinkRule || 'forbid';
 }
 
+function isLogRestorable(log) {
+  return Boolean(
+    log &&
+      !log.restored &&
+      (log.actionType === 'revoke' || log.actionType === 'downgrade') &&
+      log.fileId &&
+      (log.targetEmail || log.domain || log.targetType === 'anyone')
+  );
+}
+
 function renderLogsTab() {
   const filterVal = $('log-filter')?.value || 'all';
   const filtered = state.logs.filter(item => {
     if (filterVal === 'all') return true;
     return item.source === filterVal;
   });
+
+  const restorableLogs = filtered.filter(isLogRestorable);
+  const batchRestoreBtn = $('batch-restore-logs-btn');
+  if (batchRestoreBtn) {
+    batchRestoreBtn.textContent = `批量回滚 (${restorableLogs.length})`;
+    batchRestoreBtn.disabled = restorableLogs.length === 0;
+  }
 
   const tbody = $('log-rows');
   if (!filtered.length) {
@@ -1448,11 +1858,7 @@ function renderLogsTab() {
   tbody.innerHTML = filtered
     .slice(0, 150)
     .map(log => {
-      const canRestore =
-        !log.restored &&
-        (log.actionType === 'revoke' || log.actionType === 'downgrade') &&
-        log.fileId &&
-        (log.targetEmail || log.domain || log.targetType === 'anyone');
+      const canRestore = isLogRestorable(log);
 
       const actionHtml = log.restored
         ? '<span class="muted">已回滚</span>'
@@ -1477,6 +1883,9 @@ function renderLogsTab() {
 
 function switchTab(tabName) {
   state.activeTab = tabName;
+  if (state.rightPaneCollapsed) {
+    setRightPaneCollapsed(false);
+  }
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.tab === tabName);
   });
@@ -2745,7 +3154,7 @@ function exportTransferCsv() {
     ]);
   }
   const csvContent = rows
-    .map(r => r.map(c => `"${String(c ?? '').replaceAll('"', '""')}"`).join(','))
+    .map(r => r.map(c => escapeCsvCell(c)).join(','))
     .join('\n');
   const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
@@ -2763,22 +3172,25 @@ async function importAllowlistFromObject(parsed) {
       writers: [...state.policy.writers, ...parsed.map(normalizeEntry)]
     });
   } else if (typeof parsed === 'object') {
+    const policySrc = parsed.policy && typeof parsed.policy === 'object' ? parsed.policy : parsed;
+    const dirSrc = parsed.directory && typeof parsed.directory === 'object' ? parsed.directory : parsed;
+
     const nextWriters = [...state.policy.writers];
     const nextReaders = [...state.policy.readers];
-    if (Array.isArray(parsed.writers)) nextWriters.push(...parsed.writers.map(normalizeEntry));
-    if (Array.isArray(parsed.allowList)) nextWriters.push(...parsed.allowList.map(normalizeEntry));
-    if (Array.isArray(parsed.readers)) nextReaders.push(...parsed.readers.map(normalizeEntry));
+    if (Array.isArray(policySrc.writers)) nextWriters.push(...policySrc.writers.map(normalizeEntry));
+    if (Array.isArray(policySrc.allowList)) nextWriters.push(...policySrc.allowList.map(normalizeEntry));
+    if (Array.isArray(policySrc.readers)) nextReaders.push(...policySrc.readers.map(normalizeEntry));
 
     state.policy = await savePolicy({
       writers: nextWriters,
       readers: nextReaders,
-      publicLinkRule: parsed.publicLinkRule || state.policy.publicLinkRule
+      publicLinkRule: policySrc.publicLinkRule || state.policy.publicLinkRule
     });
 
-    if (Array.isArray(parsed.groups) || Array.isArray(parsed.contacts)) {
+    if (Array.isArray(dirSrc.groups) || Array.isArray(dirSrc.contacts)) {
       state.directory = await saveDirectory({
-        groups: parsed.groups || state.directory.groups,
-        contacts: parsed.contacts || state.directory.contacts
+        groups: dirSrc.groups || state.directory.groups,
+        contacts: dirSrc.contacts || state.directory.contacts
       });
     }
   }
@@ -2893,19 +3305,38 @@ async function handleEnforceFiles(targetFiles) {
 
   let rmTotal = 0;
   let downTotal = 0;
+  const previewItems = [];
+  const contactLookup = buildContactLookup(state.directory);
+
   for (const f of actionable) {
-    const st = evaluateFile(f, state.policy, f.ownerAccount);
+    const owner = f.ownerAccount || f.owners?.[0]?.emailAddress || '';
+    const st = evaluateFile(f, state.policy, owner);
     rmTotal += st.removeCount;
     downTotal += st.downgradeCount;
+    const actions = [];
+    for (const p of f.permissions || []) {
+      const ev = evaluatePermission(p, state.policy, owner);
+      if (ev.status === 'violation_remove') {
+        actions.push(`移除 ${permissionLabel(p, contactLookup)}`);
+      } else if (ev.status === 'violation_downgrade') {
+        actions.push(`降级 ${permissionLabel(p, contactLookup)} 为只读`);
+      }
+    }
+    previewItems.push({
+      title: `${f.name || f.id} (${owner || '默认账号'})`,
+      detail: actions.join('；') || `移除 ${st.removeCount} 项，降级 ${st.downgradeCount} 项`
+    });
   }
 
-  if (
-    !confirm(
-      `确认对 ${actionable.length} 个文件按白名单修正？\n• 移除非白名单权限：${rmTotal} 项\n• 越权编辑降为只读：${downTotal} 项`
-    )
-  ) {
-    return;
-  }
+  const confirmed = await confirmWithDryRunModal({
+    title: '白名单合规修正预演确认',
+    summaryHtml: `即将对 <strong>${actionable.length}</strong> 个文件执行白名单修正：预计移除非白名单权限 <strong style="color:var(--danger-solid);">${rmTotal}</strong> 项，将越权编辑降为只读 <strong style="color:var(--warning-solid);">${downTotal}</strong> 项。`,
+    previewItems,
+    confirmText: `确认修正 (${actionable.length} 个文件)`,
+    isDanger: rmTotal > 0,
+    fallbackText: `确认对 ${actionable.length} 个文件按白名单修正？\n• 移除非白名单权限：${rmTotal} 项\n• 越权编辑降为只读：${downTotal} 项`
+  });
+  if (!confirmed) return;
 
   $('progress').textContent = '正在执行白名单合规修正…';
   try {
@@ -2938,9 +3369,23 @@ async function handleGroupBatchOperation(mode) {
       ? '仅保留所选分组（移除组外人员）'
       : '移除所选分组权限';
 
-  if (!confirm(`确认对已勾选的 ${targetFiles.length} 个文件执行「${modeTitle}」？\n目标分组：${groupNames.join('、')}`)) {
-    return;
-  }
+  const groupMembers = (state.directory.contacts || []).filter(c =>
+    (c.groups || []).some(g => groupNames.includes(g))
+  );
+  const previewItems = targetFiles.map(f => ({
+    title: f.name || f.id,
+    detail: `操作：${modeTitle} · 目标分组：${groupNames.join('、')}（涉及组内成员 ${groupMembers.length} 人）`
+  }));
+
+  const confirmed = await confirmWithDryRunModal({
+    title: `按分组批量操作预演：${modeTitle}`,
+    summaryHtml: `已选择 <strong>${targetFiles.length}</strong> 个文件，目标分组：<strong>${escapeHtml(groupNames.join('、'))}</strong>（共 ${groupMembers.length} 名成员）。`,
+    previewItems,
+    confirmText: `确认执行 (${targetFiles.length} 个文件)`,
+    isDanger: mode !== 'grant',
+    fallbackText: `确认对已勾选的 ${targetFiles.length} 个文件执行「${modeTitle}」？\n目标分组：${groupNames.join('、')}`
+  });
+  if (!confirmed) return;
 
   $('progress').textContent = `正在执行分组批量操作…`;
   try {
@@ -2973,7 +3418,48 @@ async function handleBatchQuickAction(actionType) {
     remove_public: '关闭所选文件的公开/域内共享链接',
     revoke_all: '清空所选文件的所有非所有者权限'
   };
-  if (!confirm(`确认对已勾选的 ${targetFiles.length} 个文件执行：\n「${titleMap[actionType]}」？`)) return;
+
+  const contactLookup = buildContactLookup(state.directory);
+  const previewItems = [];
+  let affectedPermCount = 0;
+
+  for (const file of targetFiles) {
+    const changes = [];
+    for (const p of file.permissions || []) {
+      if (p.role === 'owner' || permIsInherited(p)) continue;
+      if (actionType === 'downgrade_all' && p.role !== 'reader') {
+        changes.push(`${permissionLabel(p, contactLookup)}: ${roleLabel(p.role)} → 仅查看`);
+        affectedPermCount++;
+      } else if (actionType === 'remove_public' && (p.type === 'anyone' || p.type === 'domain')) {
+        changes.push(`关闭 ${permissionLabel(p, contactLookup)}`);
+        affectedPermCount++;
+      } else if (actionType === 'revoke_all') {
+        changes.push(`移除 ${permissionLabel(p, contactLookup)} (${roleLabel(p.role)})`);
+        affectedPermCount++;
+      }
+    }
+    if (changes.length > 0) {
+      previewItems.push({
+        title: file.name || file.id,
+        detail: changes.join('；')
+      });
+    }
+  }
+
+  if (affectedPermCount === 0) {
+    toast('所选文件中没有需要变更的权限项');
+    return;
+  }
+
+  const confirmed = await confirmWithDryRunModal({
+    title: `快捷权限清理预演：${titleMap[actionType]}`,
+    summaryHtml: `已勾选 <strong>${targetFiles.length}</strong> 个文件，其中 <strong>${previewItems.length}</strong> 个文件存在可变更项，共涉及 <strong>${affectedPermCount}</strong> 项权限变更。`,
+    previewItems,
+    confirmText: `确认执行 (${affectedPermCount} 项变更)`,
+    isDanger: actionType === 'revoke_all',
+    fallbackText: `确认对已勾选的 ${targetFiles.length} 个文件执行：\n「${titleMap[actionType]}」？`
+  });
+  if (!confirmed) return;
 
   let okCount = 0;
   let failCount = 0;
@@ -3184,6 +3670,153 @@ async function handleAddSinglePermPrompt(fileId) {
 }
 
 
+async function handleInspectorAddPerm() {
+  const file = state.files.find(f => f.id === state.inspectedFileId);
+  if (!file) return;
+  const emailInput = $('inspector-add-email');
+  const roleSelect = $('inspector-add-role');
+  const email = normalizeEntry(emailInput?.value || '');
+  const role = roleSelect?.value || 'reader';
+
+  if (!email || !email.includes('@')) {
+    toast('请输入有效的协作者邮箱地址');
+    emailInput?.focus?.();
+    return;
+  }
+
+  try {
+    const token = await resolveTokenForFile(file, true);
+    const created = await createPermission(token, file.id, { type: 'user', role, emailAddress: email });
+    file.permissions = file.permissions || [];
+    file.permissions.push({
+      id: created?.id || `perm-${Date.now()}`,
+      type: 'user',
+      role,
+      emailAddress: email
+    });
+    if (emailInput) emailInput.value = '';
+    await saveCurrentFilesSnapshot();
+    await appendAuditLogs({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: new Date().toISOString(),
+      source: 'manual',
+      actionType: 'grant',
+      accountEmail: file.ownerAccount || '',
+      fileId: file.id,
+      fileName: file.name,
+      permissionId: created?.id || '',
+      targetType: 'user',
+      targetEmail: email,
+      targetLabel: email,
+      newRole: role,
+      restored: false,
+      message: `手动授予 ${roleLabel(role)} 权限`
+    });
+    state.logs = await getAuditLogs();
+    renderAll();
+    toast(`已为《${file.name}》添加 ${email} (${roleLabel(role)})`);
+  } catch (error) {
+    toast(`添加失败：${error.message}`);
+  }
+}
+
+async function handleInspectorCompleteGroup(fileId, groupName) {
+  const file = state.files.find(f => f.id === fileId);
+  if (!file || !groupName) return;
+  try {
+    $('progress').textContent = `正在为《${file.name}》补齐「${groupName}」成员权限…`;
+    const res = await executeGroupBatchOnFiles({
+      files: [file],
+      groupNames: [groupName],
+      mode: 'grant',
+      roleOption: 'group_default',
+      directory: state.directory
+    });
+    await saveCurrentFilesSnapshot();
+    state.logs = await getAuditLogs();
+    $('progress').textContent = `补齐完成：新增 ${res.createdCount} 人`;
+    renderAll();
+    toast(`已为《${file.name}》补齐「${groupName}」权限（新增 ${res.createdCount} 项）`);
+  } catch (error) {
+    toast(`补齐分组权限失败：${error.message}`);
+  }
+}
+
+async function handleBatchRestoreLogs() {
+  const filterVal = $('log-filter')?.value || 'all';
+  const restorable = state.logs.filter(item => {
+    if (filterVal !== 'all' && item.source !== filterVal) return false;
+    return isLogRestorable(item);
+  });
+
+  if (!restorable.length) {
+    toast('当前没有可回滚的日志记录');
+    return;
+  }
+
+  const previewItems = restorable.map(log => ({
+    title: `${log.fileName || log.fileId} · ${log.targetLabel || log.targetEmail || '公开链接'}`,
+    detail: `恢复为：${roleLabel(log.previousRole || 'reader')}（原变更：${log.message || log.actionType}）`
+  }));
+
+  const confirmed = await confirmWithDryRunModal({
+    title: '批量回滚权限变更预演',
+    summaryHtml: `即将按逆序恢复当前筛选列表中的 <strong>${restorable.length}</strong> 条权限变更记录。`,
+    previewItems,
+    confirmText: `确认回滚 (${restorable.length} 项)`,
+    isDanger: false,
+    fallbackText: `确认批量回滚这 ${restorable.length} 条权限变更记录？`
+  });
+  if (!confirmed) return;
+
+  let okCount = 0;
+  let failCount = 0;
+  for (let i = 0; i < restorable.length; i++) {
+    const log = restorable[i];
+    $('progress').textContent = `正在批量回滚 (${i + 1}/${restorable.length}): ${log.fileName || log.fileId}`;
+    try {
+      const file = state.files.find(f => f.id === log.fileId) || {
+        id: log.fileId,
+        name: log.fileName,
+        ownerAccount: log.accountEmail
+      };
+      const token = await resolveTokenForFile(file, i === 0);
+      const restoreRole = log.previousRole || 'reader';
+
+      if (log.actionType === 'downgrade' && log.permissionId) {
+        await updatePermissionRole(token, log.fileId, log.permissionId, restoreRole);
+        const perm = file.permissions?.find(p => p.id === log.permissionId);
+        if (perm) perm.role = restoreRole;
+      } else {
+        const created = await createPermission(token, log.fileId, {
+          type: log.targetType || 'user',
+          role: restoreRole,
+          emailAddress: log.targetEmail || undefined,
+          domain: log.domain || undefined
+        });
+        if (file.permissions) {
+          file.permissions.push({
+            id: created?.id || `restored-${Date.now()}`,
+            type: log.targetType || 'user',
+            role: restoreRole,
+            emailAddress: log.targetEmail || '',
+            domain: log.domain || ''
+          });
+        }
+      }
+      state.logs = await markAuditLogRestored(log.id);
+      okCount++;
+    } catch (_err) {
+      failCount++;
+    }
+  }
+
+  await saveCurrentFilesSnapshot();
+  $('progress').textContent = `批量回滚完成：成功恢复 ${okCount} 项，失败 ${failCount} 项`;
+  renderAll();
+  toast(`批量回滚完成：成功恢复 ${okCount} 项`);
+}
+
 async function handlePersonBatchOp(email, mode) {
   const targetEmail = normalizeEntry(email);
   const tasks = [];
@@ -3205,7 +3838,20 @@ async function handlePersonBatchOp(email, mode) {
   }
 
   const label = mode === 'revoke' ? '全部撤权' : '全部降为只读';
-  if (!confirm(`确认对 ${targetEmail} 涉及的 ${tasks.length} 处权限执行「${label}」？`)) return;
+  const previewItems = tasks.map(({ file, perm }) => ({
+    title: file.name || file.id,
+    detail: mode === 'revoke' ? `移除 ${targetEmail} (原角色: ${roleLabel(perm.role)})` : `${targetEmail}: ${roleLabel(perm.role)} → 仅查看`
+  }));
+
+  const confirmed = await confirmWithDryRunModal({
+    title: `按人员批量操作预演：${label}`,
+    summaryHtml: `即将对协作者 <strong>${escapeHtml(targetEmail)}</strong> 涉及的 <strong>${tasks.length}</strong> 个文件执行「${label}」。`,
+    previewItems,
+    confirmText: `确认${label} (${tasks.length} 项)`,
+    isDanger: mode === 'revoke',
+    fallbackText: `确认对 ${targetEmail} 涉及的 ${tasks.length} 处权限执行「${label}」？`
+  });
+  if (!confirmed) return;
 
   let ok = 0;
   const newLogs = [];
@@ -3399,7 +4045,7 @@ function exportCsv() {
   }
 
   const csvContent = rows
-    .map(r => r.map(c => `"${String(c ?? '').replaceAll('"', '""')}"`).join(','))
+    .map(r => r.map(c => escapeCsvCell(c)).join(','))
     .join('\n');
   const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
@@ -3453,6 +4099,10 @@ async function init() {
     });
   });
 
+  $('toggle-right-pane-btn')?.addEventListener('click', () => {
+    setRightPaneCollapsed(!state.rightPaneCollapsed);
+  });
+
   document.querySelectorAll('.left-tab-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       const targetTab = btn.dataset.leftTab;
@@ -3462,7 +4112,54 @@ async function init() {
       document.querySelectorAll('.left-tab-panel').forEach(panel => {
         panel.classList.toggle('active', panel.id === `left-panel-${targetTab}`);
       });
+      // 当切换到批量链接授权或全盘所有权转移时，若右侧处于仅对扫描列表生效的 ops 标签，自动收起侧栏释放全宽空间
+      if (targetTab !== 'scan-list' && state.activeTab === 'ops' && !state.rightPaneCollapsed) {
+        setRightPaneCollapsed(true);
+      } else if (targetTab === 'scan-list' && state.rightPaneCollapsed) {
+        setRightPaneCollapsed(false);
+      }
     });
+  });
+
+  // 1.5 单文件协作者检查器 (File Inspector) & Dry-Run 预览弹窗事件绑定
+  $('inspector-close-btn')?.addEventListener('click', () => {
+    state.inspectedFileId = '';
+    renderFileInspector();
+  });
+
+  $('inspector-add-perm-btn')?.addEventListener('click', handleInspectorAddPerm);
+  $('inspector-add-email')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      handleInspectorAddPerm();
+    }
+  });
+
+  $('file-inspector-card')?.addEventListener('change', e => {
+    const sel = e.target.closest('select[data-action="inspector-role-change"]');
+    if (!sel) return;
+    handleInlineRoleChange(sel.dataset.fileId, sel.dataset.permId, sel.value);
+  });
+
+  $('file-inspector-card')?.addEventListener('click', e => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const action = btn.dataset.action;
+    if (action === 'inspector-remove-perm') {
+      handleRemoveSinglePerm(btn.dataset.fileId, btn.dataset.permId);
+    } else if (action === 'inspector-complete-group') {
+      handleInspectorCompleteGroup(btn.dataset.fileId, btn.dataset.group);
+    } else if (action === 'inspector-enforce-file') {
+      const target = state.files.find(f => f.id === btn.dataset.fileId);
+      if (target) handleEnforceFiles([target]);
+    }
+  });
+
+  $('dry-run-close-btn')?.addEventListener('click', () => closeDryRunModal(false));
+  $('dry-run-cancel-btn')?.addEventListener('click', () => closeDryRunModal(false));
+  $('dry-run-confirm-btn')?.addEventListener('click', () => closeDryRunModal(true));
+  $('dry-run-modal')?.addEventListener('click', e => {
+    if (e.target.id === 'dry-run-modal') closeDryRunModal(false);
   });
 
   // 2. 下拉多选菜单（文件类型 & 批量分组）展开/收起与全选/反选
@@ -4187,6 +4884,7 @@ async function init() {
 
   // 7. 右侧 TAB 3：日志
   $('log-filter').addEventListener('change', renderLogsTab);
+  $('batch-restore-logs-btn')?.addEventListener('click', handleBatchRestoreLogs);
   $('clear-logs-btn').addEventListener('click', async () => {
     await clearAuditLogs();
     state.logs = [];
@@ -4543,6 +5241,24 @@ async function init() {
   }
 
   renderAll();
+
+  if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
+    chrome.runtime.onMessage.addListener(async (message, sender) => {
+      if (sender?.id !== chrome.runtime.id) return;
+      if (message?.type === 'SCAN_UPDATED') {
+        try {
+          const [snapshot, logs] = await Promise.all([getSnapshot(), getAuditLogs()]);
+          state.files = snapshot.files || [];
+          state.newFileIds = new Set(snapshot.newFileIds || []);
+          state.lastScanAt = snapshot.lastScanAt || '';
+          state.logs = logs;
+          renderAll();
+        } catch (_e) {
+          // ignore background sync refresh error
+        }
+      }
+    });
+  }
 }
 
 init();

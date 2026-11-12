@@ -1,0 +1,102 @@
+name: Package Chrome Extension
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: '同时发布到 GitHub Releases'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-package:
+    name: Build & Package Extension ZIP
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate syntax, manifest, and sensitive-file exclusion
+        run: |
+          node --check background.js
+          node --check core.js
+          node --check popup.js
+          node --check vendor/jsuites.js
+          node --check vendor/jspreadsheet.js
+          node -e '
+            const fs = require("fs");
+            const m = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+            if (!m.version) throw new Error("Missing version in manifest.json");
+            for (const p of Object.values(m.icons || {})) {
+              if (!fs.existsSync(p)) throw new Error("Missing icon file: " + p);
+            }
+            console.log("Verified manifest version:", m.version);
+          '
+          # 阻断任何敏感凭证或本地密钥文件被误打包
+          if find . -maxdepth 3 \( -iname "*client_secret*.json" -o -iname "*passport*.json" -o -iname "*service-account*.json" -o -iname "*service_account*.json" -o -iname "token*.json" -o -iname "*.pem" -o -iname "*.key" -o -iname ".env*" \) | grep -q .; then
+            echo "::error::Sensitive credential file detected! Aborting packaging."
+            exit 1
+          fi
+
+      - name: Package clean Chrome Extension ZIP
+        id: package
+        run: |
+          VERSION=$(node -p "require('./manifest.json').version")
+          ZIP_NAME="gdrive-tools-v${VERSION}.zip"
+          STAGE_DIR="dist/gdrive-tools"
+
+          rm -rf dist
+          mkdir -p "${STAGE_DIR}"
+
+          cp manifest.json background.js core.js popup.html popup.css popup.js README.md "${STAGE_DIR}/"
+          cp -r icons vendor "${STAGE_DIR}/"
+
+          (cd "${STAGE_DIR}" && zip -r -9 "../../dist/${ZIP_NAME}" .)
+          (cd dist && sha256sum "${ZIP_NAME}" > "${ZIP_NAME}.sha256")
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "zip_name=${ZIP_NAME}" >> "$GITHUB_OUTPUT"
+          ls -lh "dist/${ZIP_NAME}" "dist/${ZIP_NAME}.sha256"
+
+      - name: Upload Extension Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.zip_name }}
+          path: |
+            dist/${{ steps.package.outputs.zip_name }}
+            dist/${{ steps.package.outputs.zip_name }}.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release (on tag or manual dispatch)
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+          PKG_VERSION: ${{ steps.package.outputs.version }}
+          ZIP_NAME: ${{ steps.package.outputs.zip_name }}
+        run: |
+          if [[ "${REF_NAME}" == v* ]]; then
+            TAG_NAME="${REF_NAME}"
+          else
+            TAG_NAME="v${PKG_VERSION}"
+          fi
+
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" "dist/${ZIP_NAME}" "dist/${ZIP_NAME}.sha256" --clobber
+          else
+            gh release create "${TAG_NAME}" \
+              "dist/${ZIP_NAME}" \
+              "dist/${ZIP_NAME}.sha256" \
+              --title "Google Drive 权限扫描器 ${TAG_NAME}" \
+              --generate-notes
+          fi

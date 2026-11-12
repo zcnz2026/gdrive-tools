@@ -382,6 +382,23 @@ function fileCategoryLabel(mimeType = '', fileName = '') {
  * - Google 表单 (form) -> https://docs.google.com/forms/d/{id}/edit
  * - 其他文件 -> 优先使用非通用 webViewLink，否则生成 https://drive.google.com/file/d/{id}/view
  */
+function escapeDriveQueryLiteral(value = '') {
+  return String(value ?? '')
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'");
+}
+
+function isTrustedGoogleWebUrl(urlStr = '') {
+  try {
+    const parsed = new URL(String(urlStr));
+    if (parsed.protocol !== 'https:') return false;
+    const host = parsed.hostname.toLowerCase();
+    return host === 'google.com' || host.endsWith('.google.com');
+  } catch (_e) {
+    return false;
+  }
+}
+
 function formatDriveCanonicalLink(itemOrId, mimeType = '', webViewLink = '') {
   let id = '';
   let mime = mimeType;
@@ -393,34 +410,36 @@ function formatDriveCanonicalLink(itemOrId, mimeType = '', webViewLink = '') {
   } else {
     id = String(itemOrId || '').trim();
   }
-  if (!id) return rawLink || '';
+  const safeRawLink = isTrustedGoogleWebUrl(rawLink) ? rawLink : '';
+  if (!id) return safeRawLink;
 
+  const safeId = encodeURIComponent(id);
   const m = mime.toLowerCase();
   if (m === 'application/vnd.google-apps.folder') {
-    return `https://drive.google.com/drive/folders/${id}`;
+    return `https://drive.google.com/drive/folders/${safeId}`;
   }
   if (m === 'application/vnd.google-apps.spreadsheet') {
-    return `https://docs.google.com/spreadsheets/d/${id}/edit`;
+    return `https://docs.google.com/spreadsheets/d/${safeId}/edit`;
   }
   if (m === 'application/vnd.google-apps.document') {
-    return `https://docs.google.com/document/d/${id}/edit`;
+    return `https://docs.google.com/document/d/${safeId}/edit`;
   }
   if (m === 'application/vnd.google-apps.presentation') {
-    return `https://docs.google.com/presentation/d/${id}/edit`;
+    return `https://docs.google.com/presentation/d/${safeId}/edit`;
   }
   if (m === 'application/vnd.google-apps.form') {
-    return `https://docs.google.com/forms/d/${id}/edit`;
+    return `https://docs.google.com/forms/d/${safeId}/edit`;
   }
   if (m === 'application/vnd.google-apps.drawing') {
-    return `https://docs.google.com/drawings/d/${id}/edit`;
+    return `https://docs.google.com/drawings/d/${safeId}/edit`;
   }
   if (m === 'application/vnd.google-apps.script') {
-    return `https://script.google.com/d/${id}/edit`;
+    return `https://script.google.com/d/${safeId}/edit`;
   }
-  if (rawLink && /^https?:\/\//i.test(rawLink) && !rawLink.includes('drive.google.com/open?id=')) {
-    return rawLink;
+  if (safeRawLink && !safeRawLink.includes('drive.google.com/open?id=')) {
+    return safeRawLink;
   }
-  return `https://drive.google.com/file/d/${id}/view`;
+  return `https://drive.google.com/file/d/${safeId}/view`;
 }
 
 /**
@@ -484,7 +503,7 @@ function buildDriveHierarchyInfo(items = []) {
     const parentFolderLink = isMyDriveRoot
       ? 'https://drive.google.com/drive/my-drive'
       : parentFolderId
-      ? `https://drive.google.com/drive/folders/${parentFolderId}`
+      ? `https://drive.google.com/drive/folders/${encodeURIComponent(parentFolderId)}`
       : '';
 
     const topAncestor = ancestors.length > 0 ? ancestors[0] : isFolder ? it : null;
@@ -494,7 +513,7 @@ function buildDriveHierarchyInfo(items = []) {
       : it.rootFolderName || '根目录直属文件';
     const rootFolderLink =
       rootFolderId && rootFolderId !== '__root_loose__'
-        ? `https://drive.google.com/drive/folders/${rootFolderId}`
+        ? `https://drive.google.com/drive/folders/${encodeURIComponent(rootFolderId)}`
         : '';
 
     const canonicalLink = formatDriveCanonicalLink(it);
@@ -670,12 +689,85 @@ async function saveFilterPresets(presets) {
 
 /* ==================== OAuth 桌面 JSON 凭证与多账号存储 ==================== */
 
-function pickRedirectUri(uris = []) {
-  if (Array.isArray(uris)) {
-    const local = uris.find(u => /^http:\/\/(localhost|127\.0\.0\.1)/i.test(u));
-    if (local) return local;
+const DEFAULT_GOOGLE_TOKEN_URI = 'https://oauth2.googleapis.com/token';
+const DEFAULT_GOOGLE_AUTH_URI = 'https://accounts.google.com/o/oauth2/v2/auth';
+
+function sanitizeGoogleTokenUri(uri = '') {
+  if (!uri) return DEFAULT_GOOGLE_TOKEN_URI;
+  try {
+    const parsed = new URL(String(uri).trim());
+    if (parsed.protocol !== 'https:') {
+      throw new Error('OAuth token_uri 必须使用 HTTPS 协议');
+    }
+    const host = parsed.hostname.toLowerCase();
+    const allowed =
+      (host === 'oauth2.googleapis.com' && parsed.pathname.startsWith('/token')) ||
+      (host === 'www.googleapis.com' && parsed.pathname.startsWith('/oauth2/')) ||
+      (host === 'accounts.google.com' && parsed.pathname.startsWith('/o/oauth2/'));
+    if (!allowed) {
+      throw new Error(`拒绝不受信任的 OAuth token_uri 域名：${host}`);
+    }
+    return parsed.toString();
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('token_uri')) throw err;
+    throw new Error('无效的 OAuth token_uri 格式');
+  }
+}
+
+function sanitizeGoogleAuthUri(uri = '') {
+  if (!uri) return DEFAULT_GOOGLE_AUTH_URI;
+  try {
+    const parsed = new URL(String(uri).trim());
+    if (parsed.protocol !== 'https:' || parsed.hostname.toLowerCase() !== 'accounts.google.com') {
+      throw new Error(`拒绝不受信任的 OAuth auth_uri 域名：${parsed.hostname}`);
+    }
+    return parsed.toString();
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('auth_uri')) throw err;
+    throw new Error('无效的 OAuth auth_uri 格式');
+  }
+}
+
+function sanitizeLoopbackRedirectUri(uri = '') {
+  if (!uri) return 'http://localhost';
+  try {
+    const parsed = new URL(String(uri).trim());
+    const host = parsed.hostname.toLowerCase();
+    if (parsed.protocol === 'http:' && (host === 'localhost' || host === '127.0.0.1')) {
+      return `${parsed.protocol}//${parsed.host}${parsed.pathname === '/' ? '' : parsed.pathname}`;
+    }
+  } catch (_e) {
+    // fallback to default loopback URI
   }
   return 'http://localhost';
+}
+
+function pickRedirectUri(uris = []) {
+  if (Array.isArray(uris)) {
+    for (const u of uris) {
+      try {
+        const parsed = new URL(String(u).trim());
+        const host = parsed.hostname.toLowerCase();
+        if (parsed.protocol === 'http:' && (host === 'localhost' || host === '127.0.0.1')) {
+          return sanitizeLoopbackRedirectUri(u);
+        }
+      } catch (_e) {
+        // ignore invalid uri candidate
+      }
+    }
+  }
+  return 'http://localhost';
+}
+
+function generateRandomBase64Url(byteLength = 32) {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return base64UrlEncodeBytes(bytes);
+}
+
+async function computePkceChallengeS256(verifier) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  return base64UrlEncodeBytes(new Uint8Array(digest));
 }
 
 function extractOAuthClientsFromJson(parsed, fileName = '') {
@@ -691,14 +783,14 @@ function extractOAuthClientsFromJson(parsed, fileName = '') {
     if (item.type === 'service_account' && item.client_email && item.private_key) {
       const clientEmail = normalizeEntry(item.client_email);
       clients.push({
-        uid: `sa_${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${i}`,
-        fileName: fileName || `${clientEmail.split('@')[0]}.json`,
+        uid: `sa_${Date.now()}_${generateRandomBase64Url(6)}_${i}`,
+        fileName: String(fileName || `${clientEmail.split('@')[0]}.json`),
         client_id: String(item.client_id || clientEmail).trim(),
         client_email: clientEmail,
         private_key: String(item.private_key),
         private_key_id: String(item.private_key_id || ''),
         project_id: String(item.project_id || '').trim(),
-        token_uri: item.token_uri || 'https://oauth2.googleapis.com/token',
+        token_uri: sanitizeGoogleTokenUri(item.token_uri),
         client_type: 'service_account',
         boundEmail: clientEmail,
         importedAt: new Date().toISOString()
@@ -711,13 +803,13 @@ function extractOAuthClientsFromJson(parsed, fileName = '') {
     if (raw && raw.client_id && raw.client_secret) {
       const clientId = String(raw.client_id).trim();
       clients.push({
-        uid: `cred_${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${i}`,
-        fileName: fileName || `oauth_${i + 1}.json`,
+        uid: `cred_${Date.now()}_${generateRandomBase64Url(6)}_${i}`,
+        fileName: String(fileName || `oauth_${i + 1}.json`),
         client_id: clientId,
         client_secret: String(raw.client_secret).trim(),
         project_id: String(raw.project_id || '').trim(),
-        auth_uri: raw.auth_uri || 'https://accounts.google.com/o/oauth2/v2/auth',
-        token_uri: raw.token_uri || 'https://oauth2.googleapis.com/token',
+        auth_uri: sanitizeGoogleAuthUri(raw.auth_uri),
+        token_uri: sanitizeGoogleTokenUri(raw.token_uri),
         redirect_uri: pickRedirectUri(raw.redirect_uris),
         client_type: item.installed ? 'installed' : item.web ? 'web' : 'custom',
         boundEmail: '',
@@ -758,7 +850,7 @@ async function mintServiceAccountAccessToken({ clientEmail, privateKey, tokenUri
   if (!clientEmail || !privateKey) {
     throw new Error('服务账号配置缺少 client_email 或 private_key');
   }
-  const targetUri = tokenUri || 'https://oauth2.googleapis.com/token';
+  const targetUri = sanitizeGoogleTokenUri(tokenUri);
   const nowSec = Math.floor(Date.now() / 1000);
   const header = { alg: 'RS256', typ: 'JWT' };
   const claimSet = {
@@ -907,12 +999,203 @@ async function buildAuthorizedPassportBundle({ onlyEmail = '', includeTransferSt
   return payload;
 }
 
+const PASSPORT_ENCRYPTED_BUNDLE_TYPE = 'google_drive_auth_passport_encrypted_v2';
+const PASSPORT_PBKDF2_ITERATIONS = 310000;
+const PASSPORT_PBKDF2_MIN_ITERATIONS = 100000;
+const PASSPORT_PBKDF2_MAX_ITERATIONS = 2000000;
+const PASSPORT_MIN_PASSWORD_LENGTH = 8;
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(b64) {
+  const clean = String(b64 || '').trim();
+  if (!clean) throw new Error('加密数据字段为空');
+  let binary = '';
+  try {
+    binary = atob(clean);
+  } catch {
+    throw new Error('加密数据 Base64 格式损坏');
+  }
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
+
+function isEncryptedPassportBundle(obj) {
+  return Boolean(
+    obj &&
+      typeof obj === 'object' &&
+      !Array.isArray(obj) &&
+      (obj.bundleType === PASSPORT_ENCRYPTED_BUNDLE_TYPE ||
+        (obj.encrypted === true && obj.kdf && obj.cipher && typeof obj.ciphertext === 'string'))
+  );
+}
+
+async function derivePassportAesKey(password, saltBytes, iterations, keyUsages) {
+  const pwdStr = String(password || '');
+  if (!pwdStr) {
+    throw new Error('主密码不能为空');
+  }
+  const enc = new TextEncoder();
+  const baseKey = await crypto.subtle.importKey('raw', enc.encode(pwdStr), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: saltBytes,
+      iterations,
+      hash: 'SHA-256'
+    },
+    baseKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    keyUsages
+  );
+}
+
+/**
+ * 使用 WebCrypto PBKDF2-HMAC-SHA256 + AES-256-GCM 加密导出的免登录通行证 JSON
+ */
+async function encryptAuthorizedPassportBundle(plainBundle, password) {
+  if (!plainBundle || typeof plainBundle !== 'object') {
+    throw new Error('待加密的通行证数据无效');
+  }
+  const pwdStr = String(password || '');
+  if (pwdStr.length < PASSPORT_MIN_PASSWORD_LENGTH) {
+    throw new Error(`主密码长度不能少于 ${PASSPORT_MIN_PASSWORD_LENGTH} 位`);
+  }
+
+  const salt = new Uint8Array(16);
+  const iv = new Uint8Array(12);
+  crypto.getRandomValues(salt);
+  crypto.getRandomValues(iv);
+
+  const key = await derivePassportAesKey(pwdStr, salt, PASSPORT_PBKDF2_ITERATIONS, ['encrypt']);
+  const enc = new TextEncoder();
+  const aad = enc.encode(PASSPORT_ENCRYPTED_BUNDLE_TYPE);
+  const plaintextBytes = enc.encode(JSON.stringify(plainBundle));
+
+  const encryptedBuffer = await crypto.subtle.encrypt(
+    {
+      name: 'AES-GCM',
+      iv,
+      additionalData: aad,
+      tagLength: 128
+    },
+    key,
+    plaintextBytes
+  );
+
+  return {
+    bundleType: PASSPORT_ENCRYPTED_BUNDLE_TYPE,
+    version: 2,
+    encrypted: true,
+    exportedAt: new Date().toISOString(),
+    description: 'Google Drive 权限管理插件 - 主密码加密免登录通行证（AES-256-GCM + PBKDF2-SHA256）',
+    kdf: {
+      algorithm: 'PBKDF2',
+      hash: 'SHA-256',
+      iterations: PASSPORT_PBKDF2_ITERATIONS,
+      salt: bytesToBase64(salt)
+    },
+    cipher: {
+      algorithm: 'AES-GCM',
+      iv: bytesToBase64(iv),
+      tagLength: 128
+    },
+    ciphertext: bytesToBase64(new Uint8Array(encryptedBuffer))
+  };
+}
+
+/**
+ * 解密受主密码保护的免登录通行证 JSON（含迭代次数边界检查与完整性校验）
+ */
+async function decryptAuthorizedPassportBundle(envelope, password) {
+  if (!isEncryptedPassportBundle(envelope)) {
+    throw new Error('不是受支持的加密通行证格式');
+  }
+  const pwdStr = String(password || '');
+  if (!pwdStr) {
+    throw new Error('请输入解密主密码');
+  }
+
+  const kdf = envelope.kdf || {};
+  const cipher = envelope.cipher || {};
+  if (kdf.algorithm !== 'PBKDF2' || kdf.hash !== 'SHA-256') {
+    throw new Error('不支持的密钥派生算法配置');
+  }
+  if (cipher.algorithm !== 'AES-GCM') {
+    throw new Error('不支持的对称加密算法配置');
+  }
+
+  const iterations = Number(kdf.iterations);
+  if (
+    !Number.isInteger(iterations) ||
+    iterations < PASSPORT_PBKDF2_MIN_ITERATIONS ||
+    iterations > PASSPORT_PBKDF2_MAX_ITERATIONS
+  ) {
+    throw new Error('加密通行证 KDF 迭代参数超出安全范围');
+  }
+
+  const salt = base64ToBytes(kdf.salt);
+  const iv = base64ToBytes(cipher.iv);
+  const ciphertextBytes = base64ToBytes(envelope.ciphertext);
+  if (salt.length < 16) {
+    throw new Error('加密通行证盐值长度不足');
+  }
+  if (iv.length !== 12) {
+    throw new Error('加密通行证 IV 长度无效');
+  }
+
+  const key = await derivePassportAesKey(pwdStr, salt, iterations, ['decrypt']);
+  const aad = new TextEncoder().encode(PASSPORT_ENCRYPTED_BUNDLE_TYPE);
+
+  let decryptedBuffer;
+  try {
+    decryptedBuffer = await crypto.subtle.decrypt(
+      {
+        name: 'AES-GCM',
+        iv,
+        additionalData: aad,
+        tagLength: 128
+      },
+      key,
+      ciphertextBytes
+    );
+  } catch {
+    throw new Error('主密码错误或通行证文件已被篡改，解密失败');
+  }
+
+  let decoded;
+  try {
+    decoded = JSON.parse(new TextDecoder().decode(decryptedBuffer));
+  } catch {
+    throw new Error('解密后的数据不是有效的 JSON 结构');
+  }
+
+  if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
+    throw new Error('解密后的通行证内容结构无效');
+  }
+  return decoded;
+}
+
 /**
  * 识别并导入「免登录已授权通行证 JSON」或含 refresh_token 的 token.json 文件（无需弹出浏览器登录）
  */
 async function importAuthorizedPassportFromObject(parsed) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return { imported: false, accountCount: 0, clientCount: 0, restoredTransferCount: 0 };
+  }
+  if (isEncryptedPassportBundle(parsed)) {
+    throw new Error('该通行证文件已受主密码加密保护，请先输入主密码解密后再导入');
   }
 
   let rawClients = [];
@@ -929,9 +1212,9 @@ async function importAuthorizedPassportFromObject(parsed) {
     const cid = String(parsed.clientId || parsed.client_id).trim();
     const csec = String(parsed.clientSecret || parsed.client_secret).trim();
     const rtok = String(parsed.refreshToken || parsed.refresh_token).trim();
-    const turi = parsed.tokenUri || parsed.token_uri || 'https://oauth2.googleapis.com/token';
+    const turi = sanitizeGoogleTokenUri(parsed.tokenUri || parsed.token_uri);
     rawClients.push({
-      uid: `cred_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      uid: `cred_${Date.now()}_${generateRandomBase64Url(6)}`,
       fileName: 'imported_token.json',
       client_id: cid,
       client_secret: csec,
@@ -942,11 +1225,11 @@ async function importAuthorizedPassportFromObject(parsed) {
     });
     rawAccounts.push({
       email: normalizeEntry(parsed.email || ''),
-      displayName: parsed.displayName || '',
+      displayName: String(parsed.displayName || ''),
       clientId: cid,
       clientSecret: csec,
       refreshToken: rtok,
-      accessToken: parsed.accessToken || parsed.token || '',
+      accessToken: String(parsed.accessToken || parsed.token || ''),
       tokenUri: turi,
       expiresAt: Number(parsed.expiresAt) || 0
     });
@@ -955,27 +1238,51 @@ async function importAuthorizedPassportFromObject(parsed) {
   }
 
   if (rawClients.length > 0) {
-    await saveOAuthClients(rawClients);
+    const sanitizedClients = rawClients
+      .filter(c => c && typeof c === 'object' && c.client_id)
+      .map(c => {
+        const isSa = c.client_type === 'service_account' || Boolean(c.client_email && c.private_key);
+        return {
+          uid: String(c.uid || `cred_${Date.now()}_${generateRandomBase64Url(6)}`),
+          fileName: String(c.fileName || 'imported_oauth.json'),
+          client_id: String(c.client_id).trim(),
+          client_secret: c.client_secret ? String(c.client_secret).trim() : '',
+          client_email: c.client_email ? normalizeEntry(c.client_email) : '',
+          private_key: c.private_key ? String(c.private_key) : '',
+          private_key_id: c.private_key_id ? String(c.private_key_id) : '',
+          project_id: String(c.project_id || '').trim(),
+          auth_uri: isSa ? undefined : sanitizeGoogleAuthUri(c.auth_uri),
+          token_uri: sanitizeGoogleTokenUri(c.token_uri),
+          redirect_uri: isSa ? undefined : sanitizeLoopbackRedirectUri(c.redirect_uri),
+          client_type: isSa ? 'service_account' : String(c.client_type || 'installed'),
+          boundEmail: normalizeEntry(c.boundEmail || ''),
+          boundEmails: Array.isArray(c.boundEmails) ? c.boundEmails.map(normalizeEntry).filter(Boolean) : undefined,
+          importedAt: String(c.importedAt || new Date().toISOString())
+        };
+      });
+    if (sanitizedClients.length > 0) {
+      await saveOAuthClients(sanitizedClients);
+    }
   }
 
   let accountCount = 0;
   for (const acc of rawAccounts) {
     if (!acc || typeof acc !== 'object') continue;
     let email = normalizeEntry(acc.email || '');
-    let accessToken = acc.accessToken || '';
+    let accessToken = String(acc.accessToken || '');
     let expiresAt = Number(acc.expiresAt) || 0;
+    const safeTokenUri = sanitizeGoogleTokenUri(acc.tokenUri);
 
     // 导入免登录通行证时，只要有 refreshToken 就优先静默刷新一次最新 accessToken（若离线暂不可达则将 expiresAt 置 0 以便首次扫描时自动刷新）
     if (acc.refreshToken && acc.clientId && acc.clientSecret) {
       try {
-        const tokenUri = acc.tokenUri || 'https://oauth2.googleapis.com/token';
-        const resp = await fetch(tokenUri, {
+        const resp = await fetch(safeTokenUri, {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body: new URLSearchParams({
-            client_id: acc.clientId,
-            client_secret: acc.clientSecret,
-            refresh_token: acc.refreshToken,
+            client_id: String(acc.clientId),
+            client_secret: String(acc.clientSecret),
+            refresh_token: String(acc.refreshToken),
             grant_type: 'refresh_token'
           }).toString()
         });
@@ -997,11 +1304,20 @@ async function importAuthorizedPassportFromObject(parsed) {
 
     if (!email) continue;
     await saveAuthorizedAccount({
-      ...acc,
       email,
+      displayName: String(acc.displayName || ''),
+      clientUid: String(acc.clientUid || ''),
+      clientId: String(acc.clientId || ''),
+      clientSecret: acc.clientSecret ? String(acc.clientSecret) : '',
+      projectId: String(acc.projectId || ''),
+      isServiceAccount: Boolean(acc.isServiceAccount),
+      privateKey: acc.privateKey ? String(acc.privateKey) : '',
+      tokenUri: safeTokenUri,
+      redirectUri: sanitizeLoopbackRedirectUri(acc.redirectUri),
+      refreshToken: acc.refreshToken ? String(acc.refreshToken) : '',
       accessToken,
       expiresAt,
-      authorizedAt: acc.authorizedAt || new Date().toISOString()
+      authorizedAt: String(acc.authorizedAt || new Date().toISOString())
     });
     accountCount++;
   }
@@ -1040,7 +1356,7 @@ async function refreshAccountAccessToken(account) {
 
   let clientId = account.clientId || '';
   let clientSecret = account.clientSecret || '';
-  let tokenUri = account.tokenUri || 'https://oauth2.googleapis.com/token';
+  let tokenUri = account.tokenUri || DEFAULT_GOOGLE_TOKEN_URI;
 
   if ((!clientId || !clientSecret) && account.email) {
     const allClients = await getOAuthClients();
@@ -1059,6 +1375,8 @@ async function refreshAccountAccessToken(account) {
       tokenUri = account.tokenUri || matchedClient.token_uri || tokenUri;
     }
   }
+
+  tokenUri = sanitizeGoogleTokenUri(tokenUri);
 
   if (!account.refreshToken || !clientId || !clientSecret) {
     throw new Error(`账号 ${account.email} 缺少 refreshToken 或客户端密钥，请重新授权或重新导出含完整凭证的免登录通行证 JSON`);
@@ -1160,10 +1478,11 @@ function getChromeIdentityToken(interactive = true) {
 async function authorizeWithOAuthClient(client, loginHint = '') {
   if (client && (client.client_type === 'service_account' || (client.client_email && client.private_key))) {
     const email = normalizeEntry(client.client_email);
+    const safeSaTokenUri = sanitizeGoogleTokenUri(client.token_uri);
     const minted = await mintServiceAccountAccessToken({
       clientEmail: email,
       privateKey: client.private_key,
-      tokenUri: client.token_uri
+      tokenUri: safeSaTokenUri
     });
     const savedAccount = await saveAuthorizedAccount({
       email,
@@ -1171,12 +1490,12 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
       clientId: client.client_id || email,
       isServiceAccount: true,
       privateKey: client.private_key,
-      tokenUri: client.token_uri || 'https://oauth2.googleapis.com/token',
+      tokenUri: safeSaTokenUri,
       accessToken: minted.accessToken,
       expiresAt: Date.now() + minted.expiresIn * 1000,
       authorizedAt: new Date().toISOString()
     });
-    await saveOAuthClients([{ ...client, boundEmail: email }]);
+    await saveOAuthClients([{ ...client, token_uri: safeSaTokenUri, boundEmail: email }]);
     return savedAccount;
   }
 
@@ -1184,9 +1503,12 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
     throw new Error('无效的 OAuth 客户端配置（缺少 client_id 或 client_secret）');
   }
 
-  const redirectUri = client.redirect_uri || 'http://localhost';
-  const oauthState = `st_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const authEndpoint = client.auth_uri || 'https://accounts.google.com/o/oauth2/v2/auth';
+  const redirectUri = sanitizeLoopbackRedirectUri(client.redirect_uri);
+  const expectedRedirect = new URL(redirectUri);
+  const oauthState = `st_${generateRandomBase64Url(24)}`;
+  const codeVerifier = generateRandomBase64Url(32);
+  const codeChallenge = await computePkceChallengeS256(codeVerifier);
+  const authEndpoint = sanitizeGoogleAuthUri(client.auth_uri);
 
   const authUrl = new URL(authEndpoint);
   authUrl.searchParams.set('client_id', client.client_id);
@@ -1196,6 +1518,8 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
   authUrl.searchParams.set('access_type', 'offline');
   authUrl.searchParams.set('prompt', 'consent select_account');
   authUrl.searchParams.set('state', oauthState);
+  authUrl.searchParams.set('code_challenge', codeChallenge);
+  authUrl.searchParams.set('code_challenge_method', 'S256');
   if (loginHint) {
     authUrl.searchParams.set('login_hint', loginHint);
   }
@@ -1211,19 +1535,29 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
 
     const tryParseRedirect = urlStr => {
       if (!urlStr || settled) return false;
-      if (!urlStr.startsWith(redirectUri) && !/^http:\/\/(localhost|127\.0\.0\.1)(\/|:\d+|\?)/i.test(urlStr)) {
-        return false;
-      }
       try {
         const parsedUrl = new URL(urlStr);
+        const host = parsedUrl.hostname.toLowerCase();
+        const isLoopback = parsedUrl.protocol === 'http:' && (host === 'localhost' || host === '127.0.0.1');
+        if (!isLoopback) {
+          return false;
+        }
+        if (expectedRedirect.port && parsedUrl.port !== expectedRedirect.port) {
+          return false;
+        }
         const err = parsedUrl.searchParams.get('error');
         const authCode = parsedUrl.searchParams.get('code');
         if (!err && !authCode) return false;
 
+        const returnedState = parsedUrl.searchParams.get('state') || '';
         settled = true;
         cleanup();
         if (authTabId !== null) {
           chrome.tabs.remove(authTabId).catch(() => {});
+        }
+        if (returnedState !== oauthState) {
+          reject(new Error('OAuth 授权回调 state 校验失败（已拦截可疑回调请求）'));
+          return true;
         }
         if (err) {
           const hint =
@@ -1268,7 +1602,7 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
     });
   });
 
-  const tokenUri = client.token_uri || 'https://oauth2.googleapis.com/token';
+  const tokenUri = sanitizeGoogleTokenUri(client.token_uri);
   const tokenRes = await fetch(tokenUri, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -1277,6 +1611,7 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
       client_id: client.client_id,
       client_secret: client.client_secret,
       redirect_uri: redirectUri,
+      code_verifier: codeVerifier,
       grant_type: 'authorization_code'
     }).toString()
   });
@@ -1337,15 +1672,32 @@ async function getPolicy() {
   };
 }
 
-async function savePolicy(partialPolicy) {
+async function savePolicy(partialPolicy = {}) {
   const current = await getPolicy();
+  const safePartial = partialPolicy && typeof partialPolicy === 'object' ? partialPolicy : {};
+  const rawRule = safePartial.publicLinkRule !== undefined ? safePartial.publicLinkRule : current.publicLinkRule;
+  const publicLinkRule = ['forbid', 'reader_only', 'allow'].includes(rawRule) ? rawRule : DEFAULT_POLICY.publicLinkRule;
+  const rawMins =
+    safePartial.scheduleMinutes !== undefined ? Number(safePartial.scheduleMinutes) : Number(current.scheduleMinutes);
+  const scheduleMinutes = Number.isFinite(rawMins) ? Math.min(1440, Math.max(15, Math.round(rawMins))) : 60;
+
+  const nextWriters = normalizeEmailList(
+    safePartial.writers !== undefined ? safePartial.writers : current.writers || []
+  );
+  const writerSet = new Set(nextWriters);
+  const rawReaders = safePartial.readers !== undefined ? safePartial.readers : current.readers || [];
+  const nextReaders = normalizeEmailList(rawReaders.filter(item => !writerSet.has(item)));
+
   const next = {
-    ...current,
-    ...partialPolicy
+    writers: nextWriters,
+    readers: nextReaders,
+    publicLinkRule,
+    scheduleEnabled:
+      safePartial.scheduleEnabled !== undefined ? Boolean(safePartial.scheduleEnabled) : Boolean(current.scheduleEnabled),
+    scheduleMinutes,
+    autoEnforce:
+      safePartial.autoEnforce !== undefined ? Boolean(safePartial.autoEnforce) : Boolean(current.autoEnforce)
   };
-  next.writers = normalizeEmailList(next.writers || []);
-  const writerSet = new Set(next.writers);
-  next.readers = normalizeEmailList((next.readers || []).filter(item => !writerSet.has(item)));
   await safeStorageSet({ policy: next });
   return next;
 }
@@ -2315,7 +2667,7 @@ async function scanSingleAccount(
       const chunkWorkers = Array.from({ length: Math.min(4, chunks.length) }, async () => {
         while (chunkCursor < chunks.length) {
           const chunk = chunks[chunkCursor++];
-          const parentClause = chunk.map(fid => `'${fid.replace(/'/g, "\\'")}' in parents`).join(' or ');
+          const parentClause = chunk.map(fid => `'${escapeDriveQueryLiteral(fid)}' in parents`).join(' or ');
           const q = `(${parentClause}) and trashed = false`;
           let pageToken = '';
 
@@ -3589,11 +3941,11 @@ function enrichTransferItemsWithTree(items = []) {
       ? '上级目录'
       : '根目录';
     const parentFolderLink = parentFolderId
-      ? `https://drive.google.com/drive/folders/${parentFolderId}`
+      ? `https://drive.google.com/drive/folders/${encodeURIComponent(parentFolderId)}`
       : '';
     const rootFolderLink =
       rootFolderId && rootFolderId !== '__root_loose__'
-        ? `https://drive.google.com/drive/folders/${rootFolderId}`
+        ? `https://drive.google.com/drive/folders/${encodeURIComponent(rootFolderId)}`
         : '';
     const res = {
       isTopLevelFolder,
@@ -4674,7 +5026,7 @@ async function mountTransferredItemsToMyDriveRoot({
             repairedChildCount++;
           } else if (kind === 'refresh_folder') {
             const pId = Array.isArray(item.parents) && item.parents[0] ? item.parents[0] : '';
-            if (pId && pId !== myDriveRootId && pId !== 'root') {
+            if (pId && pId !== targetRootId && pId !== 'root') {
               await driveApi(
                 targetToken,
                 `/files/${encodeURIComponent(item.id)}?addParents=root&removeParents=${encodeURIComponent(pId)}&supportsAllDrives=true&fields=id`,
@@ -4815,7 +5167,7 @@ async function scanSpecificFoldersForTransfer({
     for (let i = 0; i < currentLevelFolderIds.length; i += chunkSize) {
       if (shouldStop && shouldStop()) break;
       const chunk = currentLevelFolderIds.slice(i, i + chunkSize);
-      const parentClause = chunk.map(id => `'${id.replace(/'/g, "\\'")}' in parents`).join(' or ');
+      const parentClause = chunk.map(id => `'${escapeDriveQueryLiteral(id)}' in parents`).join(' or ');
       const q = `trashed = false and mimeType != 'application/vnd.google-apps.shortcut' and (${parentClause})`;
 
       let addedInBatch = 0;

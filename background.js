@@ -1,8 +1,7 @@
 importScripts('core.js');
 
-// 内置轻量 PNG 图标 Data URI，用于系统桌面通知
-const NOTIFICATION_ICON =
-  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAABNSURBVHgB7c4xAQAgCAAw7N/a2cHHB4K6c3Z27gwgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgcLcB6f4Bff8tZ1MAAAAASUVORK5CYII=';
+// 扩展内置高清 PNG 图标，用于系统桌面通知
+const NOTIFICATION_ICON = 'icons/icon128.png';
 
 async function openOrFocusDashboard() {
   const targetUrl = chrome.runtime.getURL('popup.html');
@@ -48,8 +47,12 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   }
 });
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type === 'SYNC_ALARM') {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // 严格校验消息来源必须为本扩展自身，防止跨扩展或不可信上下文伪造指令
+  if (sender?.id !== chrome.runtime.id) {
+    return false;
+  }
+  if (message?.type === 'SYNC_ALARM' || message?.type === 'SYNC_SCHEDULE') {
     syncScheduleAlarm().then(() => sendResponse({ ok: true }));
     return true;
   }

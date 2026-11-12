@@ -1,0 +1,28 @@
+# 环境变量与本地敏感配置
+.env
+.env.*
+!.env.example
+
+# Google OAuth 客户端密钥、服务账号私钥与导出的免登录授权通行证 JSON（严禁提交版本库！）
+*client_secret*.json
+*passport*.json
+drive-auth-passport*.json
+drive-policy-and-groups*.json
+token.json
+token-*.json
+*service-account*.json
+*service_account*.json
+sa-*.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# 本地打包与操作系统临时文件
+*.crx
+*.zip
+*.7z
+.DS_Store
+Thumbs.db
+node_modules/
+dist/

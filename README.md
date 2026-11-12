@@ -40,3 +40,13 @@
 - `background.js`：后台 Service Worker（定时巡检调度、自动守护执行、桌面通知与扩展角标更新）。
 - `popup.html` / `popup.css`：工作台界面与样式。
 - `popup.js`：前端交互与状态管理。
+- `icons/`：扩展多尺寸高清图标（16 / 32 / 48 / 128 px）。
+- `vendor/`：内置 Jspreadsheet CE 与 jSuites 表格组件（已做安全裁剪加固）。
+
+## 安装方式
+
+1. 前往本仓库 **Releases** 页面下载最新打包好的 `gdrive-tools-v*.zip` 并解压到本地目录。
+2. 打开 Chrome 浏览器访问 `chrome://extensions`，开启右上角 **「开发者模式」**。
+3. 点击左上角 **「加载已解压的扩展程序」**，选择解压后的文件夹即可使用。
+
+> **安全提示**：请勿将本地导出的免登录通行证（`drive-auth-passport-*.json`）、Google Cloud OAuth 客户端密钥或 Service Account 私钥文件上传至代码仓库。
