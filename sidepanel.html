@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <script src="theme-init.js"></script>
+  <meta name="text-scale" content="scale">
+  <title>Google Drive 网页伴随权限栏</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="icons/icon32.png">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body class="sidepanel-body">
+  <div class="sp-shell">
+    <!-- 顶层极简导航栏（单行紧凑） -->
+    <header class="sp-topbar">
+      <div class="sp-topbar-left">
+        <img src="icons/icon32.png" alt="" width="20" height="20" class="brand-logo">
+        <h1 class="sp-title">Drive 伴随权限栏</h1>
+      </div>
+      <div class="sp-topbar-right">
+        <button id="sp-theme-btn" type="button" class="btn btn-xs theme-toggle-btn" title="切换浅色或深色界面" aria-label="切换浅色或深色界面">
+          <span class="theme-opt-dark">深色</span>
+          <span class="theme-opt-light">浅色</span>
+        </button>
+        <button id="sp-open-dashboard-btn" type="button" class="btn btn-xs primary" title="打开全屏权限巡检与治理工作台">全屏工作台 ↗</button>
+      </div>
+    </header>
+
+    <!-- 极紧凑折叠手输链接条：默认收起以释放首屏空间 -->
+    <details id="sp-url-disclosure" class="clean-disclosure sp-url-disclosure">
+      <summary>
+        <span id="sp-tab-status" class="status-indicator">正在识别当前网页…</span> · 手输链接
+      </summary>
+      <div class="disclosure-body sp-url-bar">
+        <input id="sp-url-input" type="search" class="input input-xs grow" aria-label="粘贴 Google Drive 链接或文件 ID" placeholder="粘贴 Drive 文档/文件夹链接或 ID…">
+        <button id="sp-inspect-btn" type="button" class="btn primary btn-xs">核查</button>
+        <button id="sp-read-tab-btn" type="button" class="btn btn-xs" title="读取当前活动标签页的 Google Drive 链接并核查权限">读取当前页</button>
+      </div>
+    </details>
+
+    <!-- 主体滚动工作区 -->
+    <main id="sp-main" class="sp-main">
+      <!-- 零已授权账号引导区 -->
+      <section id="sp-no-account-box" class="sp-empty-state hidden">
+        <h2>尚未授权 Google 账号</h2>
+        <p>伴随侧栏直接复用本地授权凭证实时读取与治理当前网页文件权限。请先打开全屏工作台导入 Google OAuth 客户端 JSON 或服务账号密钥完成授权。</p>
+        <button id="sp-go-onboarding-btn" type="button" class="btn primary btn-sm">前往全屏工作台完成授权 ↗</button>
+      </section>
+
+      <!-- 非具体 Drive 文件或待核查空状态 -->
+      <section id="sp-empty-box" class="sp-empty-state">
+        <h2 id="sp-empty-title">点开云端文档即可自动核查权限</h2>
+        <p id="sp-empty-desc">在当前窗口浏览 Google 文档、表格、幻灯片或 Drive 文件夹时，此侧栏会自动识别文件并优先展示风险预警与谁有权限；您也可以展开上方「手输链接」粘贴任意链接核查。</p>
+      </section>
+
+      <!-- 单文件就地深度核查与治理视图（三层视觉优先级） -->
+      <div id="sp-file-view" class="hidden">
+        <!-- 第 1 优先级 A：排除目录豁免提示条 -->
+        <div id="sp-excluded-banner" class="sp-excluded-banner hidden" role="status">
+          <span id="sp-excluded-text">🛡️ 已设为对外排除目录，不自动关链</span>
+        </div>
+
+        <!-- 第 1 优先级 B：宽权限醒目预警卡与紧急止血按钮 -->
+        <div id="sp-wide-alert-bar" class="sp-wide-alert sp-alert-bar hidden" role="region" aria-label="宽权限风险预警">
+          <strong id="sp-wide-alert-title">检测到宽权限暴露风险</strong>
+          <span id="sp-wide-alert-desc"></span>
+          <div class="sp-alert-actions">
+            <button id="sp-close-public-btn" type="button" class="btn danger btn-xs">🔴 关闭公开链接</button>
+            <button id="sp-enforce-btn" type="button" class="btn warning btn-xs">🟠 一键按白名单修正</button>
+            <button id="sp-align-parent-btn" type="button" class="btn warning btn-xs">⚠️ 对齐父目录</button>
+            <button id="sp-quick-harden-writers-btn" type="button" class="btn btn-xs hidden">🔒 禁编辑拉人</button>
+          </div>
+        </div>
+
+        <!-- 第 2 优先级 A：精简文件身份卡 -->
+        <section class="sp-file-header">
+          <div class="sp-file-title">
+            <span id="sp-file-type" class="meta-inline">文件</span>
+            <h2 id="sp-file-name">未选择文件</h2>
+            <span id="sp-compliance-status" class="status-pill ok">符合策略</span>
+          </div>
+          <div class="sp-file-actions">
+            <button id="sp-header-close-public-btn" type="button" class="btn danger btn-xs" title="一键关闭当前文件的公开与域内共享链接">🔴 一键关闭公开权限</button>
+            <button id="sp-refresh-btn" type="button" class="btn btn-xs" title="重新拉取该文件的最新云端权限">刷新</button>
+            <button id="sp-open-in-dashboard-btn" type="button" class="btn btn-xs" title="在全屏工作台定位并查看该文件">大盘定位</button>
+            <button id="sp-toggle-exclude-btn" type="button" class="btn btn-xs" title="将此目录或文件设为对外排除项，扫描与自动关链将跳过">设为排除目录</button>
+            <a id="sp-open-drive-link" href="#" target="_blank" rel="noopener noreferrer" class="btn-link">原链接 ↗</a>
+          </div>
+          <div class="sp-file-meta">
+            <select id="sp-account-select" class="select select-sm grow" aria-label="切换核查账号视角" title="切换核查与修改权限所使用的已授权账号"></select>
+            <span id="sp-owner-hint" class="muted hidden"></span>
+          </div>
+        </section>
+
+        <!-- 第 2 优先级 B：核心清单「谁有权限」直接前置（独立定高滚动） -->
+        <section id="sp-perms-section" class="sp-section sp-perm-section">
+          <div class="sp-section-head">
+            <h3 class="sp-section-title">谁有权限</h3>
+            <span id="sp-perm-count" class="meta-inline">0 项</span>
+          </div>
+          <div id="sp-perm-list" class="sp-perm-list"></div>
+        </section>
+
+        <!-- 第 3 优先级：底部清爽二段式快捷操作卡 -->
+        <section id="sp-actions-section" class="sp-section">
+          <div class="sp-action-tabs segmented full-segmented" role="tablist" aria-label="快捷权限操作切换">
+            <button id="sp-act-tab-share-btn" type="button" class="seg-btn active" role="tab" aria-selected="true" data-sp-tab="share">加人 / 按组授权</button>
+            <button id="sp-act-tab-lock-btn" type="button" class="seg-btn" role="tab" aria-selected="false" data-sp-tab="lock">权限锁与对齐</button>
+          </div>
+
+          <!-- 快捷面板 1：加人 / 按组授权 -->
+          <div id="sp-act-panel-share" role="tabpanel" aria-labelledby="sp-act-tab-share-btn">
+            <div class="sp-form-row">
+              <input id="sp-add-email" type="email" class="input input-xs grow" aria-label="添加协作者邮箱地址" placeholder="输入协作者邮箱地址…">
+              <select id="sp-add-role" class="select select-sm" aria-label="选择协作者角色">
+                <option value="reader">仅查看</option>
+                <option value="commenter">可评论</option>
+                <option value="writer">可编辑</option>
+              </select>
+            </div>
+            <div class="sp-form-row">
+              <select id="sp-add-ttl" class="select select-sm grow" aria-label="协作者权限有效期">
+                <option value="none">长期有效</option>
+                <option value="24h">限时 24 小时</option>
+                <option value="7d">限时 7 天</option>
+                <option value="30d">限时 30 天</option>
+                <option value="custom">自定义到期…</option>
+              </select>
+              <button id="sp-add-perm-btn" type="button" class="btn primary btn-xs">添加协作者</button>
+            </div>
+            <input id="sp-add-ttl-custom" type="datetime-local" class="input input-xs full-width hidden" aria-label="自定义协作者权限到期时间">
+
+            <!-- 折叠分隔的按人员分组快捷赋权 -->
+            <details id="sp-group-disclosure" class="clean-disclosure">
+              <summary>按人员分组快捷赋权</summary>
+              <div id="sp-group-section" class="disclosure-body">
+                <div id="sp-group-coverage" class="group-coverage-list"></div>
+                <div class="sp-form-row">
+                  <select id="sp-group-select" class="select select-sm grow" aria-label="选择人员分组"></select>
+                  <select id="sp-group-role" class="select select-sm" aria-label="选择分组授权角色">
+                    <option value="group_default">按表格个人权限 / 组默认</option>
+                    <option value="writer">统一可编辑</option>
+                    <option value="commenter">统一可评论</option>
+                    <option value="reader">统一仅查看</option>
+                  </select>
+                </div>
+                <div class="sp-form-row">
+                  <select id="sp-group-ttl" class="select select-sm grow" aria-label="分组授权有效期">
+                    <option value="none">长期有效</option>
+                    <option value="24h">限时 24 小时</option>
+                    <option value="7d">限时 7 天</option>
+                    <option value="30d">限时 30 天</option>
+                    <option value="custom">自定义到期…</option>
+                  </select>
+                  <button id="sp-group-grant-btn" type="button" class="btn primary btn-xs">开通组权限</button>
+                  <button id="sp-group-revoke-btn" type="button" class="btn danger btn-xs">撤除组权限</button>
+                </div>
+                <input id="sp-group-ttl-custom" type="datetime-local" class="input input-xs full-width hidden" aria-label="自定义分组权限到期时间">
+              </div>
+            </details>
+          </div>
+
+          <!-- 快捷面板 2：权限锁与对齐 -->
+          <div id="sp-act-panel-lock" class="hidden" role="tabpanel" aria-labelledby="sp-act-tab-lock-btn">
+            <div id="sp-security-bar" class="sp-security-bar" role="region" aria-label="修改编辑与下载权限">
+              <span class="meta-inline">修改编辑与下载权限</span>
+              <span id="sp-security-status" class="status-pill info">默认状态</span>
+              <button id="sp-toggle-writers-share" type="button" class="btn btn-xs" aria-pressed="false" title="开启后禁止编辑者拉入新协作者或修改文件共享权限">禁编辑拉人</button>
+              <button id="sp-toggle-copy-lock" type="button" class="btn btn-xs" aria-pressed="false" title="开启后禁止仅查看与可评论人员下载、打印或复制">禁下载复制</button>
+              <button id="sp-toggle-content-lock" type="button" class="btn btn-xs" aria-pressed="false" title="锁定文件内容为只读状态以防误改">锁定防误改</button>
+            </div>
+            <div id="sp-parent-align-box" class="sub-well">
+              <span id="sp-parent-align-desc" class="muted">当前文件权限与父目录保持一致，无子项独立提权逃逸。</span>
+              <button id="sp-panel-align-parent-btn" type="button" class="btn warning btn-xs hidden">⚠️ 对齐父目录权限</button>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <!-- 原生 Top-Layer 非打断式通知区域 -->
+    <div role="region" aria-label="系统通知" class="toast-region">
+      <div id="sp-toast" class="toast-popover" popover="manual">
+        <span id="sp-toast-text" class="toast-text"></span>
+        <button type="button" id="sp-toast-close-btn" class="toast-close" popovertarget="sp-toast" popovertargetaction="hide" aria-label="关闭通知">×</button>
+      </div>
+      <div id="sp-toast-live" class="visually-hidden" aria-live="polite"></div>
+    </div>
+  </div>
+
+  <script src="core.js"></script>
+  <script src="sidepanel.js"></script>
+</body>
+</html>

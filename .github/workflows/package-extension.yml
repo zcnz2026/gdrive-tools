@@ -29,7 +29,10 @@ jobs:
         run: |
           node --check background.js
           node --check core.js
+          node --check theme-init.js
           node --check popup.js
+          node --check sidepanel.js
+          node --check oauth-blocked.js
           node --check vendor/jsuites.js
           node --check vendor/jspreadsheet.js
           node -e '
@@ -57,7 +60,7 @@ jobs:
           rm -rf dist
           mkdir -p "${STAGE_DIR}"
 
-          cp manifest.json background.js core.js popup.html popup.css popup.js README.md "${STAGE_DIR}/"
+          cp manifest.json background.js core.js theme-init.js popup.html popup.css popup.js sidepanel.html sidepanel.js oauth-blocked.html oauth-blocked.js README.md "${STAGE_DIR}/"
           cp -r icons vendor "${STAGE_DIR}/"
 
           (cd "${STAGE_DIR}" && zip -r -9 "../../dist/${ZIP_NAME}" .)

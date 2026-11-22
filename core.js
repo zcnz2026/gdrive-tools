@@ -1,13 +1,35 @@
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const ALARM_NAME = 'drive_permission_periodic_scan';
+const TTL_ALARM_NAME = 'gdrive-ttl-reaper';
+
+const DEFAULT_BLOCKED_APP_KEYWORDS = [
+  'chatgpt',
+  'openai',
+  'grok',
+  'xai',
+  'muse',
+  'claude',
+  'cursor',
+  'notion',
+  'zapier',
+  'make'
+];
 
 const DEFAULT_POLICY = {
   writers: [],          // 允许编辑的邮箱或 @domain.com
   readers: [],          // 仅允许查看的邮箱或 @domain.com
   publicLinkRule: 'forbid', // 'forbid' | 'reader_only' | 'allow'
-  scheduleEnabled: false,
-  scheduleMinutes: 60,
-  autoEnforce: false    // false = 仅提醒, true = 后台自动撤权/降级
+  scheduleEnabled: true,
+  scheduleMinutes: 720, // 默认每 12 小时定期巡检
+  scanOnBrowserStartup: true,
+  autoEnforce: false,   // false = 仅提醒, true = 后台自动撤权/降级
+  excludedFolders: [],  // [{ id, name, webViewLink, includeSubitems: true, note: '', addedAt }]
+  thirdPartyOAuthGuardEnabled: true,
+  oauthGuardMode: 'block', // 'block' | 'alert'
+  blockThirdPartyDriveScope: true,
+  blockThirdPartySheetsScope: true,
+  blockedAppKeywords: [...DEFAULT_BLOCKED_APP_KEYWORDS],
+  trustedOAuthKeywords: []
 };
 
 const DEFAULT_DIRECTORY = {
@@ -38,7 +60,7 @@ async function safeStorageSet(payload) {
   } catch (err) {
     const msg = String(err?.message || err || '');
     if (/quota|QuotaBytes/i.test(msg)) {
-      // 如果当前保存的不是 scanSnapshot（例如保存免登录账号、OAuth凭据、全盘转移进度），先清除占空间最大的 scanSnapshot 缓存再重试
+      // 如果当前保存的不是 scanSnapshot（例如保存账号授权状态、OAuth凭据、全盘转移进度），先清除占空间最大的 scanSnapshot 缓存再重试
       if (!('scanSnapshot' in payload)) {
         try {
           await chrome.storage.local.remove('scanSnapshot');
@@ -77,7 +99,155 @@ async function safeStorageSet(payload) {
   }
 }
 
-/* ==================== 通讯录与邮箱分组（A列名称 / B列邮箱 / 分组） ==================== */
+/* ==================== 通讯录、分组与权限角色解析（A列邮箱 · B列权限 · 可选C列分组） ==================== */
+
+const WRITER_ROLE_TOKENS = new Set([
+  'writer',
+  'edit',
+  'editor',
+  'write',
+  'can_edit',
+  'canedit',
+  '可编辑',
+  '编辑',
+  '编辑者',
+  '允许编辑',
+  '读写',
+  '修改'
+]);
+
+const COMMENTER_ROLE_TOKENS = new Set([
+  'commenter',
+  'comment',
+  'can_comment',
+  'cancomment',
+  '可评论',
+  '评论',
+  '评论者',
+  '允许评论',
+  '仅评论',
+  '批注'
+]);
+
+const READER_ROLE_TOKENS = new Set([
+  'reader',
+  'read',
+  'view',
+  'viewer',
+  'readonly',
+  'read-only',
+  'can_view',
+  'canview',
+  '仅查看',
+  '仅限查看',
+  '只读',
+  '查看',
+  '查看者',
+  '浏览'
+]);
+
+/**
+ * 归一化权限角色词：
+ * - 命中编辑词 -> 'writer'
+ * - 命中评论词 -> 'commenter'
+ * - 命中查看词 -> 'reader'
+ * - 未命中时返回 fallback（当 fallback === '' 时返回 ''）
+ */
+function normalizePermissionRole(raw, fallback = 'reader') {
+  const clean = String(raw ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/^['"「【\s]+|['"」】\s]+$/g, '');
+  if (!clean) return fallback;
+  if (WRITER_ROLE_TOKENS.has(clean)) return 'writer';
+  if (COMMENTER_ROLE_TOKENS.has(clean)) return 'commenter';
+  if (READER_ROLE_TOKENS.has(clean)) return 'reader';
+  return fallback;
+}
+
+/**
+ * 计算成员在指定分组下的有效目标角色：
+ * 优先级：c.groupRoles?.[groupName] -> c.role -> group.defaultRole -> 'reader'
+ */
+function getEffectiveMemberRoleInGroup(contact, groupName = '', groupObj = null) {
+  if (groupName && contact?.groupRoles && contact.groupRoles[groupName]) {
+    const gr = normalizePermissionRole(contact.groupRoles[groupName], '');
+    if (gr) return gr;
+  }
+  if (contact?.role) {
+    const cr = normalizePermissionRole(contact.role, '');
+    if (cr) return cr;
+  }
+  if (groupObj?.defaultRole) {
+    return normalizePermissionRole(groupObj.defaultRole, 'reader');
+  }
+  return 'reader';
+}
+
+/**
+ * 批量解析多行分组创建文本：
+ * 支持 `财务组, 可编辑`、`审计组\t仅查看`、`外包组：可评论`、`设计组 可编辑` 或每行一个纯组名
+ * 返回 [{ name, defaultRole, policyTier }]
+ */
+function parseBatchGroupsText(rawText = '', fallbackRole = 'reader') {
+  const cleanFallback = normalizePermissionRole(fallbackRole, 'reader') || 'reader';
+  const lines = String(rawText || '')
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(Boolean);
+
+  const byName = new Map();
+  for (const line of lines) {
+    let name = '';
+    let defaultRole = cleanFallback;
+
+    const parts = line
+      .split(/[\t,，;；:：|]+/)
+      .map(s => s.trim().replace(/^"|"$/g, ''))
+      .filter(Boolean);
+
+    if (parts.length >= 2) {
+      const rSecond = normalizePermissionRole(parts[1], '');
+      const rLast = normalizePermissionRole(parts[parts.length - 1], '');
+      const rFirst = normalizePermissionRole(parts[0], '');
+      if (rSecond) {
+        name = parts[0];
+        defaultRole = rSecond;
+      } else if (rLast) {
+        name = parts.slice(0, -1).join(' ');
+        defaultRole = rLast;
+      } else if (rFirst && !normalizePermissionRole(parts[1], '')) {
+        name = parts[1];
+        defaultRole = rFirst;
+      } else {
+        name = parts[0];
+        defaultRole = cleanFallback;
+      }
+    } else if (parts.length === 1) {
+      const single = parts[0];
+      const tailMatch = single.match(/^(.+?)(?:\s+-\s+|\s+)(\S+)$/);
+      const tailRole = tailMatch ? normalizePermissionRole(tailMatch[2], '') : '';
+      if (tailMatch && tailRole) {
+        name = tailMatch[1].trim();
+        defaultRole = tailRole;
+      } else {
+        name = single.trim();
+        defaultRole = cleanFallback;
+      }
+    }
+
+    const cleanName = String(name || '').trim();
+    if (!cleanName) continue;
+    const policyTier = defaultRole === 'writer' ? 'writer' : 'reader';
+    byName.set(cleanName, {
+      name: cleanName,
+      defaultRole,
+      policyTier
+    });
+  }
+
+  return [...byName.values()];
+}
 
 async function getDirectory() {
   const data = await chrome.storage.local.get('directory');
@@ -92,35 +262,101 @@ async function getDirectory() {
 
 async function saveDirectory(directory) {
   const cleanGroups = [];
-  const seenGroup = new Set();
-  for (const g of directory.groups || []) {
-    const name = String(g.name || '').trim();
-    if (!name || seenGroup.has(name)) continue;
-    seenGroup.add(name);
-    cleanGroups.push({
-      name,
-      defaultRole: g.defaultRole === 'writer' ? 'writer' : 'reader',
-      policyTier: ['writer', 'reader', 'none'].includes(g.policyTier) ? g.policyTier : 'writer'
-    });
+  const groupByName = new Map();
+  for (const g of directory?.groups || []) {
+    const name = String(g?.name || '').trim();
+    if (!name || groupByName.has(name)) continue;
+    const defaultRole = normalizePermissionRole(g.defaultRole, 'reader') || 'reader';
+    const policyTier = ['writer', 'reader', 'none'].includes(g.policyTier)
+      ? g.policyTier
+      : defaultRole === 'writer'
+        ? 'writer'
+        : 'reader';
+    const cleanAssets = [];
+    const seenAssetIds = new Set();
+    if (Array.isArray(g.assets)) {
+      for (const rawAsset of g.assets) {
+        if (!rawAsset) continue;
+        const fid = String(rawAsset.fileId || rawAsset.id || '').trim();
+        if (!fid || seenAssetIds.has(fid)) continue;
+        seenAssetIds.add(fid);
+        cleanAssets.push({
+          fileId: fid,
+          fileName: String(rawAsset.fileName || rawAsset.name || '(无名称)').trim(),
+          mimeType: String(rawAsset.mimeType || ''),
+          webViewLink: String(
+            rawAsset.webViewLink || formatDriveCanonicalLink({ id: fid, mimeType: rawAsset.mimeType || '' })
+          )
+        });
+      }
+    }
+    const grpObj = { name, defaultRole, policyTier, assets: cleanAssets };
+    groupByName.set(name, grpObj);
+    cleanGroups.push(grpObj);
   }
 
   const contactMap = new Map();
-  for (const c of directory.contacts || []) {
-    const email = normalizeEntry(c.email);
+  for (const c of directory?.contacts || []) {
+    const email = normalizeEntry(c?.email || '');
     if (!email || !email.includes('@')) continue;
     const prev = contactMap.get(email);
-    const mergedGroups = [...new Set([...(prev?.groups || []), ...(c.groups || [])].map(x => String(x).trim()).filter(Boolean))];
+    const incomingGroups = Array.isArray(c.groups)
+      ? c.groups.map(x => String(x || '').trim()).filter(Boolean)
+      : [];
+    const mergedGroups = [...new Set([...(prev?.groups || []), ...incomingGroups])];
+
+    for (const gName of mergedGroups) {
+      if (!groupByName.has(gName)) {
+        const autoRole = normalizePermissionRole(c.groupRoles?.[gName] || c.role, 'reader') || 'reader';
+        const newGrp = {
+          name: gName,
+          defaultRole: 'reader',
+          policyTier: autoRole === 'writer' ? 'writer' : 'reader'
+        };
+        groupByName.set(gName, newGrp);
+        cleanGroups.push(newGrp);
+      }
+    }
+
+    const mergedGroupRoles = { ...(prev?.groupRoles || {}) };
+    if (c.groupRoles && typeof c.groupRoles === 'object') {
+      for (const [gk, gv] of Object.entries(c.groupRoles)) {
+        const cleanGk = String(gk || '').trim();
+        const cleanGv = normalizePermissionRole(gv, '');
+        if (cleanGk && cleanGv) {
+          mergedGroupRoles[cleanGk] = cleanGv;
+        }
+      }
+    }
+
+    const explicitRole = c.role ? normalizePermissionRole(c.role, '') : '';
+    if (explicitRole && c.hasExplicitRole && incomingGroups.length > 0 && !c.groupRoles) {
+      for (const gName of incomingGroups) {
+        mergedGroupRoles[gName] = explicitRole;
+      }
+    }
+
+    let finalRole = explicitRole || prev?.role || '';
+    if (!finalRole) {
+      let bestRank = 0;
+      for (const gName of mergedGroups) {
+        const gRole = mergedGroupRoles[gName] || groupByName.get(gName)?.defaultRole || 'reader';
+        const rank = PERMISSION_ROLE_RANKS[gRole] || 0;
+        if (rank > bestRank) {
+          bestRank = rank;
+          finalRole = gRole;
+        }
+      }
+      if (!finalRole) finalRole = 'reader';
+    }
+
     contactMap.set(email, {
       email,
       name: String(c.name || prev?.name || '').trim(),
-      groups: mergedGroups
+      groups: mergedGroups,
+      role: finalRole,
+      groupRoles: mergedGroupRoles
     });
-    for (const gName of mergedGroups) {
-      if (!seenGroup.has(gName)) {
-        seenGroup.add(gName);
-        cleanGroups.push({ name: gName, defaultRole: 'reader', policyTier: 'reader' });
-      }
-    }
   }
 
   const nextDir = {
@@ -133,28 +369,50 @@ async function saveDirectory(directory) {
 }
 
 /**
- * 将分组中设置了白名单策略（policyTier: writer / reader）的成员同步到白名单
+ * 将名录与分组中的成员按有效角色同步到合规白名单：
+ * - 有效角色为 'writer' 同步入 writers
+ * - 有效角色为 'reader' | 'commenter' 同步入 readers
  */
 async function syncDirectoryToPolicy(directory) {
   const currentPolicy = await getPolicy();
-  const writerGroupNames = new Set(
-    (directory.groups || []).filter(g => g.policyTier === 'writer').map(g => g.name)
-  );
-  const readerGroupNames = new Set(
-    (directory.groups || []).filter(g => g.policyTier === 'reader').map(g => g.name)
-  );
+  const groupByName = new Map();
+  for (const g of directory?.groups || []) {
+    if (g?.name) groupByName.set(g.name, g);
+  }
 
   const writers = new Set(currentPolicy.writers || []);
   const readers = new Set(currentPolicy.readers || []);
 
-  for (const c of directory.contacts || []) {
-    const inW = (c.groups || []).some(g => writerGroupNames.has(g));
-    const inR = (c.groups || []).some(g => readerGroupNames.has(g));
-    if (inW) {
-      writers.add(c.email);
-      readers.delete(c.email);
-    } else if (inR && !writers.has(c.email)) {
-      readers.add(c.email);
+  for (const c of directory?.contacts || []) {
+    const email = normalizeEntry(c?.email || '');
+    if (!email) continue;
+
+    const memberGroups = Array.isArray(c.groups) ? c.groups.filter(Boolean) : [];
+    let effectiveRole = '';
+
+    if (memberGroups.length > 0) {
+      const activeGroups = memberGroups.filter(gName => groupByName.get(gName)?.policyTier !== 'none');
+      if (activeGroups.length === 0) continue;
+
+      let bestRank = 0;
+      for (const gName of activeGroups) {
+        const grp = groupByName.get(gName);
+        const r = getEffectiveMemberRoleInGroup(c, gName, grp);
+        const rank = PERMISSION_ROLE_RANKS[r] || 0;
+        if (rank > bestRank) {
+          bestRank = rank;
+          effectiveRole = r;
+        }
+      }
+    } else {
+      effectiveRole = normalizePermissionRole(c.role, 'reader') || 'reader';
+    }
+
+    if (effectiveRole === 'writer') {
+      writers.add(email);
+      readers.delete(email);
+    } else if ((effectiveRole === 'reader' || effectiveRole === 'commenter') && !writers.has(email)) {
+      readers.add(email);
     }
   }
 
@@ -167,54 +425,169 @@ async function syncDirectoryToPolicy(directory) {
   return nextPolicy;
 }
 
+function splitTabularRowCells(line = '') {
+  if (line.includes('\t')) {
+    return line.split('\t').map(s => s.trim().replace(/^"|"$/g, '').replace(/""/g, '"'));
+  }
+  const cells = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        cur += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (!inQuotes && (ch === ',' || ch === ';' || ch === '，' || ch === '；')) {
+      cells.push(cur.trim());
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  cells.push(cur.trim());
+  return cells.map(s => s.replace(/^"|"$/g, '').trim());
+}
+
+function extractEmailAndInlineNameFromCell(cell = '') {
+  const str = String(cell || '').trim();
+  if (!str) return null;
+  if (/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(str)) {
+    return { email: normalizeEntry(str), inlineName: '' };
+  }
+  const angleMatch = str.match(/^(.*?)<\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\s*>$/);
+  if (angleMatch) {
+    return {
+      email: normalizeEntry(angleMatch[2]),
+      inlineName: angleMatch[1].trim().replace(/^["']|["']$/g, '').trim()
+    };
+  }
+  return null;
+}
+
 /**
- * 解析从表格复制粘贴或 CSV 导入的文本
- * 默认支持：A列 = 名称，B列 = 邮箱，可选 C列 = 分组名
- * 同时智能识别如果某列含 @ 则自动作为邮箱列
+ * 解析从 Google 表格、CSV 或粘贴文本读取的成员与权限：
+ * - 标准优先格式：A列邮箱 (index 0)，B列权限角色，可选 C列分组名，可选 D列姓名；
+ *   若 B列非角色词，则兼容旧表识别组名/姓名并回退 fallbackRole。
+ * - 兼容旧格式：B列邮箱 (index 1)，A列姓名，自动识别 C/D 列中的角色词与分组名。
  */
-function parseTabularContactsText(rawText = '', fallbackGroup = '') {
-  const lines = String(rawText)
+function parseTabularContactsText(rawText = '', fallbackGroup = '', fallbackRole = 'reader') {
+  const cleanFallbackGroup = fallbackGroup ? String(fallbackGroup).trim() : '';
+  const defaultRole = normalizePermissionRole(fallbackRole, 'reader') || 'reader';
+  const lines = String(rawText || '')
     .split(/\r?\n/)
     .map(l => l.trim())
     .filter(Boolean);
 
   const results = [];
   for (const line of lines) {
-    // 支持制表符(Excel/Sheets复制)、逗号、分号分隔
-    const cells = line.includes('\t')
-      ? line.split('\t').map(s => s.trim().replace(/^"|"$/g, ''))
-      : line.split(/[,;，；]/).map(s => s.trim().replace(/^"|"$/g, ''));
-
+    const cells = splitTabularRowCells(line);
     if (!cells.length) continue;
 
-    // 寻找包含 @ 的单元格作为邮箱
-    const emailIdx = cells.findIndex(c => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(c));
-    if (emailIdx === -1) {
-      // 可能是表头行（如：名称, 邮箱, 分组），自动跳过
+    let emailIdx = -1;
+    let extracted = null;
+    for (let i = 0; i < cells.length; i++) {
+      const hit = extractEmailAndInlineNameFromCell(cells[i]);
+      if (hit) {
+        emailIdx = i;
+        extracted = hit;
+        break;
+      }
+    }
+    if (emailIdx === -1 || !extracted) {
+      // 表头行或无邮箱行自动跳过
       continue;
     }
 
-    const email = normalizeEntry(cells[emailIdx]);
-    let name = '';
-    let group = fallbackGroup ? String(fallbackGroup).trim() : '';
+    const email = extracted.email;
+    let name = extracted.inlineName || '';
+    let group = cleanFallbackGroup;
+    let role = defaultRole;
+    let hasExplicitRole = false;
 
-    if (emailIdx === 1) {
-      // 标准情况：A列是名称 (index 0)，B列是邮箱 (index 1)，C列可选是分组 (index 2)
-      name = cells[0] || '';
-      if (cells[2]) group = cells[2];
-    } else if (emailIdx === 0) {
-      // A列直接是邮箱，B列可能是名称或分组
-      name = cells[1] || '';
-      if (cells[2]) group = cells[2];
+    if (emailIdx === 0) {
+      // 标准优先格式：A列是邮箱
+      const c1 = cells[1] || '';
+      const c2 = cells[2] || '';
+      const c3 = cells[3] || '';
+      const role1 = normalizePermissionRole(c1, '');
+      const role2 = !role1 ? normalizePermissionRole(c2, '') : '';
+
+      if (role1) {
+        role = role1;
+        hasExplicitRole = true;
+        if (c2) group = c2;
+        if (c3) name = c3;
+      } else if (role2) {
+        role = role2;
+        hasExplicitRole = true;
+        if (c3) {
+          name = c1;
+          group = c3;
+        } else if (cleanFallbackGroup) {
+          name = c1;
+          group = cleanFallbackGroup;
+        } else {
+          group = c1;
+        }
+      } else {
+        if (c1 && c2) {
+          name = c1;
+          group = c2;
+        } else if (c1) {
+          if (cleanFallbackGroup) {
+            name = c1;
+          } else if (/组|部|科|中心|团队|项目|group|team|dept/i.test(c1)) {
+            group = c1;
+          } else {
+            name = c1;
+          }
+        }
+      }
+    } else if (emailIdx === 1) {
+      // 兼容旧格式：A列是姓名，B列是邮箱，C/D列为角色或分组
+      name = cells[0] || name;
+      const c2 = cells[2] || '';
+      const c3 = cells[3] || '';
+      const role2 = normalizePermissionRole(c2, '');
+      const role3 = !role2 ? normalizePermissionRole(c3, '') : '';
+
+      if (role2) {
+        role = role2;
+        hasExplicitRole = true;
+        if (c3) group = c3;
+      } else if (role3) {
+        role = role3;
+        hasExplicitRole = true;
+        if (c2) group = c2;
+      } else if (c2) {
+        group = c2;
+      }
     } else {
-      name = cells[0] || '';
-      if (cells[emailIdx + 1]) group = cells[emailIdx + 1];
+      name = cells[0] || name;
+      for (let idx = 1; idx < cells.length; idx++) {
+        if (idx === emailIdx) continue;
+        const val = cells[idx] || '';
+        if (!val) continue;
+        const maybeRole = normalizePermissionRole(val, '');
+        if (maybeRole && !hasExplicitRole) {
+          role = maybeRole;
+          hasExplicitRole = true;
+        } else if (!group || group === cleanFallbackGroup) {
+          group = val;
+        }
+      }
     }
 
     results.push({
-      name: name.trim(),
+      name: String(name || '').trim(),
       email,
-      group: group.trim()
+      group: String(group || '').trim(),
+      role,
+      hasExplicitRole
     });
   }
   return results;
@@ -229,21 +602,28 @@ function extractDriveFileId(input = '') {
   return str;
 }
 
-async function fetchContactsFromGoogleSheet(token, sheetIdOrUrl, fallbackGroup = '') {
+function extractGoogleSheetGid(input = '') {
+  const str = String(input || '').trim();
+  const match = str.match(/[?&#]gid=(\d+)/i);
+  return match ? match[1] : '';
+}
+
+async function fetchContactsFromGoogleSheet(token, sheetIdOrUrl, fallbackGroup = '', fallbackRole = 'reader') {
   const fileId = extractDriveFileId(sheetIdOrUrl);
   if (!fileId) throw new Error('请输入有效的 Google 表格链接或文件 ID');
-  const response = await fetch(
-    `${DRIVE_API}/files/${encodeURIComponent(fileId)}/export?mimeType=text/csv`,
-    {
-      headers: { Authorization: `Bearer ${token}` }
-    }
-  );
+  const gid = extractGoogleSheetGid(sheetIdOrUrl);
+  const exportUrl = `${DRIVE_API}/files/${encodeURIComponent(fileId)}/export?mimeType=text/csv${
+    gid ? `&gid=${encodeURIComponent(gid)}` : ''
+  }`;
+  const response = await fetch(exportUrl, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
   if (!response.ok) {
     const errBody = await response.json().catch(() => ({}));
     throw new Error(errBody?.error?.message || `读取 Google 表格失败 (${response.status})`);
   }
   const csvText = await response.text();
-  return parseTabularContactsText(csvText, fallbackGroup);
+  return parseTabularContactsText(csvText, fallbackGroup, fallbackRole);
 }
 
 function buildContactLookup(directory) {
@@ -770,14 +1150,33 @@ async function computePkceChallengeS256(verifier) {
   return base64UrlEncodeBytes(new Uint8Array(digest));
 }
 
+const DEPRECATED_PASSPORT_ERROR_MSG =
+  '已移除免授权通行证导入功能，请导入标准 Google OAuth 客户端 JSON 在浏览器中完成授权';
+
+function isDeprecatedAuthPassportJson(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+  if (typeof obj.bundleType === 'string' && /passport/i.test(obj.bundleType)) return true;
+  if (obj.encryptedPassport) return true;
+  if (obj.encrypted === true && obj.kdf && obj.cipher && typeof obj.ciphertext === 'string') return true;
+  if (Array.isArray(obj.authorizedAccounts)) return true;
+  if (obj.refreshToken || obj.refresh_token || obj.accessToken || obj.access_token) return true;
+  return false;
+}
+
 function extractOAuthClientsFromJson(parsed, fileName = '') {
   if (!parsed || typeof parsed !== 'object') return [];
+  if (isDeprecatedAuthPassportJson(parsed)) {
+    throw new Error(DEPRECATED_PASSPORT_ERROR_MSG);
+  }
   const items = Array.isArray(parsed) ? parsed : [parsed];
   const clients = [];
 
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     if (!item || typeof item !== 'object') continue;
+    if (isDeprecatedAuthPassportJson(item)) {
+      throw new Error(DEPRECATED_PASSPORT_ERROR_MSG);
+    }
 
     // 1. 支持 Google Cloud Service Account 服务账号 JSON (如 sa-140@sa-140.iam.gserviceaccount.com)
     if (item.type === 'service_account' && item.client_email && item.private_key) {
@@ -846,6 +1245,9 @@ function pemToArrayBuffer(pem = '') {
   return bytes.buffer;
 }
 
+const OAUTH_DRIVE_AND_SHEETS_SCOPES =
+  'https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/spreadsheets';
+
 async function mintServiceAccountAccessToken({ clientEmail, privateKey, tokenUri }) {
   if (!clientEmail || !privateKey) {
     throw new Error('服务账号配置缺少 client_email 或 private_key');
@@ -855,7 +1257,7 @@ async function mintServiceAccountAccessToken({ clientEmail, privateKey, tokenUri
   const header = { alg: 'RS256', typ: 'JWT' };
   const claimSet = {
     iss: clientEmail,
-    scope: 'https://www.googleapis.com/auth/drive',
+    scope: OAUTH_DRIVE_AND_SHEETS_SCOPES,
     aud: targetUri,
     iat: nowSec - 30,
     exp: nowSec + 3500
@@ -954,391 +1356,6 @@ async function removeAuthorizedAccount(email) {
   return next;
 }
 
-/**
- * 导出已授权账号通行证 JSON（包含 refreshToken / clientSecret / ServiceAccount 私钥及可选的全盘转移进度），
- * 复制到任意其他电脑导入后，无需在浏览器登录 Google 账号即可直接使用所有权限管理与转移功能。
- */
-async function buildAuthorizedPassportBundle({ onlyEmail = '', includeTransferState = true } = {}) {
-  const [oauthClients, authorizedAccounts, policy, directory, transferState] = await Promise.all([
-    getOAuthClients(),
-    getAuthorizedAccounts(),
-    getPolicy(),
-    getDirectory(),
-    getOwnershipTransferState()
-  ]);
-
-  const normOnly = normalizeEntry(onlyEmail);
-  const filteredAccounts = normOnly
-    ? authorizedAccounts.filter(a => normalizeEntry(a.email) === normOnly)
-    : authorizedAccounts;
-
-  const filteredClients = normOnly
-    ? oauthClients.filter(
-        c =>
-          c.client_id === filteredAccounts[0]?.clientId ||
-          normalizeEntry(c.boundEmail || '') === normOnly ||
-          (Array.isArray(c.boundEmails) && c.boundEmails.map(normalizeEntry).includes(normOnly))
-      )
-    : oauthClients;
-
-  const payload = {
-    bundleType: 'google_drive_auth_passport_v1',
-    exportedAt: new Date().toISOString(),
-    description: 'Google Drive 权限管理插件 - 免浏览器登录已授权通行证（复制到其他电脑导入即可直接使用）',
-    oauthClients: filteredClients,
-    authorizedAccounts: filteredAccounts
-  };
-
-  if (!normOnly) {
-    payload.policy = policy;
-    payload.directory = directory;
-    if (includeTransferState && transferState?.items?.length) {
-      payload.ownershipTransferState = transferState;
-    }
-  }
-  return payload;
-}
-
-const PASSPORT_ENCRYPTED_BUNDLE_TYPE = 'google_drive_auth_passport_encrypted_v2';
-const PASSPORT_PBKDF2_ITERATIONS = 310000;
-const PASSPORT_PBKDF2_MIN_ITERATIONS = 100000;
-const PASSPORT_PBKDF2_MAX_ITERATIONS = 2000000;
-const PASSPORT_MIN_PASSWORD_LENGTH = 8;
-
-function bytesToBase64(bytes) {
-  let binary = '';
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
-}
-
-function base64ToBytes(b64) {
-  const clean = String(b64 || '').trim();
-  if (!clean) throw new Error('加密数据字段为空');
-  let binary = '';
-  try {
-    binary = atob(clean);
-  } catch {
-    throw new Error('加密数据 Base64 格式损坏');
-  }
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    out[i] = binary.charCodeAt(i);
-  }
-  return out;
-}
-
-function isEncryptedPassportBundle(obj) {
-  return Boolean(
-    obj &&
-      typeof obj === 'object' &&
-      !Array.isArray(obj) &&
-      (obj.bundleType === PASSPORT_ENCRYPTED_BUNDLE_TYPE ||
-        (obj.encrypted === true && obj.kdf && obj.cipher && typeof obj.ciphertext === 'string'))
-  );
-}
-
-async function derivePassportAesKey(password, saltBytes, iterations, keyUsages) {
-  const pwdStr = String(password || '');
-  if (!pwdStr) {
-    throw new Error('主密码不能为空');
-  }
-  const enc = new TextEncoder();
-  const baseKey = await crypto.subtle.importKey('raw', enc.encode(pwdStr), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    {
-      name: 'PBKDF2',
-      salt: saltBytes,
-      iterations,
-      hash: 'SHA-256'
-    },
-    baseKey,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    keyUsages
-  );
-}
-
-/**
- * 使用 WebCrypto PBKDF2-HMAC-SHA256 + AES-256-GCM 加密导出的免登录通行证 JSON
- */
-async function encryptAuthorizedPassportBundle(plainBundle, password) {
-  if (!plainBundle || typeof plainBundle !== 'object') {
-    throw new Error('待加密的通行证数据无效');
-  }
-  const pwdStr = String(password || '');
-  if (pwdStr.length < PASSPORT_MIN_PASSWORD_LENGTH) {
-    throw new Error(`主密码长度不能少于 ${PASSPORT_MIN_PASSWORD_LENGTH} 位`);
-  }
-
-  const salt = new Uint8Array(16);
-  const iv = new Uint8Array(12);
-  crypto.getRandomValues(salt);
-  crypto.getRandomValues(iv);
-
-  const key = await derivePassportAesKey(pwdStr, salt, PASSPORT_PBKDF2_ITERATIONS, ['encrypt']);
-  const enc = new TextEncoder();
-  const aad = enc.encode(PASSPORT_ENCRYPTED_BUNDLE_TYPE);
-  const plaintextBytes = enc.encode(JSON.stringify(plainBundle));
-
-  const encryptedBuffer = await crypto.subtle.encrypt(
-    {
-      name: 'AES-GCM',
-      iv,
-      additionalData: aad,
-      tagLength: 128
-    },
-    key,
-    plaintextBytes
-  );
-
-  return {
-    bundleType: PASSPORT_ENCRYPTED_BUNDLE_TYPE,
-    version: 2,
-    encrypted: true,
-    exportedAt: new Date().toISOString(),
-    description: 'Google Drive 权限管理插件 - 主密码加密免登录通行证（AES-256-GCM + PBKDF2-SHA256）',
-    kdf: {
-      algorithm: 'PBKDF2',
-      hash: 'SHA-256',
-      iterations: PASSPORT_PBKDF2_ITERATIONS,
-      salt: bytesToBase64(salt)
-    },
-    cipher: {
-      algorithm: 'AES-GCM',
-      iv: bytesToBase64(iv),
-      tagLength: 128
-    },
-    ciphertext: bytesToBase64(new Uint8Array(encryptedBuffer))
-  };
-}
-
-/**
- * 解密受主密码保护的免登录通行证 JSON（含迭代次数边界检查与完整性校验）
- */
-async function decryptAuthorizedPassportBundle(envelope, password) {
-  if (!isEncryptedPassportBundle(envelope)) {
-    throw new Error('不是受支持的加密通行证格式');
-  }
-  const pwdStr = String(password || '');
-  if (!pwdStr) {
-    throw new Error('请输入解密主密码');
-  }
-
-  const kdf = envelope.kdf || {};
-  const cipher = envelope.cipher || {};
-  if (kdf.algorithm !== 'PBKDF2' || kdf.hash !== 'SHA-256') {
-    throw new Error('不支持的密钥派生算法配置');
-  }
-  if (cipher.algorithm !== 'AES-GCM') {
-    throw new Error('不支持的对称加密算法配置');
-  }
-
-  const iterations = Number(kdf.iterations);
-  if (
-    !Number.isInteger(iterations) ||
-    iterations < PASSPORT_PBKDF2_MIN_ITERATIONS ||
-    iterations > PASSPORT_PBKDF2_MAX_ITERATIONS
-  ) {
-    throw new Error('加密通行证 KDF 迭代参数超出安全范围');
-  }
-
-  const salt = base64ToBytes(kdf.salt);
-  const iv = base64ToBytes(cipher.iv);
-  const ciphertextBytes = base64ToBytes(envelope.ciphertext);
-  if (salt.length < 16) {
-    throw new Error('加密通行证盐值长度不足');
-  }
-  if (iv.length !== 12) {
-    throw new Error('加密通行证 IV 长度无效');
-  }
-
-  const key = await derivePassportAesKey(pwdStr, salt, iterations, ['decrypt']);
-  const aad = new TextEncoder().encode(PASSPORT_ENCRYPTED_BUNDLE_TYPE);
-
-  let decryptedBuffer;
-  try {
-    decryptedBuffer = await crypto.subtle.decrypt(
-      {
-        name: 'AES-GCM',
-        iv,
-        additionalData: aad,
-        tagLength: 128
-      },
-      key,
-      ciphertextBytes
-    );
-  } catch {
-    throw new Error('主密码错误或通行证文件已被篡改，解密失败');
-  }
-
-  let decoded;
-  try {
-    decoded = JSON.parse(new TextDecoder().decode(decryptedBuffer));
-  } catch {
-    throw new Error('解密后的数据不是有效的 JSON 结构');
-  }
-
-  if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
-    throw new Error('解密后的通行证内容结构无效');
-  }
-  return decoded;
-}
-
-/**
- * 识别并导入「免登录已授权通行证 JSON」或含 refresh_token 的 token.json 文件（无需弹出浏览器登录）
- */
-async function importAuthorizedPassportFromObject(parsed) {
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return { imported: false, accountCount: 0, clientCount: 0, restoredTransferCount: 0 };
-  }
-  if (isEncryptedPassportBundle(parsed)) {
-    throw new Error('该通行证文件已受主密码加密保护，请先输入主密码解密后再导入');
-  }
-
-  let rawClients = [];
-  let rawAccounts = [];
-
-  if (parsed.bundleType === 'google_drive_auth_passport_v1' || Array.isArray(parsed.authorizedAccounts)) {
-    rawClients = Array.isArray(parsed.oauthClients) ? parsed.oauthClients : [];
-    rawAccounts = Array.isArray(parsed.authorizedAccounts) ? parsed.authorizedAccounts : [];
-  } else if (
-    (parsed.refreshToken && parsed.clientId && parsed.clientSecret) ||
-    (parsed.refresh_token && parsed.client_id && parsed.client_secret)
-  ) {
-    // 兼容单账号导出或标准 Google OAuth token.json (含 refresh_token)
-    const cid = String(parsed.clientId || parsed.client_id).trim();
-    const csec = String(parsed.clientSecret || parsed.client_secret).trim();
-    const rtok = String(parsed.refreshToken || parsed.refresh_token).trim();
-    const turi = sanitizeGoogleTokenUri(parsed.tokenUri || parsed.token_uri);
-    rawClients.push({
-      uid: `cred_${Date.now()}_${generateRandomBase64Url(6)}`,
-      fileName: 'imported_token.json',
-      client_id: cid,
-      client_secret: csec,
-      token_uri: turi,
-      redirect_uri: 'http://localhost',
-      client_type: 'installed',
-      boundEmail: normalizeEntry(parsed.email || '')
-    });
-    rawAccounts.push({
-      email: normalizeEntry(parsed.email || ''),
-      displayName: String(parsed.displayName || ''),
-      clientId: cid,
-      clientSecret: csec,
-      refreshToken: rtok,
-      accessToken: String(parsed.accessToken || parsed.token || ''),
-      tokenUri: turi,
-      expiresAt: Number(parsed.expiresAt) || 0
-    });
-  } else {
-    return { imported: false, accountCount: 0, clientCount: 0, restoredTransferCount: 0 };
-  }
-
-  if (rawClients.length > 0) {
-    const sanitizedClients = rawClients
-      .filter(c => c && typeof c === 'object' && c.client_id)
-      .map(c => {
-        const isSa = c.client_type === 'service_account' || Boolean(c.client_email && c.private_key);
-        return {
-          uid: String(c.uid || `cred_${Date.now()}_${generateRandomBase64Url(6)}`),
-          fileName: String(c.fileName || 'imported_oauth.json'),
-          client_id: String(c.client_id).trim(),
-          client_secret: c.client_secret ? String(c.client_secret).trim() : '',
-          client_email: c.client_email ? normalizeEntry(c.client_email) : '',
-          private_key: c.private_key ? String(c.private_key) : '',
-          private_key_id: c.private_key_id ? String(c.private_key_id) : '',
-          project_id: String(c.project_id || '').trim(),
-          auth_uri: isSa ? undefined : sanitizeGoogleAuthUri(c.auth_uri),
-          token_uri: sanitizeGoogleTokenUri(c.token_uri),
-          redirect_uri: isSa ? undefined : sanitizeLoopbackRedirectUri(c.redirect_uri),
-          client_type: isSa ? 'service_account' : String(c.client_type || 'installed'),
-          boundEmail: normalizeEntry(c.boundEmail || ''),
-          boundEmails: Array.isArray(c.boundEmails) ? c.boundEmails.map(normalizeEntry).filter(Boolean) : undefined,
-          importedAt: String(c.importedAt || new Date().toISOString())
-        };
-      });
-    if (sanitizedClients.length > 0) {
-      await saveOAuthClients(sanitizedClients);
-    }
-  }
-
-  let accountCount = 0;
-  for (const acc of rawAccounts) {
-    if (!acc || typeof acc !== 'object') continue;
-    let email = normalizeEntry(acc.email || '');
-    let accessToken = String(acc.accessToken || '');
-    let expiresAt = Number(acc.expiresAt) || 0;
-    const safeTokenUri = sanitizeGoogleTokenUri(acc.tokenUri);
-
-    // 导入免登录通行证时，只要有 refreshToken 就优先静默刷新一次最新 accessToken（若离线暂不可达则将 expiresAt 置 0 以便首次扫描时自动刷新）
-    if (acc.refreshToken && acc.clientId && acc.clientSecret) {
-      try {
-        const resp = await fetch(safeTokenUri, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
-            client_id: String(acc.clientId),
-            client_secret: String(acc.clientSecret),
-            refresh_token: String(acc.refreshToken),
-            grant_type: 'refresh_token'
-          }).toString()
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (resp.ok && data.access_token) {
-          accessToken = data.access_token;
-          expiresAt = Date.now() + (Number(data.expires_in) || 3500) * 1000;
-          if (!email) {
-            const about = await fetchAboutUser(accessToken);
-            email = normalizeEntry(about.email || '');
-          }
-        } else {
-          expiresAt = 0;
-        }
-      } catch (_e) {
-        expiresAt = 0;
-      }
-    }
-
-    if (!email) continue;
-    await saveAuthorizedAccount({
-      email,
-      displayName: String(acc.displayName || ''),
-      clientUid: String(acc.clientUid || ''),
-      clientId: String(acc.clientId || ''),
-      clientSecret: acc.clientSecret ? String(acc.clientSecret) : '',
-      projectId: String(acc.projectId || ''),
-      isServiceAccount: Boolean(acc.isServiceAccount),
-      privateKey: acc.privateKey ? String(acc.privateKey) : '',
-      tokenUri: safeTokenUri,
-      redirectUri: sanitizeLoopbackRedirectUri(acc.redirectUri),
-      refreshToken: acc.refreshToken ? String(acc.refreshToken) : '',
-      accessToken,
-      expiresAt,
-      authorizedAt: String(acc.authorizedAt || new Date().toISOString())
-    });
-    accountCount++;
-  }
-
-  let restoredTransferCount = 0;
-  if (parsed.ownershipTransferState && Array.isArray(parsed.ownershipTransferState.items) && parsed.ownershipTransferState.items.length > 0) {
-    const curTf = await getOwnershipTransferState();
-    if (!curTf.items || curTf.items.length === 0) {
-      await saveOwnershipTransferState(parsed.ownershipTransferState);
-      restoredTransferCount = parsed.ownershipTransferState.items.length;
-    }
-  }
-
-  return {
-    imported: rawClients.length > 0 || accountCount > 0,
-    accountCount,
-    clientCount: rawClients.length,
-    restoredTransferCount
-  };
-}
-
 async function refreshAccountAccessToken(account) {
   if (account.isServiceAccount && account.privateKey) {
     const minted = await mintServiceAccountAccessToken({
@@ -1379,7 +1396,9 @@ async function refreshAccountAccessToken(account) {
   tokenUri = sanitizeGoogleTokenUri(tokenUri);
 
   if (!account.refreshToken || !clientId || !clientSecret) {
-    throw new Error(`账号 ${account.email} 缺少 refreshToken 或客户端密钥，请重新授权或重新导出含完整凭证的免登录通行证 JSON`);
+    throw new Error(
+      `账号 ${account.email} 缺少 refreshToken 或客户端密钥，请导入标准 Google OAuth 客户端 JSON 并在浏览器中重新授权（或检查服务账号密钥 JSON）`
+    );
   }
 
   const controller = new AbortController();
@@ -1458,7 +1477,7 @@ async function getValidTokenForAccount(email, interactive = false, forceRefresh 
     return getChromeIdentityToken(interactive);
   }
 
-  throw new Error('尚未找到可用的已授权账号令牌。请先导入免登录通行证 JSON 或点击「🌐 授权新邮箱」完成授权。');
+  throw new Error('尚未找到可用的已授权账号令牌。请先导入 Google OAuth 客户端 JSON（或服务账号密钥 JSON）并在浏览器中完成授权。');
 }
 
 function getChromeIdentityToken(interactive = true) {
@@ -1514,7 +1533,7 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
   authUrl.searchParams.set('client_id', client.client_id);
   authUrl.searchParams.set('redirect_uri', redirectUri);
   authUrl.searchParams.set('response_type', 'code');
-  authUrl.searchParams.set('scope', 'https://www.googleapis.com/auth/drive');
+  authUrl.searchParams.set('scope', OAUTH_DRIVE_AND_SHEETS_SCOPES);
   authUrl.searchParams.set('access_type', 'offline');
   authUrl.searchParams.set('prompt', 'consent select_account');
   authUrl.searchParams.set('state', oauthState);
@@ -1661,14 +1680,114 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
 
 /* ==================== 策略、快照与审计日志存储 ==================== */
 
+function sanitizeExcludedFoldersList(rawList = []) {
+  const list = Array.isArray(rawList) ? rawList : [];
+  const cleaned = [];
+  const seenIds = new Set();
+  const nowIso = new Date().toISOString();
+
+  for (const raw of list) {
+    if (!raw) continue;
+    const isStr = typeof raw === 'string';
+    const rawIdOrUrl = isStr
+      ? raw
+      : raw.id || raw.folderId || raw.url || raw.link || raw.webViewLink || '';
+    const parsedId =
+      typeof parseDriveUrlOrId === 'function'
+        ? parseDriveUrlOrId(rawIdOrUrl).fileId
+        : '';
+    const id = String(parsedId || extractDriveFileId(rawIdOrUrl) || rawIdOrUrl || '').trim();
+    if (!id || seenIds.has(id)) continue;
+    seenIds.add(id);
+
+    cleaned.push({
+      id,
+      name: String((!isStr && (raw.name || raw.folderName)) || `排除目录 (${id.slice(0, 8)}…)`).trim(),
+      webViewLink: String(
+        (!isStr && raw.webViewLink) || `https://drive.google.com/drive/folders/${encodeURIComponent(id)}`
+      ),
+      includeSubitems: isStr ? true : raw.includeSubitems !== false,
+      note: String((!isStr && raw.note) || '').trim(),
+      addedAt: String((!isStr && raw.addedAt) || nowIso)
+    });
+  }
+
+  return cleaned;
+}
+
+function sanitizeBlockedKeywordsList(rawInput) {
+  if (rawInput === undefined || rawInput === null) {
+    return [...DEFAULT_BLOCKED_APP_KEYWORDS];
+  }
+  const tokens = Array.isArray(rawInput)
+    ? rawInput.map(x => String(x || ''))
+    : String(rawInput || '').split(/[\s\r\n,，;；\t]+/);
+  return [
+    ...new Set(
+      tokens
+        .map(s => s.trim().toLowerCase())
+        .filter(Boolean)
+    )
+  ];
+}
+
+function sanitizeTrustedKeywordsList(rawInput) {
+  if (rawInput === undefined || rawInput === null) {
+    return [];
+  }
+  const tokens = Array.isArray(rawInput)
+    ? rawInput.map(x => String(x || ''))
+    : String(rawInput || '').split(/[\s\r\n,，;；\t]+/);
+  return [
+    ...new Set(
+      tokens
+        .map(s => s.trim().toLowerCase())
+        .filter(Boolean)
+    )
+  ];
+}
+
 async function getPolicy() {
   const data = await chrome.storage.local.get('policy');
-  const saved = data.policy || {};
+  const saved = data.policy && typeof data.policy === 'object' ? data.policy : {};
+  const rawMins = Number(saved.scheduleMinutes);
+  const scheduleMinutes = Number.isFinite(rawMins) && rawMins >= 15
+    ? Math.min(1440, Math.round(rawMins))
+    : DEFAULT_POLICY.scheduleMinutes;
+  const oauthGuardMode = saved.oauthGuardMode === 'alert' ? 'alert' : 'block';
+
   return {
     ...DEFAULT_POLICY,
     ...saved,
     writers: normalizeEmailList(saved.writers || []),
-    readers: normalizeEmailList(saved.readers || [])
+    readers: normalizeEmailList(saved.readers || []),
+    scheduleEnabled:
+      saved.scheduleEnabled !== undefined ? Boolean(saved.scheduleEnabled) : DEFAULT_POLICY.scheduleEnabled,
+    scheduleMinutes,
+    scanOnBrowserStartup:
+      saved.scanOnBrowserStartup !== undefined
+        ? Boolean(saved.scanOnBrowserStartup)
+        : DEFAULT_POLICY.scanOnBrowserStartup,
+    autoEnforce: Boolean(saved.autoEnforce),
+    excludedFolders: sanitizeExcludedFoldersList(saved.excludedFolders || []),
+    thirdPartyOAuthGuardEnabled:
+      saved.thirdPartyOAuthGuardEnabled !== undefined
+        ? Boolean(saved.thirdPartyOAuthGuardEnabled)
+        : DEFAULT_POLICY.thirdPartyOAuthGuardEnabled,
+    oauthGuardMode,
+    blockThirdPartyDriveScope:
+      saved.blockThirdPartyDriveScope !== undefined
+        ? Boolean(saved.blockThirdPartyDriveScope)
+        : DEFAULT_POLICY.blockThirdPartyDriveScope,
+    blockThirdPartySheetsScope:
+      saved.blockThirdPartySheetsScope !== undefined
+        ? Boolean(saved.blockThirdPartySheetsScope)
+        : DEFAULT_POLICY.blockThirdPartySheetsScope,
+    blockedAppKeywords:
+      saved.blockedAppKeywords !== undefined
+        ? sanitizeBlockedKeywordsList(saved.blockedAppKeywords)
+        : [...DEFAULT_BLOCKED_APP_KEYWORDS],
+    trustedOAuthKeywords: sanitizeTrustedKeywordsList(saved.trustedOAuthKeywords)
   };
 }
 
@@ -1679,7 +1798,7 @@ async function savePolicy(partialPolicy = {}) {
   const publicLinkRule = ['forbid', 'reader_only', 'allow'].includes(rawRule) ? rawRule : DEFAULT_POLICY.publicLinkRule;
   const rawMins =
     safePartial.scheduleMinutes !== undefined ? Number(safePartial.scheduleMinutes) : Number(current.scheduleMinutes);
-  const scheduleMinutes = Number.isFinite(rawMins) ? Math.min(1440, Math.max(15, Math.round(rawMins))) : 60;
+  const scheduleMinutes = Number.isFinite(rawMins) ? Math.min(1440, Math.max(15, Math.round(rawMins))) : 720;
 
   const nextWriters = normalizeEmailList(
     safePartial.writers !== undefined ? safePartial.writers : current.writers || []
@@ -1688,6 +1807,25 @@ async function savePolicy(partialPolicy = {}) {
   const rawReaders = safePartial.readers !== undefined ? safePartial.readers : current.readers || [];
   const nextReaders = normalizeEmailList(rawReaders.filter(item => !writerSet.has(item)));
 
+  const nextExcludedFolders =
+    safePartial.excludedFolders !== undefined
+      ? sanitizeExcludedFoldersList(safePartial.excludedFolders)
+      : sanitizeExcludedFoldersList(current.excludedFolders || []);
+
+  const rawGuardMode =
+    safePartial.oauthGuardMode !== undefined ? safePartial.oauthGuardMode : current.oauthGuardMode;
+  const nextGuardMode = rawGuardMode === 'alert' ? 'alert' : 'block';
+
+  const nextBlockedKeywords =
+    safePartial.blockedAppKeywords !== undefined
+      ? sanitizeBlockedKeywordsList(safePartial.blockedAppKeywords)
+      : sanitizeBlockedKeywordsList(current.blockedAppKeywords);
+
+  const nextTrustedKeywords =
+    safePartial.trustedOAuthKeywords !== undefined
+      ? sanitizeTrustedKeywordsList(safePartial.trustedOAuthKeywords)
+      : sanitizeTrustedKeywordsList(current.trustedOAuthKeywords);
+
   const next = {
     writers: nextWriters,
     readers: nextReaders,
@@ -1695,8 +1833,28 @@ async function savePolicy(partialPolicy = {}) {
     scheduleEnabled:
       safePartial.scheduleEnabled !== undefined ? Boolean(safePartial.scheduleEnabled) : Boolean(current.scheduleEnabled),
     scheduleMinutes,
+    scanOnBrowserStartup:
+      safePartial.scanOnBrowserStartup !== undefined
+        ? Boolean(safePartial.scanOnBrowserStartup)
+        : Boolean(current.scanOnBrowserStartup),
     autoEnforce:
-      safePartial.autoEnforce !== undefined ? Boolean(safePartial.autoEnforce) : Boolean(current.autoEnforce)
+      safePartial.autoEnforce !== undefined ? Boolean(safePartial.autoEnforce) : Boolean(current.autoEnforce),
+    excludedFolders: nextExcludedFolders,
+    thirdPartyOAuthGuardEnabled:
+      safePartial.thirdPartyOAuthGuardEnabled !== undefined
+        ? Boolean(safePartial.thirdPartyOAuthGuardEnabled)
+        : Boolean(current.thirdPartyOAuthGuardEnabled),
+    oauthGuardMode: nextGuardMode,
+    blockThirdPartyDriveScope:
+      safePartial.blockThirdPartyDriveScope !== undefined
+        ? Boolean(safePartial.blockThirdPartyDriveScope)
+        : Boolean(current.blockThirdPartyDriveScope),
+    blockThirdPartySheetsScope:
+      safePartial.blockThirdPartySheetsScope !== undefined
+        ? Boolean(safePartial.blockThirdPartySheetsScope)
+        : Boolean(current.blockThirdPartySheetsScope),
+    blockedAppKeywords: nextBlockedKeywords,
+    trustedOAuthKeywords: nextTrustedKeywords
   };
   await safeStorageSet({ policy: next });
   return next;
@@ -1704,14 +1862,26 @@ async function savePolicy(partialPolicy = {}) {
 
 async function getSnapshot() {
   const data = await chrome.storage.local.get('scanSnapshot');
-  return data.scanSnapshot || {
+  const snap = data.scanSnapshot || {
     lastScanAt: '',
     lastScanSource: '',
     accountEmail: '',
     files: [],
     knownFileIds: [],
-    newFileIds: []
+    newFileIds: [],
+    permFingerprints: {},
+    permDiffs: {}
   };
+  if (!snap.permFingerprints || typeof snap.permFingerprints !== 'object') {
+    snap.permFingerprints = {};
+  }
+  if (!snap.permDiffs || typeof snap.permDiffs !== 'object') {
+    snap.permDiffs = {};
+  }
+  if (Array.isArray(snap.files) && snap.files.length > 0) {
+    hydrateFilesPermissionDiffs(snap.files, snap.permDiffs);
+  }
+  return snap;
 }
 
 /**
@@ -1729,7 +1899,14 @@ function compactSnapshotForStorage(snapshot, maxFiles = 0) {
     mimeType: f.mimeType,
     webViewLink: formatDriveCanonicalLink(f),
     parents: Array.isArray(f.parents) ? f.parents : [],
+    createdTime: f.createdTime || '',
     modifiedTime: f.modifiedTime || '',
+    viewedByMeTime: f.viewedByMeTime || '',
+    writersCanShare: f.writersCanShare !== false,
+    copyRequiresWriterPermission: Boolean(f.copyRequiresWriterPermission),
+    contentLocked: Boolean(f.contentLocked || f.contentRestrictions?.some(r => r?.readOnly)),
+    contentLockReason:
+      f.contentLockReason || f.contentRestrictions?.find(r => r?.readOnly)?.reason || '',
     ownedByMe: Boolean(f.ownedByMe),
     shared: Boolean(f.shared),
     ownerAccount: f.ownerAccount || '',
@@ -1750,9 +1927,19 @@ function compactSnapshotForStorage(snapshot, maxFiles = 0) {
       : undefined,
     permissions: Array.isArray(f.permissions)
       ? f.permissions.map(p => {
-          const inherited = Boolean(
-            p._inherited || (Array.isArray(p.permissionDetails) && p.permissionDetails.some(d => d.inherited))
+          const details = Array.isArray(p.permissionDetails) ? p.permissionDetails : [];
+          const inherited = Boolean(p._inherited || details.some(d => d.inherited));
+          const hasDirectOverride = Boolean(
+            p._hasDirectOverride || (details.length > 0 && details.some(d => d.inherited === false))
           );
+          let inheritedRole = p._inheritedRole || '';
+          if (!inheritedRole && details.length > 0) {
+            for (const d of details) {
+              if (d.inherited && d.role && permissionRoleRank(d.role) > permissionRoleRank(inheritedRole)) {
+                inheritedRole = d.role;
+              }
+            }
+          }
           const cp = {
             id: p.id,
             type: p.type,
@@ -1763,19 +1950,39 @@ function compactSnapshotForStorage(snapshot, maxFiles = 0) {
           if (p.displayName && p.displayName !== p.emailAddress) cp.displayName = p.displayName;
           if (p.pendingOwner) cp.pendingOwner = true;
           if (inherited) cp._inherited = true;
+          if (hasDirectOverride) cp._hasDirectOverride = true;
+          if (inheritedRole) cp._inheritedRole = inheritedRole;
           return cp;
         })
       : []
   }));
 
   const knownIds = Array.isArray(snapshot.knownFileIds) ? snapshot.knownFileIds : [];
+  const rawFingerprints =
+    snapshot.permFingerprints && typeof snapshot.permFingerprints === 'object' ? snapshot.permFingerprints : {};
+  const rawDiffs = snapshot.permDiffs && typeof snapshot.permDiffs === 'object' ? snapshot.permDiffs : {};
+
+  let compactFingerprints = rawFingerprints;
+  let compactDiffs = rawDiffs;
+  if (maxFiles > 0 && rawFiles.length > maxFiles) {
+    const keptSet = new Set(sliceFiles.map(f => f?.id).filter(Boolean));
+    compactFingerprints = {};
+    compactDiffs = {};
+    for (const id of keptSet) {
+      if (rawFingerprints[id]) compactFingerprints[id] = rawFingerprints[id];
+      if (rawDiffs[id]) compactDiffs[id] = rawDiffs[id];
+    }
+  }
+
   return {
     lastScanAt: snapshot.lastScanAt || '',
     lastScanSource: snapshot.lastScanSource || '',
     accountEmail: snapshot.accountEmail || '',
     files: compactFiles,
     knownFileIds: maxFiles > 0 && knownIds.length > maxFiles * 2 ? knownIds.slice(-maxFiles * 2) : knownIds,
-    newFileIds: Array.isArray(snapshot.newFileIds) ? snapshot.newFileIds.slice(0, 5000) : []
+    newFileIds: Array.isArray(snapshot.newFileIds) ? snapshot.newFileIds.slice(0, 5000) : [],
+    permFingerprints: compactFingerprints,
+    permDiffs: compactDiffs
   };
 }
 
@@ -1914,8 +2121,50 @@ async function fetchAboutUser(token) {
   };
 }
 
+const PERMISSION_ROLE_RANKS = {
+  owner: 50,
+  organizer: 45,
+  fileOrganizer: 40,
+  writer: 30,
+  commenter: 20,
+  reader: 10
+};
+
+function permissionRoleRank(role = '') {
+  return PERMISSION_ROLE_RANKS[role] || 0;
+}
+
 function permIsInherited(permission) {
   return Boolean(permission?._inherited || (permission?.permissionDetails || []).some(detail => detail.inherited));
+}
+
+function permHasDirectGrant(permission) {
+  if (!permission) return false;
+  const details = Array.isArray(permission.permissionDetails) ? permission.permissionDetails : [];
+  if (details.length > 0) {
+    return details.some(detail => detail.inherited === false);
+  }
+  if (permission._hasDirectOverride) return true;
+  return !Boolean(permission._inherited);
+}
+
+function getMaxInheritedRole(permission) {
+  if (!permission) return '';
+  if (permission._inheritedRole) return permission._inheritedRole;
+  const details = Array.isArray(permission.permissionDetails) ? permission.permissionDetails : [];
+  let best = '';
+  for (const detail of details) {
+    if (detail.inherited && detail.role && permissionRoleRank(detail.role) > permissionRoleRank(best)) {
+      best = detail.role;
+    }
+  }
+  if (!best && details.length > 0 && details.every(detail => detail.inherited)) {
+    return permission.role || '';
+  }
+  if (!best && permission._inherited && !permission._hasDirectOverride) {
+    return permission.role || '';
+  }
+  return best;
 }
 
 function roleLabel(role) {
@@ -2053,9 +2302,37 @@ function evaluatePermission(permission, policy, ownerEmail = '') {
   return { status: 'compliant', desiredAction: null, targetRole: null, reason: '' };
 }
 
-function evaluateFile(file, policy, fallbackOwnerEmail = '') {
-  const ownerEmail = file.ownerAccount || file.owners?.[0]?.emailAddress || fallbackOwnerEmail;
-  const perms = file.permissions || [];
+function evaluateFile(file, policy, fallbackOwnerEmail = '', excludedIdSet = null) {
+  const ownerEmail = file?.ownerAccount || file?.owners?.[0]?.emailAddress || fallbackOwnerEmail;
+  const perms = file?.permissions || [];
+  const excludedList = policy?.excludedFolders || [];
+  if (
+    (excludedList.length > 0 || (excludedIdSet instanceof Set && excludedIdSet.size > 0)) &&
+    isFileInExcludedFolders(file, excludedList, excludedIdSet)
+  ) {
+    let exHasNonOwner = false;
+    let exHasPublic = false;
+    for (const p of perms) {
+      if (!p) continue;
+      const em = normalizeEntry(p.emailAddress || '');
+      if (p.role !== 'owner' && (!em || em !== normalizeEntry(ownerEmail))) {
+        exHasNonOwner = true;
+      }
+      if (p.type === 'anyone' || p.type === 'domain') {
+        exHasPublic = true;
+      }
+    }
+    return {
+      hasNonOwner: exHasNonOwner,
+      hasPublic: exHasPublic,
+      removeCount: 0,
+      downgradeCount: 0,
+      inheritedIssueCount: 0,
+      hasActionableViolation: false,
+      isExcluded: true
+    };
+  }
+
   let hasNonOwner = false;
   let hasPublic = false;
   let removeCount = 0;
@@ -2085,12 +2362,241 @@ function evaluateFile(file, policy, fallbackOwnerEmail = '') {
     removeCount,
     downgradeCount,
     inheritedIssueCount,
-    hasActionableViolation: removeCount > 0 || downgradeCount > 0
+    hasActionableViolation: removeCount > 0 || downgradeCount > 0,
+    isExcluded: false
   };
 }
 
+function setFileInheritanceBreakage(file, info) {
+  if (!file || typeof file !== 'object') return;
+  try {
+    Object.defineProperty(file, '_inheritanceBreakage', {
+      value: info || null,
+      writable: true,
+      configurable: true,
+      enumerable: false
+    });
+  } catch (_e) {
+    // 忽略只读对象异常
+  }
+}
+
+function getFileInheritanceBreakage(file, breakageMap = null) {
+  if (!file || typeof file !== 'object') return null;
+  if (breakageMap instanceof Map && file.id) {
+    return breakageMap.get(file.id) || null;
+  }
+  return file._inheritanceBreakage || null;
+}
+
+/**
+ * 子文件权限逃逸 / 继承断链检测：
+ * 识别子文件或子目录权限宽于上级父文件夹（如额外开启公开/域内链接、单独新增外部协作者、或将只读成员单独提权为可编辑）
+ * 返回 Map<fileId, { fileId, broken: true, parentId, parentName, escapedCount, escapedPermissions, summaryText }>
+ */
+function analyzeInheritanceBreakage(files = []) {
+  const breakageMap = new Map();
+  if (!Array.isArray(files) || !files.length) return breakageMap;
+
+  const fileById = new Map();
+  for (const f of files) {
+    if (f && f.id) {
+      fileById.set(f.id, f);
+      setFileInheritanceBreakage(f, null);
+    }
+  }
+
+  for (const file of files) {
+    if (!file || !file.id || file.permissionsLoading) continue;
+    const perms = Array.isArray(file.permissions) ? file.permissions : [];
+    if (!perms.length) continue;
+
+    const parentId = Array.isArray(file.parents) && file.parents[0] ? String(file.parents[0]) : '';
+    const parentFile = parentId ? fileById.get(parentId) || null : null;
+    const fileOwner = normalizeEntry(file.ownerAccount || file.owners?.[0]?.emailAddress || '');
+    const escapedPermissions = [];
+
+    if (parentFile && Array.isArray(parentFile.permissions) && !parentFile.permissionsLoading) {
+      let parentAnyonePerm = null;
+      const parentDomainPerms = new Map();
+      const parentUserPerms = new Map();
+
+      const parentOwner = normalizeEntry(parentFile.ownerAccount || parentFile.owners?.[0]?.emailAddress || '');
+      if (parentOwner) {
+        parentUserPerms.set(parentOwner, { role: 'owner', type: 'user', emailAddress: parentOwner });
+      }
+
+      for (const pp of parentFile.permissions) {
+        if (!pp) continue;
+        if (pp.type === 'anyone') {
+          if (!parentAnyonePerm || permissionRoleRank(pp.role) > permissionRoleRank(parentAnyonePerm.role)) {
+            parentAnyonePerm = pp;
+          }
+        } else if (pp.type === 'domain') {
+          const dKey = String(pp.domain || '').trim().toLowerCase();
+          const prev = parentDomainPerms.get(dKey);
+          if (!prev || permissionRoleRank(pp.role) > permissionRoleRank(prev.role)) {
+            parentDomainPerms.set(dKey, pp);
+          }
+        } else if (pp.type === 'user' || pp.type === 'group') {
+          const em = normalizeEntry(pp.emailAddress || '');
+          if (em) {
+            const prev = parentUserPerms.get(em);
+            if (!prev || permissionRoleRank(pp.role) > permissionRoleRank(prev.role)) {
+              parentUserPerms.set(em, pp);
+            }
+          }
+        }
+      }
+
+      for (const p of perms) {
+        if (!p) continue;
+        const em = normalizeEntry(p.emailAddress || '');
+        if (p.role === 'owner' || (em && em === fileOwner)) continue;
+
+        if (p.type === 'anyone') {
+          if (!parentAnyonePerm) {
+            if (!permIsInherited(p) || permHasDirectGrant(p)) {
+              escapedPermissions.push({
+                permission: p,
+                reason: '父文件夹未开启公开链接，子项单独开启了任何人访问',
+                suggestedAction: 'remove',
+                targetRole: null
+              });
+            }
+          } else if (permissionRoleRank(p.role) > permissionRoleRank(parentAnyonePerm.role)) {
+            escapedPermissions.push({
+              permission: p,
+              reason: `公开链接权限高于父文件夹（子项：${roleLabel(p.role)}，父目录：${roleLabel(parentAnyonePerm.role)}）`,
+              suggestedAction: 'downgrade',
+              targetRole: parentAnyonePerm.role
+            });
+          }
+        } else if (p.type === 'domain') {
+          const dKey = String(p.domain || '').trim().toLowerCase();
+          const pDom = parentDomainPerms.get(dKey) || null;
+          let effectiveParentLink = pDom;
+          if (
+            parentAnyonePerm &&
+            (!effectiveParentLink || permissionRoleRank(parentAnyonePerm.role) > permissionRoleRank(effectiveParentLink.role))
+          ) {
+            effectiveParentLink = parentAnyonePerm;
+          }
+
+          if (!effectiveParentLink) {
+            if (!permIsInherited(p) || permHasDirectGrant(p)) {
+              escapedPermissions.push({
+                permission: p,
+                reason: `父文件夹未开启域内共享 (${p.domain || '未知域'})，子项单独开启`,
+                suggestedAction: 'remove',
+                targetRole: null
+              });
+            }
+          } else if (permissionRoleRank(p.role) > permissionRoleRank(effectiveParentLink.role)) {
+            escapedPermissions.push({
+              permission: p,
+              reason: `域内链接权限高于父文件夹（子项：${roleLabel(p.role)}，父目录：${roleLabel(effectiveParentLink.role)}）`,
+              suggestedAction: 'downgrade',
+              targetRole: effectiveParentLink.role
+            });
+          }
+        } else if (p.type === 'user' || p.type === 'group') {
+          const parentPerm = em ? parentUserPerms.get(em) : null;
+          if (!parentPerm) {
+            if (!permIsInherited(p) || permHasDirectGrant(p)) {
+              escapedPermissions.push({
+                permission: p,
+                reason: `父文件夹无此协作者 (${em || permissionLabel(p)})，子项单独授予了${roleLabel(p.role)}权限`,
+                suggestedAction: 'remove',
+                targetRole: null
+              });
+            }
+          } else if (permissionRoleRank(p.role) > permissionRoleRank(parentPerm.role)) {
+            escapedPermissions.push({
+              permission: p,
+              reason: `协作者 ${em} 在父文件夹为${roleLabel(parentPerm.role)}，在子项被单独提权为${roleLabel(p.role)}`,
+              suggestedAction: 'downgrade',
+              targetRole: parentPerm.role
+            });
+          }
+        }
+      }
+    } else {
+      // 父文件夹不在当前扫描快照中：基于 permissionDetails 的继承与非继承混合特征检测逃逸
+      const hasAnyInherited = perms.some(p => permIsInherited(p));
+      for (const p of perms) {
+        if (!p) continue;
+        const em = normalizeEntry(p.emailAddress || '');
+        if (p.role === 'owner' || (em && em === fileOwner)) continue;
+
+        const inheritedRole = getMaxInheritedRole(p);
+        if (
+          permIsInherited(p) &&
+          permHasDirectGrant(p) &&
+          inheritedRole &&
+          permissionRoleRank(p.role) > permissionRoleRank(inheritedRole)
+        ) {
+          escapedPermissions.push({
+            permission: p,
+            reason: `${em || permissionLabel(p)} 继承角色为${roleLabel(inheritedRole)}，在子项被单独提权为${roleLabel(p.role)}`,
+            suggestedAction: 'downgrade',
+            targetRole: inheritedRole
+          });
+        } else if (hasAnyInherited && !permIsInherited(p)) {
+          if (p.type === 'anyone' || p.type === 'domain') {
+            escapedPermissions.push({
+              permission: p,
+              reason: '子项在继承父目录权限之外单独开启了公开或域内链接',
+              suggestedAction: 'remove',
+              targetRole: null
+            });
+          } else if (p.type === 'user' || p.type === 'group') {
+            escapedPermissions.push({
+              permission: p,
+              reason: `子项在继承父目录权限之外单独添加了协作者 (${em || permissionLabel(p)})`,
+              suggestedAction: 'remove',
+              targetRole: null
+            });
+          }
+        }
+      }
+    }
+
+    if (escapedPermissions.length > 0) {
+      const parentName = parentFile?.name || (parentId ? '上级文件夹' : '继承目录');
+      const removeNum = escapedPermissions.filter(x => x.suggestedAction === 'remove').length;
+      const downgradeNum = escapedPermissions.filter(x => x.suggestedAction === 'downgrade').length;
+      const summaryParts = [];
+      if (removeNum > 0) summaryParts.push(`多出 ${removeNum} 项独立授权`);
+      if (downgradeNum > 0) summaryParts.push(`${downgradeNum} 项高于父目录`);
+      const entry = {
+        fileId: file.id,
+        broken: true,
+        parentId,
+        parentName,
+        escapedCount: escapedPermissions.length,
+        escapedPermissions,
+        summaryText: `${summaryParts.join(' · ')}（父目录：${parentName}）`
+      };
+      breakageMap.set(file.id, entry);
+      setFileInheritanceBreakage(file, entry);
+    }
+  }
+
+  return breakageMap;
+}
+
 function computeSummary(files = [], policy = DEFAULT_POLICY, ownerEmail = '', newFileIdSet = new Set()) {
-  let total = files.length;
+  const safeFiles = Array.isArray(files) ? files : [];
+  const excludedList = policy?.excludedFolders || [];
+  const excludedSet =
+    excludedList.length > 0 ? buildExcludedFileIdSet(safeFiles, excludedList) : new Set();
+  const effectiveFiles =
+    excludedList.length > 0 || excludedSet.size > 0
+      ? safeFiles.filter(f => f && !isFileInExcludedFolders(f, excludedList, excludedSet))
+      : safeFiles;
+
+  let total = effectiveFiles.length;
   let shared = 0;
   let newFiles = 0;
   let unauthorizedFiles = 0;
@@ -2098,12 +2604,22 @@ function computeSummary(files = [], policy = DEFAULT_POLICY, ownerEmail = '', ne
   let publicFiles = 0;
   let actionablePermissions = 0;
   let anomalousFiles = 0;
+  let changedFiles = 0;
+  let riskIncreasedFiles = 0;
 
-  for (const file of files) {
+  for (const file of effectiveFiles) {
     if (file.isNew || newFileIdSet.has(file.id)) {
       newFiles++;
     }
-    const stat = evaluateFile(file, policy, ownerEmail);
+    const diffInfo = getFilePermissionDiff(file);
+    if (diffInfo || file.hasPermDiff) {
+      changedFiles++;
+      if (diffInfo?.riskIncreased) {
+        riskIncreasedFiles++;
+      }
+    }
+    const stat = evaluateFile(file, policy, ownerEmail, excludedSet);
+    if (stat.isExcluded) continue;
     if (stat.hasNonOwner) shared++;
     if (stat.hasPublic) publicFiles++;
     if (stat.removeCount > 0) unauthorizedFiles++;
@@ -2111,6 +2627,8 @@ function computeSummary(files = [], policy = DEFAULT_POLICY, ownerEmail = '', ne
     if (stat.hasActionableViolation) anomalousFiles++;
     actionablePermissions += stat.removeCount + stat.downgradeCount;
   }
+
+  const breakageMap = analyzeInheritanceBreakage(effectiveFiles);
 
   return {
     total,
@@ -2120,7 +2638,10 @@ function computeSummary(files = [], policy = DEFAULT_POLICY, ownerEmail = '', ne
     overprivilegedFiles,
     anomalousFiles,
     publicFiles,
-    actionablePermissions
+    actionablePermissions,
+    inheritanceBrokenFiles: breakageMap.size,
+    changedFiles,
+    riskIncreasedFiles
   };
 }
 
@@ -2177,6 +2698,240 @@ async function createPermission(token, fileId, { type = 'user', role = 'reader',
 }
 
 /**
+ * 一键对齐父目录权限：清理子文件/子目录逃逸的独立权限或将其角色降回与父目录一致
+ */
+async function alignFilesToParentPermissions({
+  files = [],
+  breakageMap = null,
+  shouldStop = null,
+  retryQueue = null,
+  onProgress = null
+} = {}) {
+  const fileById = new Map();
+  for (const f of files || []) {
+    if (f && f.id) fileById.set(f.id, f);
+  }
+
+  const queue = [];
+  if (Array.isArray(retryQueue)) {
+    for (const item of retryQueue) {
+      if (!item || !item.fileId || !item.permissionId) continue;
+      const liveFile = fileById.get(item.fileId) || null;
+      const livePerm =
+        liveFile && Array.isArray(liveFile.permissions)
+          ? liveFile.permissions.find(p => p.id === item.permissionId) || null
+          : null;
+      queue.push({
+        file: liveFile || {
+          id: item.fileId,
+          name: item.fileName || '(无名称)',
+          webViewLink: item.webViewLink || '',
+          ownerAccount: item.fileOwner || '',
+          permissions: livePerm ? [livePerm] : []
+        },
+        fileOwner: item.fileOwner || normalizeEntry(liveFile?.ownerAccount || liveFile?.owners?.[0]?.emailAddress || ''),
+        parentName: item.parentName || '父文件夹',
+        permission: livePerm || item.permission || {
+          id: item.permissionId,
+          type: item.targetType || 'user',
+          role: item.previousRole || 'writer',
+          emailAddress: item.targetEmail || '',
+          domain: item.domain || ''
+        },
+        suggestedAction: item.suggestedAction || 'remove',
+        targetRole: item.targetRole || 'reader',
+        reason: item.reason || '对齐父目录权限'
+      });
+    }
+  } else {
+    const activeMap = breakageMap instanceof Map ? breakageMap : analyzeInheritanceBreakage(files);
+    for (const file of files || []) {
+      if (!file || !file.id) continue;
+      const info = activeMap.get(file.id);
+      if (!info || !Array.isArray(info.escapedPermissions) || !info.escapedPermissions.length) continue;
+      const fileOwner = normalizeEntry(file.ownerAccount || file.owners?.[0]?.emailAddress || '');
+      for (const esc of info.escapedPermissions) {
+        if (!esc?.permission?.id) continue;
+        queue.push({
+          file,
+          fileOwner,
+          parentName: info.parentName || '父文件夹',
+          permission: esc.permission,
+          suggestedAction: esc.suggestedAction || 'remove',
+          targetRole: esc.targetRole || 'reader',
+          reason: esc.reason || '对齐父目录权限'
+        });
+      }
+    }
+  }
+
+  let removedCount = 0;
+  let downgradedCount = 0;
+  let failedCount = 0;
+  let stopped = false;
+  const alignedFileSet = new Set();
+  const failedItems = [];
+  const logs = [];
+  let cursor = 0;
+
+  const tokenCache = new Map();
+  async function resolveToken(ownerEmail) {
+    const key = normalizeEntry(ownerEmail);
+    if (tokenCache.has(key)) return tokenCache.get(key);
+    const t = await getValidTokenForAccount(key, true);
+    tokenCache.set(key, t);
+    return t;
+  }
+
+  const workerCount = Math.min(4, Math.max(1, queue.length));
+  const workers = Array.from({ length: queue.length ? workerCount : 0 }, async () => {
+    while (cursor < queue.length) {
+      if (shouldStop?.()) {
+        stopped = true;
+        break;
+      }
+      const item = queue[cursor++];
+      const { file, fileOwner, parentName, permission, suggestedAction, targetRole, reason } = item;
+      const targetLabel = permissionLabel(permission);
+      try {
+        const token = await resolveToken(fileOwner);
+        if (suggestedAction === 'remove') {
+          await deletePermission(token, file.id, permission.id);
+          if (Array.isArray(file.permissions)) {
+            file.permissions = file.permissions.filter(p => p.id !== permission.id);
+          }
+          removedCount++;
+          alignedFileSet.add(file.id);
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'manual',
+            actionType: 'revoke',
+            accountEmail: fileOwner,
+            fileId: file.id,
+            fileName: file.name || '(无名称)',
+            webViewLink: file.webViewLink || '',
+            permissionId: permission.id,
+            targetType: permission.type || 'user',
+            targetEmail: permission.emailAddress || '',
+            domain: permission.domain || '',
+            targetLabel,
+            previousRole: permission.role || '',
+            newRole: '',
+            restored: false,
+            message: `对齐父目录《${parentName}》：移除逃逸权限 ${targetLabel}（原角色：${roleLabel(permission.role)}）`
+          });
+        } else if (suggestedAction === 'downgrade') {
+          const prevRole = permission.role;
+          await updatePermissionRole(token, file.id, permission.id, targetRole);
+          permission.role = targetRole;
+          permission._hasDirectOverride = false;
+          if (Array.isArray(permission.permissionDetails)) {
+            permission.permissionDetails = permission.permissionDetails.filter(d => d.inherited);
+          }
+          downgradedCount++;
+          alignedFileSet.add(file.id);
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'manual',
+            actionType: 'downgrade',
+            accountEmail: fileOwner,
+            fileId: file.id,
+            fileName: file.name || '(无名称)',
+            webViewLink: file.webViewLink || '',
+            permissionId: permission.id,
+            targetType: permission.type || 'user',
+            targetEmail: permission.emailAddress || '',
+            domain: permission.domain || '',
+            targetLabel,
+            previousRole: prevRole,
+            newRole: targetRole,
+            restored: false,
+            message: `对齐父目录《${parentName}》：将 ${targetLabel} 从${roleLabel(prevRole)}降回${roleLabel(targetRole)}`
+          });
+        }
+      } catch (error) {
+        failedCount++;
+        const errMsg = error?.message || String(error);
+        failedItems.push({
+          fileId: file.id,
+          fileName: file.name || '(无名称)',
+          webViewLink: file.webViewLink || '',
+          fileOwner,
+          parentName,
+          permissionId: permission.id,
+          targetType: permission.type || 'user',
+          targetEmail: permission.emailAddress || '',
+          domain: permission.domain || '',
+          previousRole: permission.role || '',
+          permission: {
+            id: permission.id,
+            type: permission.type || 'user',
+            role: permission.role || '',
+            emailAddress: permission.emailAddress || '',
+            domain: permission.domain || '',
+            displayName: permission.displayName || ''
+          },
+          suggestedAction,
+          targetRole,
+          reason,
+          errorMessage: errMsg
+        });
+        logs.push({
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: new Date().toISOString(),
+          source: 'manual',
+          actionType: 'error',
+          accountEmail: fileOwner,
+          fileId: file.id,
+          fileName: file.name || '(无名称)',
+          webViewLink: file.webViewLink || '',
+          permissionId: permission.id,
+          targetType: permission.type || 'user',
+          targetEmail: permission.emailAddress || '',
+          targetLabel,
+          previousRole: permission.role || '',
+          newRole: '',
+          restored: false,
+          message: `对齐父目录失败 (${targetLabel})：${errMsg}`
+        });
+      }
+
+      if (onProgress) {
+        onProgress({
+          done: removedCount + downgradedCount + failedCount,
+          total: queue.length,
+          removedCount,
+          downgradedCount,
+          failedCount,
+          stopped
+        });
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  if (logs.length) {
+    await appendAuditLogs(logs);
+  }
+  if (Array.isArray(files) && files.length > 0) {
+    analyzeInheritanceBreakage(files);
+  }
+
+  return {
+    alignedFilesCount: alignedFileSet.size,
+    removedCount,
+    downgradedCount,
+    failedCount,
+    total: queue.length,
+    stopped,
+    failedItems,
+    logs
+  };
+}
+
+/**
  * 按选定的「邮箱分组」对多个文件批量执行授权 / 对齐 / 撤权
  * mode:
  * - 'grant': 给所选组全体成员开通指定角色（若写成 'group_default' 则按各组默认角色）
@@ -2184,111 +2939,172 @@ async function createPermission(token, fileId, { type = 'user', role = 'reader',
  * - 'revoke_groups': 从所选文件中移除所选组全部成员的直接权限
  */
 async function executeGroupBatchOnFiles({
-  files,
-  groupNames,
+  files = [],
+  groupNames = [],
   mode = 'grant',
   roleOption = 'group_default',
-  directory,
-  onProgress = null
+  directory = DEFAULT_DIRECTORY,
+  expiresAt = '',
+  expireAction = 'revoke',
+  onProgress = null,
+  shouldStop = null,
+  retryQueue = null
 }) {
-  const groupSet = new Set(groupNames);
-  const groupRoleMap = new Map();
-  for (const g of directory.groups || []) {
-    groupRoleMap.set(g.name, g.defaultRole || 'reader');
-  }
+  const validExpiresAt =
+    expiresAt && Number.isFinite(Date.parse(expiresAt)) ? new Date(Date.parse(expiresAt)).toISOString() : '';
 
-  // 计算目标成员及其目标角色（若一人在多个选中组，writer 优先于 reader）
-  const targetMemberRole = new Map();
-  const targetMemberName = new Map();
-  for (const c of directory.contacts || []) {
-    const matchedGroups = (c.groups || []).filter(g => groupSet.has(g));
-    if (!matchedGroups.length) continue;
-    const email = normalizeEntry(c.email);
-    targetMemberName.set(email, c.name || email);
-
-    let desiredRole = 'reader';
-    if (roleOption === 'writer' || roleOption === 'reader') {
-      desiredRole = roleOption;
-    } else {
-      // 按组默认角色，只要有一个组是 writer 即给 writer
-      if (matchedGroups.some(g => groupRoleMap.get(g) === 'writer')) {
-        desiredRole = 'writer';
-      }
-    }
-    if (targetMemberRole.get(email) === 'writer') {
-      desiredRole = 'writer';
-    }
-    targetMemberRole.set(email, desiredRole);
+  const fileById = new Map();
+  for (const f of files || []) {
+    if (f && f.id) fileById.set(f.id, f);
   }
 
   const operations = [];
-  for (const file of files) {
-    const fileOwner = normalizeEntry(file.ownerAccount || file.owners?.[0]?.emailAddress || '');
-    const perms = file.permissions || [];
-    const existingByEmail = new Map();
-    for (const p of perms) {
-      if (p.type === 'user' || p.type === 'group') {
-        const em = normalizeEntry(p.emailAddress || '');
-        if (em) existingByEmail.set(em, p);
-      }
+  if (Array.isArray(retryQueue)) {
+    for (const item of retryQueue) {
+      if (!item || !item.fileId || !item.type) continue;
+      const liveFile =
+        fileById.get(item.fileId) ||
+        item.file || {
+          id: item.fileId,
+          name: item.fileName || '(无名称)',
+          mimeType: item.mimeType || '',
+          webViewLink: item.webViewLink || '',
+          ownerAccount: item.fileOwner || '',
+          permissions: []
+        };
+      const livePerm =
+        item.permissionId && Array.isArray(liveFile.permissions)
+          ? liveFile.permissions.find(p => p.id === item.permissionId) || item.permission
+          : item.permission || null;
+      operations.push({
+        type: item.type,
+        file: liveFile,
+        fileOwner: item.fileOwner || normalizeEntry(liveFile.ownerAccount || liveFile.owners?.[0]?.emailAddress || ''),
+        permission: livePerm,
+        email: item.email || '',
+        name: item.name || item.email || '',
+        role: item.role || 'reader',
+        groupTitle: item.groupTitle || '',
+        expiresAt: item.expiresAt || validExpiresAt,
+        expireAction: item.expireAction || expireAction || 'revoke'
+      });
+    }
+  } else {
+    const groupSet = new Set(groupNames || []);
+    const groupObjMap = new Map();
+    for (const g of directory?.groups || []) {
+      groupObjMap.set(g.name, g);
     }
 
-    if (mode === 'grant' || mode === 'keep_only_groups') {
-      for (const [email, desiredRole] of targetMemberRole.entries()) {
-        if (email === fileOwner) continue;
-        const existing = existingByEmail.get(email);
-        if (!existing) {
-          operations.push({
-            type: 'create',
-            file,
-            fileOwner,
-            email,
-            name: targetMemberName.get(email),
-            role: desiredRole
-          });
-        } else if (!permIsInherited(existing) && existing.role !== 'owner' && existing.role !== desiredRole) {
-          operations.push({
-            type: 'update',
-            file,
-            fileOwner,
-            permission: existing,
-            email,
-            name: targetMemberName.get(email),
-            role: desiredRole
-          });
+    // 计算目标成员及其目标角色（多组重叠时优先级 writer > commenter > reader）
+    const targetMemberRole = new Map();
+    const targetMemberName = new Map();
+    for (const c of directory?.contacts || []) {
+      const matchedGroups = (c.groups || []).filter(g => groupSet.has(g));
+      if (!matchedGroups.length) continue;
+      const email = normalizeEntry(c.email);
+      if (!email) continue;
+      targetMemberName.set(email, c.name || email);
+
+      let desiredRole = 'reader';
+      if (roleOption === 'writer' || roleOption === 'commenter' || roleOption === 'reader') {
+        desiredRole = roleOption;
+      } else {
+        // roleOption === 'group_default'：优先按成员在该组的 c.groupRoles?.[g] || c.role || group.defaultRole 计算
+        let bestRank = 0;
+        for (const gName of matchedGroups) {
+          const grp = groupObjMap.get(gName);
+          const candidate = getEffectiveMemberRoleInGroup(c, gName, grp);
+          const rank = permissionRoleRank(candidate);
+          if (rank > bestRank) {
+            bestRank = rank;
+            desiredRole = candidate;
+          }
         }
       }
+      const existingTargetRole = targetMemberRole.get(email);
+      if (existingTargetRole && permissionRoleRank(existingTargetRole) > permissionRoleRank(desiredRole)) {
+        desiredRole = existingTargetRole;
+      }
+      targetMemberRole.set(email, desiredRole);
     }
 
-    if (mode === 'keep_only_groups') {
+    for (const file of files || []) {
+      const fileOwner = normalizeEntry(file.ownerAccount || file.owners?.[0]?.emailAddress || '');
+      const perms = file.permissions || [];
+      const existingByEmail = new Map();
       for (const p of perms) {
-        if (p.role === 'owner' || permIsInherited(p)) continue;
-        const em = normalizeEntry(p.emailAddress || '');
-        if (em && em === fileOwner) continue;
-        if (!em || !targetMemberRole.has(em)) {
-          operations.push({
-            type: 'delete',
-            file,
-            fileOwner,
-            permission: p,
-            email: em,
-            name: permissionLabel(p)
-          });
+        if (p.type === 'user' || p.type === 'group') {
+          const em = normalizeEntry(p.emailAddress || '');
+          if (em) existingByEmail.set(em, p);
         }
       }
-    } else if (mode === 'revoke_groups') {
-      for (const p of perms) {
-        if (p.role === 'owner' || permIsInherited(p)) continue;
-        const em = normalizeEntry(p.emailAddress || '');
-        if (em && targetMemberRole.has(em)) {
-          operations.push({
-            type: 'delete',
-            file,
-            fileOwner,
-            permission: p,
-            email: em,
-            name: targetMemberName.get(em) || em
-          });
+
+      if (mode === 'grant' || mode === 'keep_only_groups') {
+        for (const [email, desiredRole] of targetMemberRole.entries()) {
+          if (email === fileOwner) continue;
+          const existing = existingByEmail.get(email);
+          if (!existing) {
+            operations.push({
+              type: 'create',
+              file,
+              fileOwner,
+              email,
+              name: targetMemberName.get(email),
+              role: desiredRole,
+              expiresAt: validExpiresAt,
+              expireAction: expireAction || 'revoke'
+            });
+          } else if (
+            !permIsInherited(existing) &&
+            existing.role !== 'owner' &&
+            (existing.role !== desiredRole || Boolean(validExpiresAt))
+          ) {
+            operations.push({
+              type: 'update',
+              file,
+              fileOwner,
+              permission: existing,
+              email,
+              name: targetMemberName.get(email),
+              role: desiredRole,
+              expiresAt: validExpiresAt,
+              expireAction: expireAction || 'revoke'
+            });
+          }
+        }
+      }
+
+      if (mode === 'keep_only_groups') {
+        for (const p of perms) {
+          if (p.role === 'owner' || permIsInherited(p)) continue;
+          const em = normalizeEntry(p.emailAddress || '');
+          if (em && em === fileOwner) continue;
+          if (!em || !targetMemberRole.has(em)) {
+            operations.push({
+              type: 'delete',
+              file,
+              fileOwner,
+              permission: p,
+              email: em,
+              name: permissionLabel(p)
+            });
+          }
+        }
+      } else if (mode === 'revoke_groups') {
+        for (const p of perms) {
+          if (p.role === 'owner' || permIsInherited(p)) continue;
+          const em = normalizeEntry(p.emailAddress || '');
+          if (em && targetMemberRole.has(em)) {
+            operations.push({
+              type: 'delete',
+              file,
+              fileOwner,
+              permission: p,
+              email: em,
+              name: targetMemberName.get(em) || em
+            });
+          }
         }
       }
     }
@@ -2298,6 +3114,9 @@ async function executeGroupBatchOnFiles({
   let updatedCount = 0;
   let removedCount = 0;
   let failedCount = 0;
+  let stopped = false;
+  const failedItems = [];
+  const ttlBatchToEnqueue = [];
   const logs = [];
   let cursor = 0;
 
@@ -2309,34 +3128,73 @@ async function executeGroupBatchOnFiles({
     return t;
   }
 
-  const groupTitle = groupNames.join('、');
+  const defaultGroupTitle = (groupNames || []).join('、') || '分组操作';
 
   const workers = Array.from({ length: 4 }, async () => {
     while (cursor < operations.length) {
+      if (shouldStop?.()) {
+        stopped = true;
+        break;
+      }
       const op = operations[cursor++];
       const { file, fileOwner } = op;
+      const groupTitle = op.groupTitle || defaultGroupTitle;
+      const activeExpiresAt = op.expiresAt || '';
+      const activeExpireAction = op.expireAction || expireAction || 'revoke';
       try {
         const token = await getToken(fileOwner);
         if (op.type === 'create') {
-          const created = await createPermission(token, file.id, {
-            type: 'user',
-            role: op.role,
-            emailAddress: op.email
-          });
+          let created = null;
+          let nativeExpirationApplied = false;
+          if (activeExpiresAt) {
+            const grantRes = await grantPermissionCoreApi(token, file, file.id, {
+              type: 'user',
+              role: op.role,
+              emailAddress: op.email,
+              expiresAt: activeExpiresAt
+            });
+            created = grantRes.createdPermission;
+            nativeExpirationApplied = grantRes.nativeExpirationApplied;
+          } else {
+            created = await createPermission(token, file.id, {
+              type: 'user',
+              role: op.role,
+              emailAddress: op.email
+            });
+          }
+          const createdId = created?.id || `grp-${Date.now()}-${Math.random()}`;
           file.permissions = file.permissions || [];
           file.permissions.push({
-            id: created?.id || `grp-${Date.now()}-${Math.random()}`,
+            id: createdId,
             type: 'user',
             role: op.role,
             emailAddress: op.email,
             displayName: op.name
           });
+          if (activeExpiresAt) {
+            ttlBatchToEnqueue.push({
+              fileId: file.id,
+              fileName: file.name || '(无名称)',
+              mimeType: file.mimeType || '',
+              webViewLink: file.webViewLink || '',
+              accountEmail: fileOwner,
+              permissionId: created?.id || '',
+              targetType: 'user',
+              targetEmail: op.email,
+              targetLabel: `[${groupTitle}] ${op.name} (${op.email})`,
+              grantedRole: op.role,
+              expireAction: activeExpireAction,
+              expiresAt: activeExpiresAt,
+              nativeExpirationApplied
+            });
+          }
           createdCount++;
           logs.push({
             id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             timestamp: new Date().toISOString(),
             source: 'manual',
             actionType: 'grant',
+            isTtl: Boolean(activeExpiresAt),
             accountEmail: fileOwner,
             fileId: file.id,
             fileName: file.name || '(无名称)',
@@ -2348,18 +3206,40 @@ async function executeGroupBatchOnFiles({
             previousRole: '',
             newRole: op.role,
             restored: false,
-            message: `按组【${groupTitle}】批量授予「${roleLabel(op.role)}」权限`
+            message: `按组【${groupTitle}】批量授予「${roleLabel(op.role)}」权限${
+              activeExpiresAt ? `（限时：${formatTtlRemaining(activeExpiresAt)}）` : ''
+            }`
           });
         } else if (op.type === 'update') {
           const prevRole = op.permission.role;
-          await updatePermissionRole(token, file.id, op.permission.id, op.role);
-          op.permission.role = op.role;
+          if (prevRole !== op.role) {
+            await updatePermissionRole(token, file.id, op.permission.id, op.role);
+            op.permission.role = op.role;
+          }
+          if (activeExpiresAt) {
+            ttlBatchToEnqueue.push({
+              fileId: file.id,
+              fileName: file.name || '(无名称)',
+              mimeType: file.mimeType || '',
+              webViewLink: file.webViewLink || '',
+              accountEmail: fileOwner,
+              permissionId: op.permission.id,
+              targetType: op.permission.type || 'user',
+              targetEmail: op.email,
+              targetLabel: `[${groupTitle}] ${op.name} (${op.email})`,
+              grantedRole: op.role,
+              expireAction: activeExpireAction,
+              expiresAt: activeExpiresAt,
+              nativeExpirationApplied: false
+            });
+          }
           updatedCount++;
           logs.push({
             id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             timestamp: new Date().toISOString(),
             source: 'manual',
             actionType: 'downgrade',
+            isTtl: Boolean(activeExpiresAt),
             accountEmail: fileOwner,
             fileId: file.id,
             fileName: file.name || '(无名称)',
@@ -2371,7 +3251,9 @@ async function executeGroupBatchOnFiles({
             previousRole: prevRole,
             newRole: op.role,
             restored: false,
-            message: `按组【${groupTitle}】调整角色：${roleLabel(prevRole)} → ${roleLabel(op.role)}`
+            message: `按组【${groupTitle}】调整角色：${roleLabel(prevRole)} -> ${roleLabel(op.role)}${
+              activeExpiresAt ? `（限时：${formatTtlRemaining(activeExpiresAt)}）` : ''
+            }`
           });
         } else if (op.type === 'delete') {
           await deletePermission(token, file.id, op.permission.id);
@@ -2399,6 +3281,31 @@ async function executeGroupBatchOnFiles({
         }
       } catch (error) {
         failedCount++;
+        failedItems.push({
+          type: op.type,
+          fileId: file.id,
+          fileName: file.name || '(无名称)',
+          mimeType: file.mimeType || '',
+          webViewLink: file.webViewLink || '',
+          fileOwner,
+          permissionId: op.permission?.id || '',
+          permission: op.permission
+            ? {
+                id: op.permission.id,
+                type: op.permission.type,
+                role: op.permission.role,
+                emailAddress: op.permission.emailAddress || '',
+                domain: op.permission.domain || ''
+              }
+            : null,
+          email: op.email || '',
+          name: op.name || '',
+          role: op.role || '',
+          groupTitle,
+          expiresAt: activeExpiresAt,
+          expireAction: activeExpireAction,
+          errorMessage: error?.message || String(error)
+        });
       }
 
       if (onProgress) {
@@ -2408,35 +3315,483 @@ async function executeGroupBatchOnFiles({
           createdCount,
           updatedCount,
           removedCount,
-          failedCount
+          failedCount,
+          stopped
         });
       }
     }
   });
 
   await Promise.all(workers);
+  if (ttlBatchToEnqueue.length) {
+    await enqueueTtlPermissions(ttlBatchToEnqueue);
+  }
   if (logs.length) await appendAuditLogs(logs);
-  return { createdCount, updatedCount, removedCount, failedCount, total: operations.length };
+  return {
+    createdCount,
+    updatedCount,
+    removedCount,
+    failedCount,
+    total: operations.length,
+    stopped,
+    failedItems
+  };
+}
+
+async function executeGroupBatchOperation(options = {}) {
+  return executeGroupBatchOnFiles(options);
 }
 
 /**
- * 对指定文件列表按当前白名单与公开策略执行修正
+ * 直接对传入的文件/文件夹列表批量授予或撤除指定邮箱集合的权限
+ * 支持 'reader' | 'commenter' | 'writer' 角色、TTL 限时授权、暂停/取消与失败项重试
  */
-async function enforceFilesByPolicy(fallbackToken, files, policy, fallbackOwnerEmail, source = 'manual', onProgress = null) {
-  const queue = [];
-  for (const file of files) {
-    const fileOwner = file.ownerAccount || file.owners?.[0]?.emailAddress || fallbackOwnerEmail;
-    for (const permission of file.permissions || []) {
-      const evalResult = evaluatePermission(permission, policy, fileOwner);
-      if (evalResult.desiredAction === 'remove' || evalResult.desiredAction === 'downgrade') {
-        queue.push({
-          file,
+async function executeDirectEmailsBatchOnFiles({
+  files = [],
+  emails = [],
+  mode = 'grant',
+  role = 'reader',
+  expiresAt = '',
+  expireAction = 'revoke',
+  onProgress = null,
+  shouldStop = null,
+  retryQueue = null
+} = {}) {
+  const cleanRole = normalizePermissionRole(role, 'reader') || 'reader';
+  const validExpiresAt =
+    expiresAt && Number.isFinite(Date.parse(expiresAt)) ? new Date(Date.parse(expiresAt)).toISOString() : '';
+
+  const fileById = new Map();
+  for (const f of files || []) {
+    if (f && f.id) fileById.set(f.id, f);
+  }
+
+  let contactLookup = null;
+  try {
+    const dir = await getDirectory();
+    contactLookup = buildContactLookup(dir);
+  } catch (_e) {
+    contactLookup = null;
+  }
+
+  const operations = [];
+  if (Array.isArray(retryQueue)) {
+    for (const item of retryQueue) {
+      if (!item || !item.fileId || !item.type) continue;
+      const liveFile =
+        fileById.get(item.fileId) ||
+        item.file || {
+          id: item.fileId,
+          name: item.fileName || '(无名称)',
+          mimeType: item.mimeType || '',
+          webViewLink: item.webViewLink || '',
+          ownerAccount: item.fileOwner || '',
+          permissions: []
+        };
+      const livePerm =
+        item.permissionId && Array.isArray(liveFile.permissions)
+          ? liveFile.permissions.find(p => p.id === item.permissionId) || item.permission
+          : item.permission || null;
+      operations.push({
+        type: item.type,
+        file: liveFile,
+        fileOwner: item.fileOwner || normalizeEntry(liveFile.ownerAccount || liveFile.owners?.[0]?.emailAddress || ''),
+        permission: livePerm,
+        email: normalizeEntry(item.email || ''),
+        name: item.name || item.email || '',
+        role: normalizePermissionRole(item.role, cleanRole) || cleanRole,
+        expiresAt: item.expiresAt || validExpiresAt,
+        expireAction: item.expireAction || expireAction || 'revoke'
+      });
+    }
+  } else {
+    const cleanEmails = Array.isArray(emails)
+      ? parseEmailListInput(emails.join('\n'))
+      : parseEmailListInput(String(emails || ''));
+    if (!cleanEmails.length) {
+      throw new Error('请至少输入 1 个有效的目标邮箱地址');
+    }
+    const emailSet = new Set(cleanEmails);
+
+    for (const file of files || []) {
+      if (!file || !file.id) continue;
+      const fileOwner = normalizeEntry(file.ownerAccount || file.owners?.[0]?.emailAddress || '');
+      const perms = file.permissions || [];
+      const existingByEmail = new Map();
+      for (const p of perms) {
+        if (p.type === 'user' || p.type === 'group') {
+          const em = normalizeEntry(p.emailAddress || '');
+          if (em) existingByEmail.set(em, p);
+        }
+      }
+
+      if (mode === 'grant') {
+        for (const email of cleanEmails) {
+          if (email === fileOwner) continue;
+          const contactName = contactLookup?.get(email)?.name || email;
+          const existing = existingByEmail.get(email);
+          if (!existing) {
+            operations.push({
+              type: 'create',
+              file,
+              fileOwner,
+              email,
+              name: contactName,
+              role: cleanRole,
+              expiresAt: validExpiresAt,
+              expireAction: expireAction || 'revoke'
+            });
+          } else if (
+            existing.role !== 'owner' &&
+            !permIsInherited(existing) &&
+            (existing.role !== cleanRole || Boolean(validExpiresAt))
+          ) {
+            operations.push({
+              type: 'update',
+              file,
+              fileOwner,
+              permission: existing,
+              email,
+              name: contactName,
+              role: cleanRole,
+              expiresAt: validExpiresAt,
+              expireAction: expireAction || 'revoke'
+            });
+          } else if (
+            existing.role !== 'owner' &&
+            permIsInherited(existing) &&
+            permissionRoleRank(cleanRole) > permissionRoleRank(existing.role)
+          ) {
+            operations.push({
+              type: 'create',
+              file,
+              fileOwner,
+              email,
+              name: contactName,
+              role: cleanRole,
+              expiresAt: validExpiresAt,
+              expireAction: expireAction || 'revoke'
+            });
+          }
+        }
+      } else if (mode === 'revoke') {
+        for (const p of perms) {
+          if (p.role === 'owner' || permIsInherited(p)) continue;
+          const em = normalizeEntry(p.emailAddress || '');
+          if (em && em !== fileOwner && emailSet.has(em)) {
+            operations.push({
+              type: 'delete',
+              file,
+              fileOwner,
+              permission: p,
+              email: em,
+              name: contactLookup?.get(em)?.name || p.displayName || em
+            });
+          }
+        }
+      }
+    }
+  }
+
+  let createdCount = 0;
+  let updatedCount = 0;
+  let removedCount = 0;
+  let failedCount = 0;
+  let stopped = false;
+  const failedItems = [];
+  const ttlBatchToEnqueue = [];
+  const logs = [];
+  let cursor = 0;
+
+  const tokenCache = new Map();
+  async function getToken(owner) {
+    if (tokenCache.has(owner)) return tokenCache.get(owner);
+    const t = await getValidTokenForAccount(owner, true);
+    tokenCache.set(owner, t);
+    return t;
+  }
+
+  const workers = Array.from({ length: 4 }, async () => {
+    while (cursor < operations.length) {
+      if (shouldStop?.()) {
+        stopped = true;
+        break;
+      }
+      const op = operations[cursor++];
+      const { file, fileOwner } = op;
+      const activeExpiresAt = op.expiresAt || '';
+      const activeExpireAction = op.expireAction || expireAction || 'revoke';
+      const targetDisplay = op.name && op.name !== op.email ? `${op.name} (${op.email})` : op.email;
+      try {
+        const token = await getToken(fileOwner);
+        if (op.type === 'create') {
+          let created = null;
+          let nativeExpirationApplied = false;
+          if (activeExpiresAt) {
+            const grantRes = await grantPermissionCoreApi(token, file, file.id, {
+              type: 'user',
+              role: op.role,
+              emailAddress: op.email,
+              expiresAt: activeExpiresAt
+            });
+            created = grantRes.createdPermission;
+            nativeExpirationApplied = grantRes.nativeExpirationApplied;
+          } else {
+            created = await createPermission(token, file.id, {
+              type: 'user',
+              role: op.role,
+              emailAddress: op.email
+            });
+          }
+          const createdId = created?.id || `dir-${Date.now()}-${Math.random()}`;
+          file.permissions = file.permissions || [];
+          const existPerm = file.permissions.find(p => normalizeEntry(p.emailAddress || '') === op.email);
+          if (existPerm && existPerm.role !== 'owner') {
+            existPerm.id = created?.id || existPerm.id;
+            existPerm.role = op.role;
+          } else {
+            file.permissions.push({
+              id: createdId,
+              type: 'user',
+              role: op.role,
+              emailAddress: op.email,
+              displayName: op.name || op.email
+            });
+          }
+
+          if (activeExpiresAt) {
+            ttlBatchToEnqueue.push({
+              fileId: file.id,
+              fileName: file.name || '(无名称)',
+              mimeType: file.mimeType || '',
+              webViewLink: file.webViewLink || '',
+              accountEmail: fileOwner,
+              permissionId: created?.id || '',
+              targetType: 'user',
+              targetEmail: op.email,
+              targetLabel: targetDisplay,
+              grantedRole: op.role,
+              expireAction: activeExpireAction,
+              expiresAt: activeExpiresAt,
+              nativeExpirationApplied
+            });
+          }
+          createdCount++;
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'manual',
+            actionType: 'grant',
+            isTtl: Boolean(activeExpiresAt),
+            accountEmail: fileOwner,
+            fileId: file.id,
+            fileName: file.name || '(无名称)',
+            webViewLink: file.webViewLink || '',
+            permissionId: created?.id || '',
+            targetType: 'user',
+            targetEmail: op.email,
+            targetLabel: targetDisplay,
+            previousRole: '',
+            newRole: op.role,
+            restored: false,
+            message: `指定邮箱批量授予「${roleLabel(op.role)}」权限${
+              activeExpiresAt ? `（限时：${formatTtlRemaining(activeExpiresAt)}）` : ''
+            }`
+          });
+        } else if (op.type === 'update') {
+          const prevRole = op.permission.role;
+          if (prevRole !== op.role) {
+            await updatePermissionRole(token, file.id, op.permission.id, op.role);
+            op.permission.role = op.role;
+          }
+          if (activeExpiresAt) {
+            ttlBatchToEnqueue.push({
+              fileId: file.id,
+              fileName: file.name || '(无名称)',
+              mimeType: file.mimeType || '',
+              webViewLink: file.webViewLink || '',
+              accountEmail: fileOwner,
+              permissionId: op.permission.id,
+              targetType: op.permission.type || 'user',
+              targetEmail: op.email,
+              targetLabel: targetDisplay,
+              grantedRole: op.role,
+              expireAction: activeExpireAction,
+              expiresAt: activeExpiresAt,
+              nativeExpirationApplied: false
+            });
+          }
+          updatedCount++;
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'manual',
+            actionType: 'downgrade',
+            isTtl: Boolean(activeExpiresAt),
+            accountEmail: fileOwner,
+            fileId: file.id,
+            fileName: file.name || '(无名称)',
+            webViewLink: file.webViewLink || '',
+            permissionId: op.permission.id,
+            targetType: op.permission.type || 'user',
+            targetEmail: op.email,
+            targetLabel: targetDisplay,
+            previousRole: prevRole,
+            newRole: op.role,
+            restored: false,
+            message: `指定邮箱批量调整角色：${roleLabel(prevRole)} -> ${roleLabel(op.role)}${
+              activeExpiresAt ? `（限时：${formatTtlRemaining(activeExpiresAt)}）` : ''
+            }`
+          });
+        } else if (op.type === 'delete') {
+          await deletePermission(token, file.id, op.permission.id);
+          file.permissions = (file.permissions || []).filter(x => x.id !== op.permission.id);
+          removedCount++;
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'manual',
+            actionType: 'revoke',
+            accountEmail: fileOwner,
+            fileId: file.id,
+            fileName: file.name || '(无名称)',
+            webViewLink: file.webViewLink || '',
+            permissionId: op.permission.id,
+            targetType: op.permission.type || 'user',
+            targetEmail: op.email,
+            targetLabel: targetDisplay,
+            previousRole: op.permission.role,
+            newRole: '',
+            restored: false,
+            message: `指定邮箱批量移除权限（原角色：${roleLabel(op.permission.role)}）`
+          });
+        }
+      } catch (error) {
+        failedCount++;
+        failedItems.push({
+          type: op.type,
+          fileId: file.id,
+          fileName: file.name || '(无名称)',
+          mimeType: file.mimeType || '',
+          webViewLink: file.webViewLink || '',
           fileOwner,
-          permission,
-          action: evalResult.desiredAction,
-          targetRole: evalResult.targetRole || 'reader',
-          reason: evalResult.reason
+          permissionId: op.permission?.id || '',
+          permission: op.permission
+            ? {
+                id: op.permission.id,
+                type: op.permission.type,
+                role: op.permission.role,
+                emailAddress: op.permission.emailAddress || '',
+                domain: op.permission.domain || ''
+              }
+            : null,
+          email: op.email || '',
+          name: op.name || '',
+          role: op.role || '',
+          expiresAt: activeExpiresAt,
+          expireAction: activeExpireAction,
+          errorMessage: error?.message || String(error)
         });
+      }
+
+      const changedCount = createdCount + updatedCount + removedCount;
+      if (onProgress) {
+        onProgress({
+          done: changedCount + failedCount,
+          total: operations.length,
+          changedCount,
+          createdCount,
+          updatedCount,
+          removedCount,
+          failedCount,
+          stopped,
+          message: `正在处理指定邮箱权限 ${changedCount + failedCount}/${operations.length}（成功 ${changedCount}，失败 ${failedCount}）…`
+        });
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  if (ttlBatchToEnqueue.length) {
+    await enqueueTtlPermissions(ttlBatchToEnqueue);
+  }
+  if (logs.length) await appendAuditLogs(logs);
+
+  const changedCount = createdCount + updatedCount + removedCount;
+  return {
+    changedCount,
+    createdCount,
+    updatedCount,
+    removedCount,
+    failedCount,
+    total: operations.length,
+    failedItems,
+    stopped
+  };
+}
+
+/**
+ * 对指定文件列表按当前白名单与公开策略执行修正（支持暂停/取消与失败重试）
+ */
+async function enforceFilesByPolicy(
+  fallbackToken,
+  files,
+  policy,
+  fallbackOwnerEmail,
+  source = 'manual',
+  onProgress = null,
+  control = {}
+) {
+  const { shouldStop = null, retryQueue = null } = control || {};
+  const fileById = new Map();
+  for (const f of files || []) {
+    if (f && f.id) fileById.set(f.id, f);
+  }
+
+  const queue = [];
+  if (Array.isArray(retryQueue)) {
+    for (const item of retryQueue) {
+      if (!item || !item.fileId || !item.permissionId) continue;
+      const liveFile =
+        fileById.get(item.fileId) ||
+        item.file || {
+          id: item.fileId,
+          name: item.fileName || '(无名称)',
+          webViewLink: item.webViewLink || '',
+          ownerAccount: item.fileOwner || fallbackOwnerEmail || '',
+          permissions: []
+        };
+      const livePerm =
+        Array.isArray(liveFile.permissions)
+          ? liveFile.permissions.find(p => p.id === item.permissionId) || item.permission
+          : item.permission;
+      if (!livePerm) continue;
+      queue.push({
+        file: liveFile,
+        fileOwner: item.fileOwner || liveFile.ownerAccount || liveFile.owners?.[0]?.emailAddress || fallbackOwnerEmail,
+        permission: livePerm,
+        action: item.action,
+        targetRole: item.targetRole || 'reader',
+        reason: item.reason || '策略合规修正'
+      });
+    }
+  } else {
+    const excludedSet = buildExcludedFileIdSet(files || [], policy?.excludedFolders || []);
+    for (const file of files || []) {
+      if (isFileInExcludedFolders(file, policy?.excludedFolders || [], excludedSet)) continue;
+      const fileOwner = file.ownerAccount || file.owners?.[0]?.emailAddress || fallbackOwnerEmail;
+      for (const permission of file.permissions || []) {
+        const evalResult = evaluatePermission(permission, policy, fileOwner);
+        if (evalResult.desiredAction === 'remove' || evalResult.desiredAction === 'downgrade') {
+          queue.push({
+            file,
+            fileOwner,
+            permission,
+            action: evalResult.desiredAction,
+            targetRole: evalResult.targetRole || 'reader',
+            reason: evalResult.reason
+          });
+        }
       }
     }
   }
@@ -2444,6 +3799,8 @@ async function enforceFilesByPolicy(fallbackToken, files, policy, fallbackOwnerE
   let removed = 0;
   let downgraded = 0;
   let failed = 0;
+  let stopped = false;
+  const failedItems = [];
   const logs = [];
   let cursor = 0;
 
@@ -2463,6 +3820,10 @@ async function enforceFilesByPolicy(fallbackToken, files, policy, fallbackOwnerE
 
   const workers = Array.from({ length: 4 }, async () => {
     while (cursor < queue.length) {
+      if (shouldStop?.()) {
+        stopped = true;
+        break;
+      }
       const item = queue[cursor++];
       const { file, fileOwner, permission, action, targetRole, reason } = item;
       const targetLabel = permissionLabel(permission);
@@ -2518,6 +3879,26 @@ async function enforceFilesByPolicy(fallbackToken, files, policy, fallbackOwnerE
         }
       } catch (error) {
         failed++;
+        const errMsg = error?.message || String(error);
+        failedItems.push({
+          fileId: file.id,
+          fileName: file.name || '(无名称)',
+          webViewLink: file.webViewLink || '',
+          fileOwner,
+          permissionId: permission.id,
+          permission: {
+            id: permission.id,
+            type: permission.type,
+            role: permission.role,
+            emailAddress: permission.emailAddress || '',
+            domain: permission.domain || '',
+            displayName: permission.displayName || ''
+          },
+          action,
+          targetRole,
+          reason,
+          errorMessage: errMsg
+        });
         logs.push({
           id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           timestamp: new Date().toISOString(),
@@ -2534,7 +3915,7 @@ async function enforceFilesByPolicy(fallbackToken, files, policy, fallbackOwnerE
           previousRole: permission.role || '',
           newRole: '',
           restored: false,
-          message: `处理失败 (${targetLabel})：${error.message}`
+          message: `处理失败 (${targetLabel})：${errMsg}`
         });
       }
 
@@ -2544,7 +3925,8 @@ async function enforceFilesByPolicy(fallbackToken, files, policy, fallbackOwnerE
           total: queue.length,
           removed,
           downgraded,
-          failed
+          failed,
+          stopped
         });
       }
     }
@@ -2555,13 +3937,24 @@ async function enforceFilesByPolicy(fallbackToken, files, policy, fallbackOwnerE
     await appendAuditLogs(logs);
   }
 
-  return { removed, downgraded, failed, total: queue.length, logs };
+  return { removed, downgraded, failed, total: queue.length, logs, stopped, failedItems };
 }
 
 function normalizeScannedFileItem(file, accountEmail = '') {
   file.ownerAccount = normalizeEntry(accountEmail || file.owners?.[0]?.emailAddress || '');
   file.scannedByAccount = normalizeEntry(accountEmail || '');
   file.webViewLink = formatDriveCanonicalLink(file);
+  file.writersCanShare = file.writersCanShare !== undefined ? Boolean(file.writersCanShare) : true;
+  file.copyRequiresWriterPermission = Boolean(file.copyRequiresWriterPermission);
+  const roRestriction = Array.isArray(file.contentRestrictions)
+    ? file.contentRestrictions.find(r => r && r.readOnly)
+    : null;
+  file.contentLocked =
+    file.contentLocked !== undefined && !Array.isArray(file.contentRestrictions)
+      ? Boolean(file.contentLocked)
+      : Boolean(roRestriction);
+  file.contentLockReason = roRestriction?.reason || file.contentLockReason || '';
+  file.viewedByMeTime = file.viewedByMeTime || '';
   if (Array.isArray(file.permissions) && file.permissions.length > 0) {
     file.permissionsLoading = false;
     file.permissionError = '';
@@ -2602,7 +3995,7 @@ async function scanSingleAccount(
   onProgress = null,
   accountPrefix = '',
   onPartialFiles = null,
-  scanScope = 'all_drive',
+  scanScope = 'owned',
   customFolderIds = [],
   recursive = true
 ) {
@@ -2611,7 +4004,7 @@ async function scanSingleAccount(
   let lastPartialEmit = 0;
 
   const INLINE_FILE_FIELDS =
-    'id,name,mimeType,webViewLink,createdTime,modifiedTime,ownedByMe,shared,owners(emailAddress,displayName),capabilities(canEdit,canComment,canShare),permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(inherited,inheritedFrom,permissionType)),parents';
+    'id,name,mimeType,webViewLink,createdTime,modifiedTime,viewedByMeTime,writersCanShare,copyRequiresWriterPermission,contentRestrictions(readOnly,reason),ownedByMe,shared,owners(emailAddress,displayName),capabilities(canEdit,canComment,canShare),permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(role,inherited,inheritedFrom,permissionType)),parents';
 
   if (scanScope === 'custom_folders') {
     const cleanRootIds = [...new Set((customFolderIds || []).filter(Boolean))];
@@ -2805,7 +4198,7 @@ async function scanSingleAccount(
               supportsAllDrives: 'true',
               pageSize: '100',
               fields:
-                'nextPageToken,permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(inherited,inheritedFrom,permissionType))'
+                'nextPageToken,permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(role,inherited,inheritedFrom,permissionType))'
             });
             if (pToken) params.set('pageToken', pToken);
             const data = await driveApi(token, `/files/${encodeURIComponent(file.id)}/permissions?${params}`);
@@ -2847,106 +4240,193 @@ async function scanSingleAccount(
 }
 
 /**
- * 执行完整扫描（支持多账号并发、扫描范围选择 scanScope & 边扫边展示 onPartialFiles）
+ * 执行完整扫描（支持多账号并发、扫描范围选择 scanScope、边扫边展示 onPartialFiles、并发锁与权限变更 Diff）
  */
 async function runFullScan({
   interactive = false,
   source = 'manual',
   targetAccount = 'all',
-  scanScope = 'all_drive',
+  scanScope = 'owned',
   customFolderIds = [],
   recursive = true,
+  resumeCheckpoint = false,
   onProgress = null,
   onPartialFiles = null
 } = {}) {
-  const policy = await getPolicy();
-  const prevSnapshot = await getSnapshot();
-  const accounts = await getAuthorizedAccounts();
-
-  const knownSet = new Set(prevSnapshot.knownFileIds || []);
-  const prevNewSet = new Set(prevSnapshot.newFileIds || []);
-  const isFirstScan = knownSet.size === 0;
-
-  let targetAccounts = [];
-  if (accounts.length > 0) {
-    if (targetAccount && targetAccount !== 'all') {
-      const found = accounts.find(a => normalizeEntry(a.email) === normalizeEntry(targetAccount));
-      targetAccounts = found ? [found] : accounts;
-    } else {
-      targetAccounts = accounts;
-    }
-  } else {
-    const oauthClients = await getOAuthClients();
-    if (interactive && oauthClients.length > 0) {
-      const newAcc = await authorizeWithOAuthClient(oauthClients[0]);
-      targetAccounts = [newAcc];
-    } else {
-      const token = await getValidTokenForAccount('', interactive);
-      const about = await fetchAboutUser(token);
-      targetAccounts = [{ email: about.email, accessToken: token }];
-    }
+  const lockAttempt = await acquireScanRuntimeLock(source);
+  if (!lockAttempt.acquired) {
+    const policy = await getPolicy();
+    const prevSnapshot = await getSnapshot();
+    const summary = computeSummary(
+      prevSnapshot.files || [],
+      policy,
+      prevSnapshot.accountEmail || '',
+      new Set(prevSnapshot.newFileIds || [])
+    );
+    return {
+      skipped: true,
+      skipReason: 'scan_in_progress',
+      accounts: await getAuthorizedAccounts(),
+      policy,
+      snapshot: prevSnapshot,
+      summary,
+      newlyDiscoveredCount: 0,
+      excludedSkippedCount: 0,
+      autoEnforceResult: null
+    };
   }
 
-  const scannedAccountSet = new Set(targetAccounts.map(a => normalizeEntry(a.email)));
-  const otherAccountFiles =
-    scanScope !== 'custom_folders' && targetAccount !== 'all' && prevSnapshot.files?.length
-      ? prevSnapshot.files.filter(f => f.ownerAccount && !scannedAccountSet.has(normalizeEntry(f.ownerAccount)))
-      : [];
+  const lockId = lockAttempt.lockId;
+  const isAutoPatrol = source === 'schedule' || source === 'startup';
+  try {
+    const policy = await getPolicy();
+    const prevSnapshot = await getSnapshot();
+    const accounts = await getAuthorizedAccounts();
+    const excludedFolders = policy.excludedFolders || [];
 
-  const perAccountFiles = new Map();
+    const knownSet = new Set(prevSnapshot.knownFileIds || []);
+    const prevNewSet = new Set(prevSnapshot.newFileIds || []);
+    const isFirstScan = knownSet.size === 0;
 
-  // 多账号全网盘扫描时按 file.id 去重，优先保留 ownedByMe 或权限信息更完整的项
-  const mergeAndDedupeFiles = () => {
-    const byId = new Map();
-    const allLists = [...perAccountFiles.values(), otherAccountFiles];
-    for (const list of allLists) {
-      for (const file of list) {
-        if (!file?.id) continue;
-        const prev = byId.get(file.id);
-        if (!prev || (!prev.ownedByMe && file.ownedByMe) || ((file.permissions?.length || 0) > (prev.permissions?.length || 0))) {
-          byId.set(file.id, file);
-        }
+    // 准备旧快照权限指纹（兼容尚未持久化 permFingerprints 的历史快照）
+    const prevFingerprints = { ...(prevSnapshot.permFingerprints || {}) };
+    if (Object.keys(prevFingerprints).length === 0 && Array.isArray(prevSnapshot.files) && prevSnapshot.files.length > 0) {
+      for (const pf of prevSnapshot.files) {
+        if (!pf?.id) continue;
+        const fp = buildFilePermissionFingerprint(pf);
+        if (fp) prevFingerprints[pf.id] = fp;
       }
     }
-    return [...byId.values()];
-  };
+    const prevPermDiffs = { ...(prevSnapshot.permDiffs || {}) };
 
-  const emitPartialCombined = () => {
-    if (!onPartialFiles) return;
-    const combined = mergeAndDedupeFiles();
-    for (const file of combined) {
-      file.isNew = (!isFirstScan && !knownSet.has(file.id)) || prevNewSet.has(file.id);
+    let targetAccounts = [];
+    if (accounts.length > 0) {
+      if (targetAccount && targetAccount !== 'all') {
+        const found = accounts.find(a => normalizeEntry(a.email) === normalizeEntry(targetAccount));
+        targetAccounts = found ? [found] : accounts;
+      } else {
+        targetAccounts = accounts;
+      }
+    } else {
+      const oauthClients = await getOAuthClients();
+      if (interactive && oauthClients.length > 0) {
+        const newAcc = await authorizeWithOAuthClient(oauthClients[0]);
+        targetAccounts = [newAcc];
+      } else {
+        const token = await getValidTokenForAccount('', interactive);
+        const about = await fetchAboutUser(token);
+        targetAccounts = [{ email: about.email, accessToken: token }];
+      }
     }
-    onPartialFiles(combined);
-  };
 
-  // 多账号多线程并发扫描
-  await Promise.all(
-    targetAccounts.map(async acc => {
-      const prefix = targetAccounts.length > 1 ? `[${acc.email}] ` : '';
-      let token = await getValidTokenForAccount(acc.email, interactive, false);
-      let accFiles;
-      try {
-        accFiles = await scanSingleAccount(
-          acc.email,
-          token,
-          onProgress,
-          prefix,
-          partialList => {
-            perAccountFiles.set(acc.email, partialList);
-            emitPartialCombined();
-          },
-          scanScope,
-          customFolderIds,
-          recursive
-        );
-      } catch (err) {
-        if (/401|Invalid Credentials|UNAUTHENTICATED|authError/i.test(String(err?.message || ''))) {
-          token = await getValidTokenForAccount(acc.email, interactive, true);
+    // 自动巡检断点续检：若开启 resumeCheckpoint 且上次未完成，跳过已扫完的账号并保留其历史文件
+    let resumedCompletedSet = new Set();
+    let checkpointStartedAt = new Date().toISOString();
+    if (isAutoPatrol) {
+      const prevCp = await getAutoScanCheckpoint();
+      if (
+        resumeCheckpoint &&
+        (prevCp.status === 'running' || prevCp.status === 'interrupted') &&
+        Array.isArray(prevCp.completedAccountEmails) &&
+        prevCp.completedAccountEmails.length > 0
+      ) {
+        const targetNormSet = new Set(targetAccounts.map(a => normalizeEntry(a.email)));
+        const validCompleted = prevCp.completedAccountEmails
+          .map(normalizeEntry)
+          .filter(em => em && targetNormSet.has(em));
+        if (validCompleted.length > 0 && validCompleted.length < targetAccounts.length) {
+          resumedCompletedSet = new Set(validCompleted);
+          if (prevCp.startedAt) checkpointStartedAt = prevCp.startedAt;
+        }
+      }
+      await saveAutoScanCheckpoint({
+        status: 'running',
+        startedAt: checkpointStartedAt,
+        completedAccountEmails: [...resumedCompletedSet],
+        totalAccounts: targetAccounts.length,
+        scanScope,
+        lastError: ''
+      });
+    }
+
+    const accountsToScan =
+      resumedCompletedSet.size > 0
+        ? targetAccounts.filter(a => !resumedCompletedSet.has(normalizeEntry(a.email)))
+        : targetAccounts;
+
+    const activelyScanningAccountSet = new Set(accountsToScan.map(a => normalizeEntry(a.email)));
+    const otherAccountFiles =
+      scanScope !== 'custom_folders' &&
+      (targetAccount !== 'all' || resumedCompletedSet.size > 0) &&
+      prevSnapshot.files?.length
+        ? prevSnapshot.files.filter(f => f.ownerAccount && !activelyScanningAccountSet.has(normalizeEntry(f.ownerAccount)))
+        : [];
+
+    const perAccountFiles = new Map();
+    const completedEmailsLive = new Set(resumedCompletedSet);
+
+    // 多账号全网盘扫描时按 file.id 去重，优先保留 ownedByMe 或权限信息更完整的项
+    const mergeAndDedupeRawFiles = () => {
+      const byId = new Map();
+      const allLists = [...perAccountFiles.values(), otherAccountFiles];
+      for (const list of allLists) {
+        for (const file of list) {
+          if (!file?.id) continue;
+          const prev = byId.get(file.id);
+          if (
+            !prev ||
+            (!prev.ownedByMe && file.ownedByMe) ||
+            (file.permissions?.length || 0) > (prev.permissions?.length || 0)
+          ) {
+            byId.set(file.id, file);
+          }
+        }
+      }
+      return [...byId.values()];
+    };
+
+    const filterOutExcluded = list => {
+      if (!excludedFolders.length || !list.length) {
+        return { kept: list, excludedCount: 0 };
+      }
+      const exSet = buildExcludedFileIdSet(list, excludedFolders);
+      if (exSet.size === 0) {
+        return { kept: list, excludedCount: 0 };
+      }
+      const kept = list.filter(f => !exSet.has(f.id));
+      return { kept, excludedCount: list.length - kept.length };
+    };
+
+    const emitPartialCombined = () => {
+      touchScanRuntimeLock(lockId);
+      if (!onPartialFiles) return;
+      const { kept: combined } = filterOutExcluded(mergeAndDedupeRawFiles());
+      for (const file of combined) {
+        file.isNew = (!isFirstScan && !knownSet.has(file.id)) || prevNewSet.has(file.id);
+      }
+      onPartialFiles(combined);
+    };
+
+    const wrappedProgress = onProgress
+      ? info => {
+          touchScanRuntimeLock(lockId);
+          onProgress(info);
+        }
+      : info => {
+          touchScanRuntimeLock(lockId);
+        };
+
+    // 多账号多线程并发扫描
+    await Promise.all(
+      accountsToScan.map(async acc => {
+        const prefix = targetAccounts.length > 1 ? `[${acc.email}] ` : '';
+        let token = await getValidTokenForAccount(acc.email, interactive, false);
+        let accFiles;
+        try {
           accFiles = await scanSingleAccount(
             acc.email,
             token,
-            onProgress,
+            wrappedProgress,
             prefix,
             partialList => {
               perAccountFiles.set(acc.email, partialList);
@@ -2956,82 +4436,201 @@ async function runFullScan({
             customFolderIds,
             recursive
           );
-        } else {
-          throw err;
+        } catch (err) {
+          if (/401|Invalid Credentials|UNAUTHENTICATED|authError/i.test(String(err?.message || ''))) {
+            token = await getValidTokenForAccount(acc.email, interactive, true);
+            accFiles = await scanSingleAccount(
+              acc.email,
+              token,
+              wrappedProgress,
+              prefix,
+              partialList => {
+                perAccountFiles.set(acc.email, partialList);
+                emitPartialCombined();
+              },
+              scanScope,
+              customFolderIds,
+              recursive
+            );
+          } else {
+            throw err;
+          }
         }
+        perAccountFiles.set(acc.email, accFiles);
+        emitPartialCombined();
+
+        if (isAutoPatrol) {
+          const normAcc = normalizeEntry(acc.email);
+          if (normAcc) completedEmailsLive.add(normAcc);
+          const { kept: partialMerged } = filterOutExcluded(mergeAndDedupeRawFiles());
+          await saveSnapshot({
+            ...prevSnapshot,
+            lastScanAt: new Date().toISOString(),
+            lastScanSource: source,
+            accountEmail: targetAccounts[0]?.email || prevSnapshot.accountEmail || '',
+            files: partialMerged
+          });
+          await saveAutoScanCheckpoint({
+            status: 'running',
+            startedAt: checkpointStartedAt,
+            completedAccountEmails: [...completedEmailsLive],
+            totalAccounts: targetAccounts.length,
+            scanScope,
+            lastError: ''
+          });
+        }
+      })
+    );
+
+    const scannedFileIdSet = new Set();
+    for (const list of perAccountFiles.values()) {
+      for (const f of list || []) {
+        if (f?.id) scannedFileIdSet.add(f.id);
       }
-      perAccountFiles.set(acc.email, accFiles);
-      emitPartialCombined();
-    })
-  );
-
-  const mergedFiles = mergeAndDedupeFiles();
-
-  const newlyDiscoveredIds = [];
-  for (const file of mergedFiles) {
-    if (!isFirstScan && !knownSet.has(file.id)) {
-      file.isNew = true;
-      newlyDiscoveredIds.push(file.id);
-    } else if (prevNewSet.has(file.id)) {
-      file.isNew = true;
-    } else {
-      file.isNew = false;
     }
+
+    const { kept: mergedFiles, excludedCount: excludedSkippedCount } = filterOutExcluded(mergeAndDedupeRawFiles());
+
+    const newlyDiscoveredIds = [];
+    for (const file of mergedFiles) {
+      if (!isFirstScan && !knownSet.has(file.id)) {
+        file.isNew = true;
+        newlyDiscoveredIds.push(file.id);
+      } else if (prevNewSet.has(file.id)) {
+        file.isNew = true;
+      } else {
+        file.isNew = false;
+      }
+    }
+
+    const updatedKnownIds = [...new Set([...knownSet, ...mergedFiles.map(f => f.id)])];
+    const updatedNewIds = [...new Set([...prevNewSet, ...newlyDiscoveredIds])];
+    const primaryEmail = targetAccounts[0]?.email || prevSnapshot.accountEmail || '';
+
+    let autoEnforceResult = null;
+    if (isAutoPatrol && policy.autoEnforce) {
+      autoEnforceResult = await enforceFilesByPolicy(null, mergedFiles, policy, primaryEmail, 'auto');
+    }
+
+    // 计算本次扫描后的权限指纹与权限变动 Diff（单账号或断点续检时保留未重扫账号原有的指纹与 Diff）
+    const isPartialAccountScan =
+      scanScope === 'custom_folders' || (targetAccount && targetAccount !== 'all') || resumedCompletedSet.size > 0;
+    const nextFingerprints = isPartialAccountScan ? { ...prevFingerprints } : {};
+    const nextPermDiffs = isPartialAccountScan ? { ...prevPermDiffs } : {};
+
+    for (const file of mergedFiles) {
+      if (!file?.id) continue;
+      if (!scannedFileIdSet.has(file.id)) {
+        if (prevFingerprints[file.id]) nextFingerprints[file.id] = prevFingerprints[file.id];
+        if (prevPermDiffs[file.id]) nextPermDiffs[file.id] = prevPermDiffs[file.id];
+        continue;
+      }
+
+      const currFp = buildFilePermissionFingerprint(file);
+      if (currFp) {
+        nextFingerprints[file.id] = currFp;
+      } else if (prevFingerprints[file.id]) {
+        nextFingerprints[file.id] = prevFingerprints[file.id];
+      }
+
+      const prevFp = prevFingerprints[file.id] || null;
+      if (!isFirstScan && prevFp && currFp && prevFp.sig !== currFp.sig) {
+        const diffInfo = computeFilePermissionDiff(prevFp, currFp);
+        if (diffInfo) {
+          nextPermDiffs[file.id] = diffInfo;
+        } else {
+          delete nextPermDiffs[file.id];
+        }
+      } else if (scannedFileIdSet.has(file.id)) {
+        delete nextPermDiffs[file.id];
+      }
+    }
+
+    hydrateFilesPermissionDiffs(mergedFiles, nextPermDiffs);
+
+    const completedIso = new Date().toISOString();
+    const snapshot = {
+      lastScanAt: completedIso,
+      lastScanSource: source,
+      accountEmail: primaryEmail,
+      files: mergedFiles,
+      knownFileIds: updatedKnownIds,
+      newFileIds: updatedNewIds,
+      permFingerprints: nextFingerprints,
+      permDiffs: nextPermDiffs
+    };
+
+    await saveSnapshot(snapshot);
+    await updateExtensionBadge(mergedFiles, policy, primaryEmail);
+
+    if (isAutoPatrol) {
+      await saveAutoScanCheckpoint({
+        status: 'completed',
+        startedAt: checkpointStartedAt,
+        completedAt: completedIso,
+        lastSuccessAt: completedIso,
+        completedAccountEmails: targetAccounts.map(a => normalizeEntry(a.email)).filter(Boolean),
+        totalAccounts: targetAccounts.length,
+        scanScope,
+        lastError: ''
+      });
+    }
+
+    const summary = computeSummary(mergedFiles, policy, primaryEmail, new Set(updatedNewIds));
+
+    if (isAutoPatrol) {
+      const patrolLabel =
+        source === 'startup' && resumedCompletedSet.size > 0
+          ? `启动断点续检 (${accountsToScan.length}/${targetAccounts.length} 个剩余账号)`
+          : source === 'startup'
+            ? `启动自动巡检 (${targetAccounts.length} 个账号)`
+            : `定期自动巡检 (${targetAccounts.length} 个账号)`;
+      await appendAuditLogs({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        timestamp: snapshot.lastScanAt,
+        source: 'scan',
+        actionType: 'scan_summary',
+        fileId: '',
+        fileName: patrolLabel,
+        webViewLink: '',
+        permissionId: '',
+        targetType: '',
+        targetEmail: '',
+        targetLabel: `共 ${summary.total} 个文件（新增 ${newlyDiscoveredIds.length} 个，变动 ${summary.changedFiles} 个${
+          excludedSkippedCount > 0 ? `，已跳过排除项 ${excludedSkippedCount} 个` : ''
+        }）`,
+        previousRole: '',
+        newRole: '',
+        restored: false,
+        message: autoEnforceResult
+          ? `${patrolLabel}完成：自动移除 ${autoEnforceResult.removed} 项违规权限，自动降级 ${autoEnforceResult.downgraded} 项越权编辑。`
+          : `${patrolLabel}完成：发现 ${summary.anomalousFiles} 个异常文件（${summary.actionablePermissions} 项待处理权限，${summary.changedFiles} 个权限变动文件）。`
+      });
+    }
+
+    return {
+      accounts: await getAuthorizedAccounts(),
+      policy,
+      snapshot,
+      summary,
+      newlyDiscoveredCount: newlyDiscoveredIds.length,
+      excludedSkippedCount,
+      resumedFromCheckpoint: resumedCompletedSet.size > 0,
+      autoEnforceResult
+    };
+  } catch (scanErr) {
+    if (isAutoPatrol) {
+      try {
+        await saveAutoScanCheckpoint({
+          status: 'interrupted',
+          lastError: scanErr?.message || String(scanErr)
+        });
+      } catch (_cpErr) {}
+    }
+    throw scanErr;
+  } finally {
+    await releaseScanRuntimeLock(lockId);
   }
-
-  const updatedKnownIds = [...new Set([...knownSet, ...mergedFiles.map(f => f.id)])];
-  const updatedNewIds = [...new Set([...prevNewSet, ...newlyDiscoveredIds])];
-  const primaryEmail = targetAccounts[0]?.email || prevSnapshot.accountEmail || '';
-
-  let autoEnforceResult = null;
-  if (source === 'schedule' && policy.autoEnforce) {
-    autoEnforceResult = await enforceFilesByPolicy(null, mergedFiles, policy, primaryEmail, 'auto');
-  }
-
-  const snapshot = {
-    lastScanAt: new Date().toISOString(),
-    lastScanSource: source,
-    accountEmail: primaryEmail,
-    files: mergedFiles,
-    knownFileIds: updatedKnownIds,
-    newFileIds: updatedNewIds
-  };
-
-  await saveSnapshot(snapshot);
-  await updateExtensionBadge(mergedFiles, policy, primaryEmail);
-
-  const summary = computeSummary(mergedFiles, policy, primaryEmail, new Set(updatedNewIds));
-
-  if (source === 'schedule') {
-    await appendAuditLogs({
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      timestamp: snapshot.lastScanAt,
-      source: 'scan',
-      actionType: 'scan_summary',
-      fileId: '',
-      fileName: `全盘定时巡检 (${targetAccounts.length} 个账号)`,
-      webViewLink: '',
-      permissionId: '',
-      targetType: '',
-      targetEmail: '',
-      targetLabel: `共 ${summary.total} 个文件（新增 ${newlyDiscoveredIds.length} 个）`,
-      previousRole: '',
-      newRole: '',
-      restored: false,
-      message: autoEnforceResult
-        ? `定时巡检完成：自动移除 ${autoEnforceResult.removed} 项违规权限，自动降级 ${autoEnforceResult.downgraded} 项越权编辑。`
-        : `定时巡检完成：发现 ${summary.anomalousFiles} 个异常文件（${summary.actionablePermissions} 项待处理权限）。`
-    });
-  }
-
-  return {
-    accounts: await getAuthorizedAccounts(),
-    policy,
-    snapshot,
-    summary,
-    newlyDiscoveredCount: newlyDiscoveredIds.length,
-    autoEnforceResult
-  };
 }
 
 
@@ -3081,27 +4680,132 @@ function parseDriveLinksInput(rawText = '') {
 }
 
 /**
- * 从多行文本中提取所有有效邮箱地址（支持直接粘贴「姓名 + 邮箱」两列或逗号/换行分隔）
+ * 从逗号、分号、空格、制表符、换行或 `姓名 <a@b.com>` 文本/数组中提取去重合法邮箱数组
  */
-function parseEmailsInput(rawText = '') {
-  const matches = String(rawText).match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
+function parseEmailListInput(rawText = '') {
+  const combined = Array.isArray(rawText) ? rawText.join('\n') : String(rawText ?? '');
+  const matches = combined.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
   return [...new Set(matches.map(normalizeEntry).filter(Boolean))];
 }
 
 /**
- * 对一批文件/文件夹 ID (fileIds) 和一批邮箱 (emails) 批量开通查看/编辑/评论或关闭权限
+ * 兼容旧版邮箱列表提取别名
+ */
+function parseEmailsInput(rawText = '') {
+  return parseEmailListInput(rawText);
+}
+
+/**
+ * 对一批文件/文件夹 ID (fileIds 或 rows) 和一批邮箱 (emails) 批量开通查看/编辑/评论或关闭权限
+ * 若单行对象传入了合法 row.role ('writer'|'commenter'|'reader')，优先使用单行 row.role，否则使用工具栏统一 role
  */
 async function executeBatchLinksPermissions({
   fileIds = [],
   emails = [],
+  rows = null,
   role = 'reader', // 'reader' | 'writer' | 'commenter'
   mode = 'grant',  // 'grant' | 'revoke'
   existingFiles = [],
   targetAccount = 'all',
-  onProgress = null
+  expiresAt = '',
+  expireAction = 'revoke',
+  onProgress = null,
+  shouldStop = null,
+  retryQueue = null
 }) {
-  const cleanFileIds = [...new Set(fileIds.filter(Boolean))];
-  const cleanEmails = [...new Set(emails.map(normalizeEntry).filter(Boolean))];
+  const defaultRole = normalizePermissionRole(role, 'reader') || 'reader';
+  const validExpiresAt =
+    expiresAt && Number.isFinite(Date.parse(expiresAt)) ? new Date(Date.parse(expiresAt)).toISOString() : '';
+  const isRetry = Array.isArray(retryQueue);
+  if (isRetry && retryQueue.length === 0) {
+    return {
+      fileCount: 0,
+      emailCount: 0,
+      totalTasks: 0,
+      successCount: 0,
+      failCount: 0,
+      stopped: false,
+      failedItems: []
+    };
+  }
+
+  const hasRowObjects =
+    !isRetry &&
+    ((Array.isArray(rows) && rows.length > 0) ||
+      (Array.isArray(fileIds) && fileIds.some(item => item && typeof item === 'object')));
+
+  const rowPairs = [];
+  let cleanFileIds = [];
+  let cleanEmails = [];
+
+  if (isRetry) {
+    cleanFileIds = [...new Set(retryQueue.map(x => x?.fileId).filter(Boolean))];
+    cleanEmails = [...new Set(retryQueue.map(x => normalizeEntry(x?.email || '')).filter(Boolean))];
+  } else if (hasRowObjects) {
+    const rawRowObjects =
+      Array.isArray(rows) && rows.length > 0 ? rows : fileIds.filter(item => item && typeof item === 'object');
+    const fallbackEmails = parseEmailListInput(emails);
+    const pairMap = new Map();
+    const fidSet = new Set();
+    const emailSet = new Set();
+
+    for (const r of rawRowObjects) {
+      if (!r || typeof r !== 'object') continue;
+      let rowFids = [];
+      if (Array.isArray(r.fileIds) && r.fileIds.length) {
+        rowFids = r.fileIds.map(x => String(x || '').trim()).filter(Boolean);
+      } else if (typeof r.fileId === 'string' && r.fileId.trim()) {
+        const parsedIds = parseDriveLinksInput(r.fileId);
+        rowFids = parsedIds.length ? parsedIds : [r.fileId.trim()];
+      } else if (typeof r.id === 'string' && r.id.trim()) {
+        rowFids = [r.id.trim()];
+      } else if (r.link || r.url) {
+        rowFids = parseDriveLinksInput(r.link || r.url);
+      }
+
+      let rowEmails = [];
+      if (Array.isArray(r.emails) && r.emails.length) {
+        rowEmails = parseEmailListInput(r.emails);
+      } else if (typeof r.emails === 'string' && r.emails.trim()) {
+        rowEmails = parseEmailListInput(r.emails);
+      } else if (typeof r.email === 'string' && r.email.trim()) {
+        rowEmails = parseEmailListInput(r.email);
+      } else {
+        rowEmails = fallbackEmails;
+      }
+
+      const rowRole = normalizePermissionRole(r.role, '') || defaultRole;
+      const rowExp =
+        r.expiresAt && Number.isFinite(Date.parse(r.expiresAt))
+          ? new Date(Date.parse(r.expiresAt)).toISOString()
+          : validExpiresAt;
+
+      for (const fid of rowFids) {
+        fidSet.add(fid);
+        for (const em of rowEmails) {
+          emailSet.add(em);
+          const pKey = `${fid}::${em}`;
+          const prevPair = pairMap.get(pKey);
+          if (!prevPair || permissionRoleRank(rowRole) >= permissionRoleRank(prevPair.role)) {
+            pairMap.set(pKey, {
+              fileId: fid,
+              email: em,
+              role: rowRole,
+              expiresAt: rowExp
+            });
+          }
+        }
+      }
+    }
+
+    rowPairs.push(...pairMap.values());
+    cleanFileIds = [...fidSet];
+    cleanEmails = [...emailSet];
+  } else {
+    cleanFileIds = [...new Set((fileIds || []).map(x => String(x || '').trim()).filter(Boolean))];
+    cleanEmails = parseEmailListInput(emails);
+  }
+
   if (!cleanFileIds.length || !cleanEmails.length) {
     throw new Error('请至少提供 1 个有效链接（文件ID）和 1 个有效邮箱');
   }
@@ -3134,13 +4838,18 @@ async function executeBatchLinksPermissions({
     tokenPool.push({ email: '', token: fallbackToken });
   }
 
-  const existingMap = new Map(existingFiles.map(f => [f.id, f]));
+  const existingMap = new Map((existingFiles || []).map(f => [f.id, f]));
   const fileMetaMap = new Map();
+  let stopped = false;
 
   // 并发解析每个 fileId 对应的文件名与可用 token（避免逐个串行等待）
   let metaCursor = 0;
   const metaWorkers = Array.from({ length: Math.min(10, cleanFileIds.length) }, async () => {
     while (metaCursor < cleanFileIds.length) {
+      if (shouldStop?.()) {
+        stopped = true;
+        break;
+      }
       const fid = cleanFileIds[metaCursor++];
       const localFile = existingMap.get(fid);
       const preferredEmail = normalizeEntry(localFile?.ownerAccount || localFile?.owners?.[0]?.emailAddress || '');
@@ -3149,6 +4858,7 @@ async function executeBatchLinksPermissions({
       let resolvedToken = preferredEntry.token;
       let resolvedAccount = preferredEntry.email;
       let fileName = localFile?.name || `文件 (${fid.slice(0, 8)}…)`;
+      let mimeType = localFile?.mimeType || '';
       let webViewLink = localFile?.webViewLink || `https://drive.google.com/open?id=${fid}`;
 
       if (!localFile) {
@@ -3156,12 +4866,13 @@ async function executeBatchLinksPermissions({
           try {
             const meta = await driveApi(
               entry.token,
-              `/files/${encodeURIComponent(fid)}?supportsAllDrives=true&fields=id,name,webViewLink,owners(emailAddress)`
+              `/files/${encodeURIComponent(fid)}?supportsAllDrives=true&fields=id,name,mimeType,webViewLink,owners(emailAddress)`
             );
             if (meta) {
               resolvedToken = entry.token;
               resolvedAccount = entry.email || normalizeEntry(meta.owners?.[0]?.emailAddress || '');
               fileName = meta.name || fileName;
+              mimeType = meta.mimeType || mimeType;
               webViewLink = meta.webViewLink || webViewLink;
               break;
             }
@@ -3174,6 +4885,7 @@ async function executeBatchLinksPermissions({
       fileMetaMap.set(fid, {
         fileId: fid,
         fileName,
+        mimeType,
         webViewLink,
         token: resolvedToken,
         accountEmail: resolvedAccount,
@@ -3185,20 +4897,69 @@ async function executeBatchLinksPermissions({
 
   // 构建任务队列
   const tasks = [];
-  if (mode === 'grant') {
-    for (const fid of cleanFileIds) {
-      for (const email of cleanEmails) {
-        tasks.push({ type: 'grant', fileId: fid, email, role });
+  if (isRetry) {
+    for (const item of retryQueue) {
+      if (!item || !item.fileId || !item.email) continue;
+      tasks.push({
+        type: item.type || mode || 'grant',
+        fileId: item.fileId,
+        email: normalizeEntry(item.email),
+        role: normalizePermissionRole(item.role, defaultRole) || defaultRole,
+        permissionId: item.permissionId || '',
+        previousRole: item.previousRole || '',
+        expiresAt: item.expiresAt || validExpiresAt,
+        expireAction: item.expireAction || expireAction || 'revoke'
+      });
+    }
+  } else if (mode === 'grant') {
+    if (hasRowObjects) {
+      for (const pair of rowPairs) {
+        tasks.push({
+          type: 'grant',
+          fileId: pair.fileId,
+          email: pair.email,
+          role: pair.role,
+          expiresAt: pair.expiresAt,
+          expireAction: expireAction || 'revoke'
+        });
+      }
+    } else {
+      for (const fid of cleanFileIds) {
+        for (const email of cleanEmails) {
+          tasks.push({
+            type: 'grant',
+            fileId: fid,
+            email,
+            role: defaultRole,
+            expiresAt: validExpiresAt,
+            expireAction: expireAction || 'revoke'
+          });
+        }
       }
     }
   } else {
-    // mode === 'revoke': 并发读取每个文件的权限列表，找出命中 cleanEmails 的权限项
-    const emailSet = new Set(cleanEmails);
+    // mode === 'revoke': 并发读取每个文件的权限列表，找出命中目标邮箱的权限项
+    const allowedEmailsByFile = new Map();
+    if (hasRowObjects) {
+      for (const pair of rowPairs) {
+        if (!allowedEmailsByFile.has(pair.fileId)) {
+          allowedEmailsByFile.set(pair.fileId, new Set());
+        }
+        allowedEmailsByFile.get(pair.fileId).add(pair.email);
+      }
+    }
+    const globalEmailSet = new Set(cleanEmails);
     let revCursor = 0;
     const revWorkers = Array.from({ length: Math.min(10, cleanFileIds.length) }, async () => {
       while (revCursor < cleanFileIds.length) {
+        if (shouldStop?.()) {
+          stopped = true;
+          break;
+        }
         const fid = cleanFileIds[revCursor++];
         const meta = fileMetaMap.get(fid);
+        if (!meta) continue;
+        const targetEmailSet = hasRowObjects ? allowedEmailsByFile.get(fid) || new Set() : globalEmailSet;
         try {
           let perms = meta.localFile?.permissions;
           if (!perms || !perms.length) {
@@ -3211,7 +4972,7 @@ async function executeBatchLinksPermissions({
           for (const p of perms) {
             if (p.role === 'owner') continue;
             const em = normalizeEntry(p.emailAddress || '');
-            if (em && emailSet.has(em)) {
+            if (em && targetEmailSet.has(em)) {
               tasks.push({ type: 'revoke', fileId: fid, email: em, permissionId: p.id, previousRole: p.role });
             }
           }
@@ -3227,19 +4988,53 @@ async function executeBatchLinksPermissions({
   let failCount = 0;
   let done = 0;
   let cursor = 0;
+  const failedItems = [];
+  const ttlBatchToEnqueue = [];
   const logs = [];
 
   const workers = Array.from({ length: 12 }, async () => {
     while (cursor < tasks.length) {
+      if (shouldStop?.()) {
+        stopped = true;
+        break;
+      }
       const task = tasks[cursor++];
-      const meta = fileMetaMap.get(task.fileId);
+      const meta = fileMetaMap.get(task.fileId) || {
+        fileId: task.fileId,
+        fileName: `文件 (${String(task.fileId).slice(0, 8)}…)`,
+        mimeType: '',
+        webViewLink: `https://drive.google.com/open?id=${task.fileId}`,
+        token: tokenPool[0].token,
+        accountEmail: tokenPool[0].email,
+        localFile: existingMap.get(task.fileId) || null
+      };
+      const taskExpiresAt = task.expiresAt || '';
+      const taskExpireAction = task.expireAction || expireAction || 'revoke';
       try {
         if (task.type === 'grant') {
-          const created = await createPermission(meta.token, task.fileId, {
-            type: 'user',
-            role: task.role,
-            emailAddress: task.email
-          });
+          let created = null;
+          let nativeExpirationApplied = false;
+          if (taskExpiresAt) {
+            const grantRes = await grantPermissionCoreApi(
+              meta.token,
+              meta.localFile || { mimeType: meta.mimeType },
+              task.fileId,
+              {
+                type: 'user',
+                role: task.role,
+                emailAddress: task.email,
+                expiresAt: taskExpiresAt
+              }
+            );
+            created = grantRes.createdPermission;
+            nativeExpirationApplied = grantRes.nativeExpirationApplied;
+          } else {
+            created = await createPermission(meta.token, task.fileId, {
+              type: 'user',
+              role: task.role,
+              emailAddress: task.email
+            });
+          }
 
           if (meta.localFile) {
             meta.localFile.permissions = meta.localFile.permissions || [];
@@ -3258,12 +5053,31 @@ async function executeBatchLinksPermissions({
             }
           }
 
+          if (taskExpiresAt) {
+            ttlBatchToEnqueue.push({
+              fileId: task.fileId,
+              fileName: meta.fileName,
+              mimeType: meta.mimeType || meta.localFile?.mimeType || '',
+              webViewLink: meta.webViewLink,
+              accountEmail: meta.accountEmail,
+              permissionId: created?.id || '',
+              targetType: 'user',
+              targetEmail: task.email,
+              targetLabel: task.email,
+              grantedRole: task.role,
+              expireAction: taskExpireAction,
+              expiresAt: taskExpiresAt,
+              nativeExpirationApplied
+            });
+          }
+
           successCount++;
           logs.push({
             id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             timestamp: new Date().toISOString(),
             source: 'manual',
             actionType: 'grant',
+            isTtl: Boolean(taskExpiresAt),
             accountEmail: meta.accountEmail,
             fileId: task.fileId,
             fileName: meta.fileName,
@@ -3275,12 +5089,27 @@ async function executeBatchLinksPermissions({
             previousRole: '',
             newRole: task.role,
             restored: false,
-            message: `批量链接授权：授予「${roleLabel(task.role)}」权限`
+            message: `批量链接授权：授予「${roleLabel(task.role)}」权限${
+              taskExpiresAt ? `（限时：${formatTtlRemaining(taskExpiresAt)}）` : ''
+            }`
           });
         } else if (task.type === 'revoke') {
-          await deletePermission(meta.token, task.fileId, task.permissionId);
-          if (meta.localFile && meta.localFile.permissions) {
-            meta.localFile.permissions = meta.localFile.permissions.filter(p => p.id !== task.permissionId);
+          let permId = task.permissionId;
+          if (!permId) {
+            const data = await driveApi(
+              meta.token,
+              `/files/${encodeURIComponent(task.fileId)}/permissions?supportsAllDrives=true&pageSize=100&fields=permissions(id,type,role,emailAddress)`
+            );
+            const matched = (data?.permissions || []).find(
+              p => p.role !== 'owner' && normalizeEntry(p.emailAddress || '') === task.email
+            );
+            permId = matched?.id || '';
+          }
+          if (permId) {
+            await deletePermission(meta.token, task.fileId, permId);
+            if (meta.localFile && meta.localFile.permissions) {
+              meta.localFile.permissions = meta.localFile.permissions.filter(p => p.id !== permId);
+            }
           }
           successCount++;
           logs.push({
@@ -3292,7 +5121,7 @@ async function executeBatchLinksPermissions({
             fileId: task.fileId,
             fileName: meta.fileName,
             webViewLink: meta.webViewLink,
-            permissionId: task.permissionId,
+            permissionId: permId,
             targetType: 'user',
             targetEmail: task.email,
             targetLabel: task.email,
@@ -3304,6 +5133,19 @@ async function executeBatchLinksPermissions({
         }
       } catch (error) {
         failCount++;
+        const errMsg = error?.message || String(error);
+        failedItems.push({
+          type: task.type,
+          fileId: task.fileId,
+          fileName: meta.fileName,
+          email: task.email,
+          role: task.role || role,
+          permissionId: task.permissionId || '',
+          previousRole: task.previousRole || '',
+          expiresAt: taskExpiresAt,
+          expireAction: taskExpireAction,
+          errorMessage: errMsg
+        });
         logs.push({
           id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           timestamp: new Date().toISOString(),
@@ -3317,7 +5159,7 @@ async function executeBatchLinksPermissions({
           targetEmail: task.email,
           targetLabel: task.email,
           restored: false,
-          message: `批量链接操作失败 (${task.email})：${error.message}`
+          message: `批量链接操作失败 (${task.email})：${errMsg}`
         });
       } finally {
         done++;
@@ -3327,6 +5169,7 @@ async function executeBatchLinksPermissions({
             total: tasks.length,
             successCount,
             failCount,
+            stopped,
             message: `正在处理链接权限 ${done}/${tasks.length}（成功 ${successCount}，失败 ${failCount}）…`
           });
         }
@@ -3335,6 +5178,9 @@ async function executeBatchLinksPermissions({
   });
 
   await Promise.all(workers);
+  if (ttlBatchToEnqueue.length) {
+    await enqueueTtlPermissions(ttlBatchToEnqueue);
+  }
   if (logs.length) await appendAuditLogs(logs);
 
   return {
@@ -3342,7 +5188,9 @@ async function executeBatchLinksPermissions({
     emailCount: cleanEmails.length,
     totalTasks: tasks.length,
     successCount,
-    failCount
+    failCount,
+    stopped,
+    failedItems
   };
 }
 
@@ -3356,10 +5204,25 @@ async function executeBatchLinksPublicAccess({
   publicMode = 'anyone_writer',
   existingFiles = [],
   targetAccount = 'all',
-  onProgress = null
+  onProgress = null,
+  shouldStop = null,
+  retryQueue = null
 }) {
-  const cleanFileIds = [...new Set(fileIds.filter(Boolean))];
-  if (!cleanFileIds.length) {
+  const isRetry = Array.isArray(retryQueue);
+  if (isRetry && retryQueue.length === 0) {
+    return { total: 0, successCount: 0, failCount: 0, stopped: false, failedItems: [], results: [] };
+  }
+
+  const taskItems = isRetry
+    ? retryQueue
+        .map(item => {
+          const fid = typeof item === 'string' ? item : item?.fileId;
+          return fid ? { fileId: fid, publicMode: item?.publicMode || publicMode } : null;
+        })
+        .filter(Boolean)
+    : [...new Set((fileIds || []).filter(Boolean))].map(fid => ({ fileId: fid, publicMode }));
+
+  if (!taskItems.length) {
     throw new Error('请先输入至少 1 个有效链接');
   }
 
@@ -3387,19 +5250,28 @@ async function executeBatchLinksPublicAccess({
     tokenPool.push({ email: '', token: fallbackToken });
   }
 
-  const existingMap = new Map(existingFiles.map(f => [f.id, f]));
-  const desiredRole =
-    publicMode === 'anyone_writer' ? 'writer' : publicMode === 'anyone_commenter' ? 'commenter' : 'reader';
+  const existingMap = new Map((existingFiles || []).map(f => [f.id, f]));
 
   let successCount = 0;
   let failCount = 0;
   let done = 0;
   let cursor = 0;
+  let stopped = false;
+  const failedItems = [];
+  const results = [];
   const logs = [];
 
-  const workers = Array.from({ length: Math.min(10, cleanFileIds.length) }, async () => {
-    while (cursor < cleanFileIds.length) {
-      const fid = cleanFileIds[cursor++];
+  const workers = Array.from({ length: Math.min(10, taskItems.length) }, async () => {
+    while (cursor < taskItems.length) {
+      if (shouldStop?.()) {
+        stopped = true;
+        break;
+      }
+      const taskItem = taskItems[cursor++];
+      const fid = taskItem.fileId;
+      const itemMode = taskItem.publicMode || publicMode;
+      const desiredRole =
+        itemMode === 'anyone_writer' ? 'writer' : itemMode === 'anyone_commenter' ? 'commenter' : 'reader';
       const localFile = existingMap.get(fid);
       let fileName = localFile?.name || `文件 (${fid.slice(0, 8)}…)`;
       let webViewLink = localFile?.webViewLink || `https://drive.google.com/open?id=${fid}`;
@@ -3427,7 +5299,7 @@ async function executeBatchLinksPublicAccess({
           }
         }
 
-        if (publicMode === 'anyone_off') {
+        if (itemMode === 'anyone_off') {
           const permData = await driveApi(
             activeToken,
             `/files/${encodeURIComponent(fid)}/permissions?supportsAllDrives=true&fields=permissions(id,type,role)`
@@ -3440,6 +5312,13 @@ async function executeBatchLinksPublicAccess({
             localFile.permissions = localFile.permissions.filter(p => p.type !== 'anyone' && p.type !== 'domain');
           }
           successCount++;
+          results.push({
+            fileId: fid,
+            fileName,
+            webViewLink,
+            ok: true,
+            status: '已关闭公开链接（受限）'
+          });
           logs.push({
             id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             timestamp: new Date().toISOString(),
@@ -3474,6 +5353,13 @@ async function executeBatchLinksPublicAccess({
             }
           }
           successCount++;
+          results.push({
+            fileId: fid,
+            fileName,
+            webViewLink,
+            ok: true,
+            status: `任何人 · ${roleLabel(desiredRole)}`
+          });
           logs.push({
             id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             timestamp: new Date().toISOString(),
@@ -3493,6 +5379,21 @@ async function executeBatchLinksPublicAccess({
         }
       } catch (error) {
         failCount++;
+        const errMsg = error?.message || String(error);
+        failedItems.push({
+          fileId: fid,
+          fileName,
+          webViewLink,
+          publicMode: itemMode,
+          errorMessage: errMsg
+        });
+        results.push({
+          fileId: fid,
+          fileName,
+          webViewLink,
+          ok: false,
+          status: `失败：${errMsg}`
+        });
         logs.push({
           id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           timestamp: new Date().toISOString(),
@@ -3505,17 +5406,18 @@ async function executeBatchLinksPublicAccess({
           targetType: 'anyone',
           targetLabel: '公开链接 (任何人)',
           restored: false,
-          message: `设置公开链接失败：${error.message}`
+          message: `设置公开链接失败：${errMsg}`
         });
       } finally {
         done++;
         if (onProgress) {
           onProgress({
             done,
-            total: cleanFileIds.length,
+            total: taskItems.length,
             successCount,
             failCount,
-            message: `正在设置链接公开权限 ${done}/${cleanFileIds.length}（成功 ${successCount}，失败 ${failCount}）…`
+            stopped,
+            message: `正在设置链接公开权限 ${done}/${taskItems.length}（成功 ${successCount}，失败 ${failCount}）…`
           });
         }
       }
@@ -3524,7 +5426,7 @@ async function executeBatchLinksPublicAccess({
 
   await Promise.all(workers);
   if (logs.length) await appendAuditLogs(logs);
-  return { total: cleanFileIds.length, successCount, failCount };
+  return { total: taskItems.length, successCount, failCount, stopped, failedItems, results };
 }
 
 /**
@@ -4101,7 +6003,7 @@ async function scanSourceOwnedItemsForTransfer({
       phase: 'auth',
       page: 0,
       count: 0,
-      message: `正在校验来源邮箱 (${normSource}) 的免登录授权令牌…`
+      message: `正在校验来源邮箱 (${normSource}) 的本地授权令牌…`
     });
   }
 
@@ -4169,7 +6071,7 @@ async function scanSourceOwnedItemsForTransfer({
                   phase: 'auth_refresh',
                   page: completedPages + 1,
                   count: rawFiles.length,
-                  message: `🔄 检测到缓存令牌已过期，正在使用免登录 refreshToken 自动换取新令牌…`
+                  message: `🔄 检测到缓存令牌已过期，正在使用本地 refreshToken 自动换取新令牌…`
                 });
               }
               sourceToken = await getValidTokenForAccount(normSource, false, true);
@@ -6062,5 +7964,6175 @@ async function scanAndRestoreSpamAndTrashItems({
     fixedFlashInFolder,
     failedCount,
     totalFound: totalTasks
+  };
+}
+
+// ============================================================================
+// 阶段二：外部域名聚合审计与离职人员一键全盘清退引擎
+// ============================================================================
+
+const PUBLIC_EMAIL_DOMAINS = new Set([
+  'gmail.com',
+  'googlemail.com',
+  'outlook.com',
+  'hotmail.com',
+  'live.com',
+  'msn.com',
+  'qq.com',
+  'foxmail.com',
+  'vip.qq.com',
+  '163.com',
+  '126.com',
+  'yeah.net',
+  'vip.163.com',
+  'sina.com',
+  'sina.cn',
+  'sohu.com',
+  'aliyun.com',
+  'icloud.com',
+  'me.com',
+  'mac.com',
+  'yahoo.com',
+  'yahoo.co.jp',
+  'yahoo.com.hk',
+  'yahoo.com.tw',
+  'ymail.com',
+  'proton.me',
+  'protonmail.com',
+  'aol.com',
+  'zoho.com',
+  'gmx.com',
+  'mail.com',
+  'naver.com',
+  'daum.net',
+  'hanmail.net',
+  'yandex.ru',
+  'yandex.com'
+]);
+
+/**
+ * 安全提取邮箱的小写域名（如 'alice@Company.com' -> 'company.com'）
+ */
+function extractEmailDomain(email = '') {
+  const raw = String(email || '').trim().toLowerCase();
+  if (!raw) return '';
+  const angleMatch = raw.match(/<([^<>]+)>/);
+  const target = (angleMatch ? angleMatch[1] : raw).trim();
+  const atIdx = target.lastIndexOf('@');
+  if (atIdx === -1) return '';
+  if (atIdx === 0 && target.length > 1) {
+    const bareDom = target.slice(1).trim();
+    return /^[a-z0-9.-]+\.[a-z]{2,}$/.test(bareDom) ? bareDom : '';
+  }
+  const localPart = target.slice(0, atIdx).trim();
+  const domainPart = target.slice(atIdx + 1).trim();
+  if (!localPart || !domainPart) return '';
+  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(domainPart)) return '';
+  return domainPart;
+}
+
+/**
+ * 外部域名聚合审计摘要：
+ * 自动从已授权账号识别内部企业域名（排除公共邮箱域），聚合全部非所有者协作者并按风险与暴露文件数排序
+ */
+function buildDomainAuditSummary(
+  files = [],
+  directory = DEFAULT_DIRECTORY,
+  policy = DEFAULT_POLICY,
+  authorizedAccounts = []
+) {
+  const internalDomains = new Set();
+
+  for (const acc of authorizedAccounts || []) {
+    const accEmail = typeof acc === 'string' ? acc : acc?.email || '';
+    const dom = extractEmailDomain(accEmail);
+    if (dom && !PUBLIC_EMAIL_DOMAINS.has(dom)) {
+      internalDomains.add(dom);
+    }
+  }
+
+  // 若调用方未显式传入 authorizedAccounts，从当前已扫描自有文件的 ownerAccount 兜底推断企业自有域名
+  if (internalDomains.size === 0 && Array.isArray(files)) {
+    const ownerDomainCounts = new Map();
+    for (const file of files) {
+      if (!file) continue;
+      const ownerCandidate = file.ownerAccount || (file.ownedByMe ? file.owners?.[0]?.emailAddress : '') || '';
+      const dom = extractEmailDomain(ownerCandidate);
+      if (dom && !PUBLIC_EMAIL_DOMAINS.has(dom)) {
+        ownerDomainCounts.set(dom, (ownerDomainCounts.get(dom) || 0) + 1);
+      }
+    }
+    for (const [dom] of ownerDomainCounts.entries()) {
+      internalDomains.add(dom);
+    }
+  }
+
+  const contactLookup = buildContactLookup(directory || DEFAULT_DIRECTORY);
+  const activePolicy = policy || DEFAULT_POLICY;
+  const domainBuckets = new Map();
+
+  for (const file of files || []) {
+    if (!file || !file.id) continue;
+    const owner = normalizeEntry(file.ownerAccount || file.owners?.[0]?.emailAddress || '');
+    const seenUserInFile = new Set();
+
+    for (const p of file.permissions || []) {
+      if (!p || p.role === 'owner' || (p.type !== 'user' && p.type !== 'group')) continue;
+      const email = normalizeEntry(p.emailAddress || '');
+      if (!email || email === owner) continue;
+      const domain = extractEmailDomain(email);
+      if (!domain) continue;
+
+      let bucket = domainBuckets.get(domain);
+      if (!bucket) {
+        const category = PUBLIC_EMAIL_DOMAINS.has(domain)
+          ? 'personal'
+          : internalDomains.has(domain)
+            ? 'internal'
+            : 'external';
+        bucket = {
+          domain,
+          category,
+          usersMap: new Map(),
+          fileIds: new Set(),
+          writerFileIds: new Set(),
+          readerFileIds: new Set()
+        };
+        domainBuckets.set(domain, bucket);
+      }
+
+      bucket.fileIds.add(file.id);
+      if (p.role === 'reader') {
+        bucket.readerFileIds.add(file.id);
+      } else {
+        bucket.writerFileIds.add(file.id);
+      }
+
+      let userEntry = bucket.usersMap.get(email);
+      if (!userEntry) {
+        const contact = contactLookup.get(email);
+        const inW = matchesAllowlist(email, activePolicy.writers || []);
+        const inR = matchesAllowlist(email, activePolicy.readers || []);
+        userEntry = {
+          email,
+          name: contact?.name || p.displayName || '',
+          groups: contact?.groups ? [...contact.groups] : [],
+          inDirectory: Boolean(contact),
+          fileCount: 0,
+          writerCount: 0,
+          readerCount: 0,
+          overprivilegedCount: 0,
+          inWriters: inW,
+          inReaders: inR,
+          isStranger: !inW && !inR
+        };
+        bucket.usersMap.set(email, userEntry);
+      }
+
+      const userFileKey = `${email}::${file.id}`;
+      if (!seenUserInFile.has(userFileKey)) {
+        seenUserInFile.add(userFileKey);
+        userEntry.fileCount++;
+      }
+
+      if (p.role === 'reader') {
+        userEntry.readerCount++;
+      } else {
+        userEntry.writerCount++;
+      }
+
+      const ev = evaluatePermission(p, activePolicy, owner);
+      if (ev.status === 'violation_downgrade') {
+        userEntry.overprivilegedCount++;
+      }
+    }
+  }
+
+  const categoryWeight = {
+    external: 3,
+    personal: 2,
+    internal: 1
+  };
+
+  const result = [];
+  for (const bucket of domainBuckets.values()) {
+    const users = [...bucket.usersMap.values()].sort((a, b) => {
+      if (Number(b.isStranger) !== Number(a.isStranger)) return Number(b.isStranger) - Number(a.isStranger);
+      if (b.writerCount !== a.writerCount) return b.writerCount - a.writerCount;
+      if (b.fileCount !== a.fileCount) return b.fileCount - a.fileCount;
+      return a.email.localeCompare(b.email);
+    });
+
+    const fileCount = bucket.fileIds.size;
+    const writerFileCount = bucket.writerFileIds.size;
+    const readerFileCount = Math.max(0, fileCount - writerFileCount);
+    const strangerCount = users.filter(u => u.isStranger).length;
+    const overprivilegedCount = users.reduce((sum, u) => sum + u.overprivilegedCount, 0);
+
+    result.push({
+      domain: bucket.domain,
+      category: bucket.category,
+      userCount: users.length,
+      users,
+      fileCount,
+      writerFileCount,
+      readerFileCount,
+      strangerCount,
+      overprivilegedCount
+    });
+  }
+
+  result.sort((a, b) => {
+    const cwDiff = (categoryWeight[b.category] || 0) - (categoryWeight[a.category] || 0);
+    if (cwDiff !== 0) return cwDiff;
+    const aRisk = a.strangerCount > 0 || a.overprivilegedCount > 0 || a.writerFileCount > 0 ? 1 : 0;
+    const bRisk = b.strangerCount > 0 || b.overprivilegedCount > 0 || b.writerFileCount > 0 ? 1 : 0;
+    if (bRisk !== aRisk) return bRisk - aRisk;
+    if (b.fileCount !== a.fileCount) return b.fileCount - a.fileCount;
+    if (b.writerFileCount !== a.writerFileCount) return b.writerFileCount - a.writerFileCount;
+    if (b.strangerCount !== a.strangerCount) return b.strangerCount - a.strangerCount;
+    if (b.userCount !== a.userCount) return b.userCount - a.userCount;
+    return a.domain.localeCompare(b.domain);
+  });
+
+  return result;
+}
+
+/**
+ * 将离职清退回执格式化为带 UTF-8 BOM 的 CSV 文本，便于直接导出审计存档
+ */
+function formatOffboardReceiptCsv(offboardResult = {}) {
+  const rows = Array.isArray(offboardResult?.receiptRows) ? offboardResult.receiptRows : [];
+  const escapeCsvCell = val => {
+    const str = String(val ?? '');
+    if (/[",\r\n]/.test(str)) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  };
+  const header = ['处置时间', '所属账号', '目标邮箱', '文件名', '文件ID', '访问链接', '原角色', '处置结果'];
+  const lines = [header.map(escapeCsvCell).join(',')];
+  for (const r of rows) {
+    lines.push(
+      [
+        r.timestamp || '',
+        r.accountEmail || '',
+        r.targetEmail || offboardResult.targetEmail || '',
+        r.fileName || '',
+        r.fileId || '',
+        r.webViewLink || '',
+        r.previousRoleLabel || roleLabel(r.previousRole || ''),
+        r.resultText || ''
+      ]
+        .map(escapeCsvCell)
+        .join(',')
+    );
+  }
+  return '\uFEFF' + lines.join('\r\n');
+}
+
+/**
+ * 指定单个或多个邮箱一键全盘移除权限：
+ * 支持 targetEmail 传入逗号/换行分隔的多个邮箱或 targetEmails: string[]，
+ * 结合本地扫描快照 + 实时 Drive API 补漏搜索，并发撤除全部目标邮箱在所有可管理文件/目录上的非所有者权限，
+ * 跳过其作为 owner 的文件并合并生成可导出 CSV 的完整清退回执与可回滚审计日志。
+ */
+async function offboardPersonAcrossDrive({
+  targetEmail = '',
+  targetEmails = null,
+  files = [],
+  targetAccount = 'all',
+  liveSearch = true,
+  shouldStop = null,
+  retryQueue = null,
+  onProgress = null
+} = {}) {
+  const isRetry = Array.isArray(retryQueue);
+  const rawEmailCandidates = [];
+  if (Array.isArray(targetEmails)) {
+    rawEmailCandidates.push(...parseEmailListInput(targetEmails));
+  } else if (typeof targetEmails === 'string' && targetEmails.trim()) {
+    rawEmailCandidates.push(...parseEmailListInput(targetEmails));
+  }
+  if (typeof targetEmail === 'string' && targetEmail.trim()) {
+    rawEmailCandidates.push(...parseEmailListInput(targetEmail));
+  } else if (Array.isArray(targetEmail)) {
+    rawEmailCandidates.push(...parseEmailListInput(targetEmail));
+  }
+  if (isRetry) {
+    for (const rItem of retryQueue) {
+      const rEm = normalizeEntry(rItem?.targetEmail || '');
+      if (rEm && rEm.includes('@')) rawEmailCandidates.push(rEm);
+    }
+  }
+
+  const cleanEmails = [...new Set(rawEmailCandidates.filter(e => e && e.includes('@')))];
+  if (!cleanEmails.length) {
+    throw new Error('请输入有效的待清退人员邮箱地址');
+  }
+  const cleanEmailSet = new Set(cleanEmails);
+  const summaryTargetEmail = cleanEmails.join(', ');
+  const displayTargetSummary =
+    cleanEmails.length === 1 ? cleanEmails[0] : `${cleanEmails[0]} 等 ${cleanEmails.length} 个邮箱`;
+
+  const normalizedTargetAccount =
+    targetAccount && targetAccount !== 'all' ? normalizeEntry(targetAccount) : 'all';
+
+  // 准备已授权账号 Token 池
+  const accounts = await getAuthorizedAccounts();
+  const tokenPool = [];
+  const tokenByEmail = new Map();
+
+  if (accounts.length > 0) {
+    const scopedAccounts =
+      normalizedTargetAccount !== 'all'
+        ? accounts.filter(a => normalizeEntry(a.email) === normalizedTargetAccount)
+        : accounts;
+    const candidateAccounts = scopedAccounts.length > 0 ? scopedAccounts : accounts;
+
+    for (const acc of candidateAccounts) {
+      const em = normalizeEntry(acc.email);
+      try {
+        const tk = await getValidTokenForAccount(em, false);
+        if (tk) {
+          const entry = { email: em, token: tk };
+          tokenPool.push(entry);
+          tokenByEmail.set(em, tk);
+        }
+      } catch (_e) {
+        // 忽略单个过期账号，按需在执行时兜底获取
+      }
+    }
+  }
+
+  if (tokenPool.length === 0) {
+    try {
+      const fallbackTk = await getValidTokenForAccount(
+        normalizedTargetAccount !== 'all' ? normalizedTargetAccount : '',
+        false
+      );
+      if (fallbackTk) {
+        const em = normalizedTargetAccount !== 'all' ? normalizedTargetAccount : '';
+        tokenPool.push({ email: em, token: fallbackTk });
+        if (em) tokenByEmail.set(em, fallbackTk);
+      }
+    } catch (_e) {
+      // 允许在纯传入缓存 token 环境中按 getValidTokenForAccount 执行阶段获取
+    }
+  }
+
+  async function resolveTokenForAccount(accEmail) {
+    const norm = normalizeEntry(accEmail || '');
+    if (norm && tokenByEmail.has(norm)) return tokenByEmail.get(norm);
+    try {
+      const tk = await getValidTokenForAccount(norm, true);
+      if (norm && tk) tokenByEmail.set(norm, tk);
+      return tk;
+    } catch (err) {
+      if (tokenPool[0]?.token) return tokenPool[0].token;
+      throw err;
+    }
+  }
+
+  const localFileById = new Map();
+  for (const f of files || []) {
+    if (f && f.id) localFileById.set(f.id, f);
+  }
+
+  const ownedFilesSkippedMap = new Map();
+  const taskMap = new Map();
+  let stopped = false;
+
+  function registerFileCandidate(fileObj, fallbackAccEmail = '') {
+    if (!fileObj || !fileObj.id) return;
+    const accEmail = normalizeEntry(
+      fileObj.ownerAccount || fileObj.scannedByAccount || fallbackAccEmail || fileObj.owners?.[0]?.emailAddress || ''
+    );
+    const ownerEmailSet = new Set();
+    if (fileObj.ownerAccount) ownerEmailSet.add(normalizeEntry(fileObj.ownerAccount));
+    if (Array.isArray(fileObj.owners)) {
+      for (const o of fileObj.owners) {
+        const oem = normalizeEntry(o?.emailAddress || '');
+        if (oem) ownerEmailSet.add(oem);
+      }
+    }
+    const canonicalLink = formatDriveCanonicalLink(fileObj);
+
+    for (const ownerEm of ownerEmailSet) {
+      if (cleanEmailSet.has(ownerEm)) {
+        ownedFilesSkippedMap.set(`${fileObj.id}::${ownerEm}`, {
+          fileId: fileObj.id,
+          fileName: fileObj.name || '(无名称)',
+          mimeType: fileObj.mimeType || '',
+          webViewLink: canonicalLink,
+          accountEmail: accEmail,
+          targetEmail: ownerEm
+        });
+      }
+    }
+
+    for (const p of fileObj.permissions || []) {
+      if (!p) continue;
+      const pEmail = normalizeEntry(p.emailAddress || '');
+      if (!pEmail || !cleanEmailSet.has(pEmail)) continue;
+
+      if (p.role === 'owner' || ownerEmailSet.has(pEmail)) {
+        ownedFilesSkippedMap.set(`${fileObj.id}::${pEmail}`, {
+          fileId: fileObj.id,
+          fileName: fileObj.name || '(无名称)',
+          mimeType: fileObj.mimeType || '',
+          webViewLink: canonicalLink,
+          accountEmail: accEmail,
+          targetEmail: pEmail
+        });
+        continue;
+      }
+
+      if (!p.id) continue;
+      const key = `${fileObj.id}::${p.id}`;
+      if (!taskMap.has(key)) {
+        taskMap.set(key, {
+          fileId: fileObj.id,
+          fileName: fileObj.name || '(无名称)',
+          mimeType: fileObj.mimeType || '',
+          webViewLink: canonicalLink,
+          accountEmail: accEmail,
+          permissionId: p.id,
+          targetType: p.type || 'user',
+          targetEmail: pEmail,
+          previousRole: p.role || 'reader',
+          inheritedOnly: Boolean(permIsInherited(p) && !permHasDirectGrant(p)),
+          parents: Array.isArray(fileObj.parents) ? [...fileObj.parents] : []
+        });
+      }
+    }
+  }
+
+  if (isRetry) {
+    for (const item of retryQueue) {
+      if (!item || !item.fileId || !item.permissionId) continue;
+      const itemEmail = normalizeEntry(item.targetEmail || cleanEmails[0] || '');
+      if (!itemEmail) continue;
+      const key = `${item.fileId}::${item.permissionId}`;
+      taskMap.set(key, {
+        fileId: item.fileId,
+        fileName: item.fileName || '(无名称)',
+        mimeType: item.mimeType || '',
+        webViewLink: item.webViewLink || `https://drive.google.com/open?id=${item.fileId}`,
+        accountEmail: normalizeEntry(item.accountEmail || ''),
+        permissionId: item.permissionId,
+        targetType: item.targetType || 'user',
+        targetEmail: itemEmail,
+        previousRole: item.previousRole || 'reader',
+        inheritedOnly: Boolean(item.inheritedOnly),
+        parents: Array.isArray(item.parents) ? [...item.parents] : []
+      });
+    }
+  } else {
+    // 1. 先从本地已扫描文件快照一次遍历收集全部目标邮箱权限
+    for (const file of files || []) {
+      if (!file || !file.id) continue;
+      if (normalizedTargetAccount !== 'all') {
+        const fAcc = normalizeEntry(file.ownerAccount || file.scannedByAccount || '');
+        if (fAcc && fAcc !== normalizedTargetAccount) continue;
+      }
+      registerFileCandidate(file);
+    }
+
+    // 2. 实时调用 Drive API 搜索补漏未在当前快照中的文件（支持多邮箱合并查询）
+    if (liveSearch !== false && tokenPool.length > 0 && !shouldStop?.()) {
+      const LIVE_FIELDS =
+        'nextPageToken,files(id,name,mimeType,webViewLink,ownedByMe,owners(emailAddress,displayName),parents,permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(role,inherited,inheritedFrom,permissionType)))';
+
+      const emailChunks = [];
+      for (let i = 0; i < cleanEmails.length; i += 8) {
+        emailChunks.push(cleanEmails.slice(i, i + 8));
+      }
+
+      for (const accEntry of tokenPool) {
+        if (shouldStop?.()) {
+          stopped = true;
+          break;
+        }
+        if (normalizedTargetAccount !== 'all' && accEntry.email && accEntry.email !== normalizedTargetAccount) {
+          continue;
+        }
+
+        const fetchedPermFileIds = new Set();
+        for (const batchEmails of emailChunks) {
+          if (shouldStop?.()) {
+            stopped = true;
+            break;
+          }
+          const orClause = batchEmails
+            .map(em => {
+              const safeEmail = escapeDriveQueryLiteral(em);
+              return `'${safeEmail}' in writers or '${safeEmail}' in readers`;
+            })
+            .join(' or ');
+          const q = `(${orClause}) and trashed = false`;
+
+          try {
+            let pageToken = '';
+            do {
+              if (shouldStop?.()) {
+                stopped = true;
+                break;
+              }
+              const params = new URLSearchParams({
+                q,
+                pageSize: '200',
+                supportsAllDrives: 'true',
+                includeItemsFromAllDrives: 'true',
+                fields: LIVE_FIELDS
+              });
+              if (pageToken) params.set('pageToken', pageToken);
+              const data = await driveApi(accEntry.token, `/files?${params}`);
+              const foundFiles = Array.isArray(data?.files) ? data.files : [];
+
+              for (const item of foundFiles) {
+                if (!item || !item.id) continue;
+                // 若共享云端硬盘文件未内联返回 permissions，补充拉取一次权限列表
+                if (
+                  (!Array.isArray(item.permissions) || item.permissions.length === 0) &&
+                  !fetchedPermFileIds.has(item.id)
+                ) {
+                  fetchedPermFileIds.add(item.id);
+                  try {
+                    const pData = await driveApi(
+                      accEntry.token,
+                      `/files/${encodeURIComponent(item.id)}/permissions?supportsAllDrives=true&pageSize=100&fields=permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(role,inherited,inheritedFrom,permissionType))`
+                    );
+                    item.permissions = pData?.permissions || [];
+                  } catch (_pe) {
+                    item.permissions = [];
+                  }
+                }
+                registerFileCandidate(item, accEntry.email);
+              }
+
+              pageToken = data?.nextPageToken || '';
+              if (onProgress) {
+                onProgress({
+                  phase: 'search',
+                  done: 0,
+                  total: taskMap.size,
+                  message: `正在全盘检索 ${displayTargetSummary} 关联文件（已发现 ${taskMap.size} 项待撤权）…`
+                });
+              }
+            } while (pageToken);
+          } catch (_searchErr) {
+            // 单个账号实时搜索异常不阻断本地已收集项的清退
+          }
+        }
+      }
+    }
+  }
+
+  // 文件夹优先于普通文件执行撤权，便于父目录撤权自动级联覆盖子文件继承权限
+  const tasks = [...taskMap.values()].sort((a, b) => {
+    const aFolder = a.mimeType === 'application/vnd.google-apps.folder' ? 1 : 0;
+    const bFolder = b.mimeType === 'application/vnd.google-apps.folder' ? 1 : 0;
+    if (bFolder !== aFolder) return bFolder - aFolder;
+    return (a.fileName || '').localeCompare(b.fileName || '');
+  });
+
+  const ownedFilesSkipped = [...ownedFilesSkippedMap.values()];
+  const successfullyRevokedFolderEmailKeys = new Set();
+  const receiptRows = [];
+  const failedItems = [];
+  const logs = [];
+  let revokedCount = 0;
+  let failedCount = 0;
+  let cursor = 0;
+
+  function cleanLocalMemoryPermission(fileId, permissionId, taskEmail) {
+    const lf = localFileById.get(fileId);
+    if (lf && Array.isArray(lf.permissions)) {
+      lf.permissions = lf.permissions.filter(
+        p => p.id !== permissionId && normalizeEntry(p.emailAddress || '') !== taskEmail
+      );
+    }
+  }
+
+  // 先执行顶层文件夹撤权，随后并发撤除其余文件，使父子级联判断确定可靠
+  async function processSingleTask(task) {
+    const nowIso = new Date().toISOString();
+    const itemEmail = task.targetEmail;
+    const isCascadedFromParent =
+      task.inheritedOnly &&
+      Array.isArray(task.parents) &&
+      task.parents.some(pid => successfullyRevokedFolderEmailKeys.has(`${pid}::${itemEmail}`));
+
+    if (isCascadedFromParent) {
+      cleanLocalMemoryPermission(task.fileId, task.permissionId, itemEmail);
+      revokedCount++;
+      receiptRows.push({
+        timestamp: nowIso,
+        accountEmail: task.accountEmail,
+        targetEmail: itemEmail,
+        fileName: task.fileName,
+        fileId: task.fileId,
+        webViewLink: task.webViewLink,
+        previousRole: task.previousRole,
+        previousRoleLabel: roleLabel(task.previousRole),
+        status: 'revoked_cascade',
+        resultText: '已随上级文件夹撤权自动解除继承'
+      });
+      return;
+    }
+
+    try {
+      const token = await resolveTokenForAccount(task.accountEmail);
+      await deletePermission(token, task.fileId, task.permissionId);
+      cleanLocalMemoryPermission(task.fileId, task.permissionId, itemEmail);
+      if (task.mimeType === 'application/vnd.google-apps.folder') {
+        successfullyRevokedFolderEmailKeys.add(`${task.fileId}::${itemEmail}`);
+      }
+      revokedCount++;
+      logs.push({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        timestamp: nowIso,
+        source: 'manual',
+        actionType: 'revoke',
+        accountEmail: task.accountEmail,
+        fileId: task.fileId,
+        fileName: task.fileName,
+        webViewLink: task.webViewLink,
+        permissionId: task.permissionId,
+        targetType: task.targetType,
+        targetEmail: itemEmail,
+        targetLabel: itemEmail,
+        previousRole: task.previousRole,
+        newRole: '',
+        restored: false,
+        message: `离职清退：已撤除 ${itemEmail} 的${roleLabel(task.previousRole)}权限`
+      });
+      receiptRows.push({
+        timestamp: nowIso,
+        accountEmail: task.accountEmail,
+        targetEmail: itemEmail,
+        fileName: task.fileName,
+        fileId: task.fileId,
+        webViewLink: task.webViewLink,
+        previousRole: task.previousRole,
+        previousRoleLabel: roleLabel(task.previousRole),
+        status: 'revoked',
+        resultText: '已撤除权限'
+      });
+    } catch (error) {
+      const errMsg = error?.message || String(error);
+      // 若权限已因父级文件夹撤权级联消失 (404 / Permission not found)，视为已完成撤除
+      if (/not found|404/i.test(errMsg)) {
+        cleanLocalMemoryPermission(task.fileId, task.permissionId, itemEmail);
+        revokedCount++;
+        receiptRows.push({
+          timestamp: nowIso,
+          accountEmail: task.accountEmail,
+          targetEmail: itemEmail,
+          fileName: task.fileName,
+          fileId: task.fileId,
+          webViewLink: task.webViewLink,
+          previousRole: task.previousRole,
+          previousRoleLabel: roleLabel(task.previousRole),
+          status: 'revoked_cascade',
+          resultText: '权限已不存在或随上级目录一并解除'
+        });
+        return;
+      }
+
+      failedCount++;
+      failedItems.push({
+        ...task,
+        errorMessage: errMsg
+      });
+      logs.push({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        timestamp: nowIso,
+        source: 'manual',
+        actionType: 'error',
+        accountEmail: task.accountEmail,
+        fileId: task.fileId,
+        fileName: task.fileName,
+        webViewLink: task.webViewLink,
+        permissionId: task.permissionId,
+        targetType: task.targetType,
+        targetEmail: itemEmail,
+        targetLabel: itemEmail,
+        previousRole: task.previousRole,
+        newRole: '',
+        restored: false,
+        message: `离职清退失败 (${itemEmail})：${errMsg}`
+      });
+      receiptRows.push({
+        timestamp: nowIso,
+        accountEmail: task.accountEmail,
+        targetEmail: itemEmail,
+        fileName: task.fileName,
+        fileId: task.fileId,
+        webViewLink: task.webViewLink,
+        previousRole: task.previousRole,
+        previousRoleLabel: roleLabel(task.previousRole),
+        status: 'failed',
+        resultText: `撤除失败：${errMsg}`
+      });
+    }
+  }
+
+  const folderTasks = tasks.filter(t => t.mimeType === 'application/vnd.google-apps.folder');
+  const nonFolderTasks = tasks.filter(t => t.mimeType !== 'application/vnd.google-apps.folder');
+
+  async function runTaskSlice(slice) {
+    let sliceCursor = 0;
+    const workerNum = Math.min(4, Math.max(1, slice.length));
+    const workers = Array.from({ length: slice.length ? workerNum : 0 }, async () => {
+      while (sliceCursor < slice.length) {
+        if (shouldStop?.()) {
+          stopped = true;
+          break;
+        }
+        const task = slice[sliceCursor++];
+        cursor++;
+        await processSingleTask(task);
+        if (onProgress) {
+          onProgress({
+            phase: 'revoke',
+            done: revokedCount + failedCount,
+            total: tasks.length,
+            revokedCount,
+            failedCount,
+            stopped,
+            message: `正在清退 ${displayTargetSummary} (${revokedCount + failedCount}/${tasks.length})：成功 ${revokedCount}，失败 ${failedCount}…`
+          });
+        }
+      }
+    });
+    await Promise.all(workers);
+  }
+
+  if (!stopped && folderTasks.length > 0) {
+    await runTaskSlice(folderTasks);
+  }
+  if (!stopped && nonFolderTasks.length > 0) {
+    await runTaskSlice(nonFolderTasks);
+  }
+
+  for (const owned of ownedFilesSkipped) {
+    receiptRows.push({
+      timestamp: new Date().toISOString(),
+      accountEmail: owned.accountEmail || '',
+      targetEmail: owned.targetEmail || summaryTargetEmail,
+      fileName: owned.fileName,
+      fileId: owned.fileId,
+      webViewLink: owned.webViewLink,
+      previousRole: 'owner',
+      previousRoleLabel: roleLabel('owner'),
+      status: 'skipped_owner',
+      resultText: '跳过：该人员为文件所有者，请使用所有权转移功能交接'
+    });
+  }
+
+  if (logs.length) {
+    await appendAuditLogs(logs);
+  }
+
+  return {
+    targetEmail: summaryTargetEmail,
+    targetEmails: cleanEmails,
+    revokedCount,
+    failedCount,
+    ownedSkippedCount: ownedFilesSkipped.length,
+    ownedFilesSkipped,
+    stopped,
+    total: tasks.length,
+    failedItems,
+    receiptRows
+  };
+}
+
+async function offboardEmailsAcrossDrive(options = {}) {
+  return offboardPersonAcrossDrive(options);
+}
+
+// ============================================================================
+// 阶段三：限时授权自动回收 (TTL)、扫描权限变更 Diff 与伴随侧边栏支撑引擎
+// ============================================================================
+
+const SCAN_LOCK_STALE_MS = 120 * 1000;
+let _memoryScanRuntimeLock = null;
+
+async function notifyRuntimeSafe(payload) {
+  try {
+    if (typeof chrome !== 'undefined' && chrome.runtime?.sendMessage) {
+      await chrome.runtime.sendMessage(payload);
+    }
+  } catch (_e) {
+    // 忽略无接收端异常
+  }
+}
+
+async function readScanRuntimeLock() {
+  try {
+    if (typeof chrome !== 'undefined' && chrome.storage?.session?.get) {
+      const data = await chrome.storage.session.get('scanRuntimeLock');
+      return data?.scanRuntimeLock || null;
+    }
+  } catch (_e) {
+    // 回退内存锁
+  }
+  return _memoryScanRuntimeLock;
+}
+
+async function writeScanRuntimeLock(lockObj) {
+  _memoryScanRuntimeLock = lockObj || null;
+  try {
+    if (typeof chrome !== 'undefined' && chrome.storage?.session?.set) {
+      if (lockObj) {
+        await chrome.storage.session.set({ scanRuntimeLock: lockObj });
+      } else if (chrome.storage.session.remove) {
+        await chrome.storage.session.remove('scanRuntimeLock');
+      } else {
+        await chrome.storage.session.set({ scanRuntimeLock: null });
+      }
+    }
+  } catch (_e) {
+    // 忽略 session 存储异常
+  }
+}
+
+async function acquireScanRuntimeLock(source = 'manual') {
+  const now = Date.now();
+  const existing = await readScanRuntimeLock();
+  const isAlive = existing && Number.isFinite(existing.heartbeatAt) && now - existing.heartbeatAt < SCAN_LOCK_STALE_MS;
+
+  if (isAlive && (source === 'schedule' || source === 'startup')) {
+    return { acquired: false, holder: existing };
+  }
+
+  const lockId = `scan-${now}-${Math.random().toString(36).slice(2, 8)}`;
+  const nextLock = {
+    lockId,
+    source,
+    startedAt: now,
+    heartbeatAt: now
+  };
+  await writeScanRuntimeLock(nextLock);
+  return { acquired: true, lockId };
+}
+
+function touchScanRuntimeLock(lockId) {
+  if (!lockId) return;
+  const now = Date.now();
+  if (_memoryScanRuntimeLock && _memoryScanRuntimeLock.lockId === lockId) {
+    _memoryScanRuntimeLock.heartbeatAt = now;
+  }
+  (async () => {
+    try {
+      if (typeof chrome !== 'undefined' && chrome.storage?.session?.get && chrome.storage?.session?.set) {
+        const cur = await chrome.storage.session.get('scanRuntimeLock');
+        if (cur?.scanRuntimeLock?.lockId === lockId) {
+          await chrome.storage.session.set({
+            scanRuntimeLock: { ...cur.scanRuntimeLock, heartbeatAt: now }
+          });
+        }
+      }
+    } catch (_e) {}
+  })();
+}
+
+async function releaseScanRuntimeLock(lockId) {
+  if (!lockId) return;
+  const cur = await readScanRuntimeLock();
+  if (!cur || cur.lockId === lockId) {
+    await writeScanRuntimeLock(null);
+  }
+}
+
+/* ==================== A. 临时限时授权 (TTL) 与到期自动回收引擎 ==================== */
+
+/**
+ * 解析限时预设或自定义时间为标准 ISO 到期时间字符串
+ */
+function resolveTtlExpiresAt(ttlPreset = 'none', customDateTime = '') {
+  const preset = String(ttlPreset || 'none').trim().toLowerCase();
+  if (!preset || preset === 'none' || preset === 'permanent') {
+    return null;
+  }
+
+  const now = Date.now();
+  const durationMap = {
+    '1h': 60 * 60 * 1000,
+    '24h': 24 * 60 * 60 * 1000,
+    '7d': 7 * 24 * 60 * 60 * 1000,
+    '30d': 30 * 24 * 60 * 60 * 1000
+  };
+
+  if (durationMap[preset]) {
+    return new Date(now + durationMap[preset]).toISOString();
+  }
+
+  if (preset === 'custom') {
+    const rawCustom = String(customDateTime || '').trim();
+    if (!rawCustom) {
+      throw new Error('请选择有效的自定义权限到期时间');
+    }
+    const parsedMs = Date.parse(rawCustom);
+    if (!Number.isFinite(parsedMs)) {
+      throw new Error('自定义权限到期时间格式无效，请重新选择');
+    }
+    if (parsedMs <= now + 30 * 1000) {
+      throw new Error('自定义权限到期时间必须晚于当前时间至少 30 秒');
+    }
+    return new Date(parsedMs).toISOString();
+  }
+
+  const fallbackMs = Date.parse(ttlPreset);
+  if (Number.isFinite(fallbackMs) && fallbackMs > now + 30 * 1000) {
+    return new Date(fallbackMs).toISOString();
+  }
+
+  throw new Error(`不支持的权限有效期选项：${ttlPreset}`);
+}
+
+/**
+ * 格式化剩余时间文案（零破折号，清晰易读）
+ */
+function formatTtlRemaining(expiresAt, nowMs = Date.now()) {
+  const expMs = typeof expiresAt === 'number' ? expiresAt : Date.parse(String(expiresAt || ''));
+  if (!Number.isFinite(expMs)) return '';
+  const diffMs = expMs - nowMs;
+  if (diffMs <= 0) {
+    return '已到期（待回收）';
+  }
+
+  const totalMinutes = Math.max(1, Math.ceil(diffMs / 60000));
+  if (totalMinutes < 60) {
+    return `剩余 ${totalMinutes} 分钟`;
+  }
+
+  const totalHours = Math.floor(diffMs / 3600000);
+  if (totalHours < 24) {
+    const roundedHours = Math.max(1, Math.round(diffMs / 3600000));
+    return `剩余 ${roundedHours} 小时`;
+  }
+
+  const days = Math.floor(totalHours / 24);
+  const remHours = totalHours % 24;
+  return remHours > 0 ? `剩余 ${days} 天 ${remHours} 小时` : `剩余 ${days} 天`;
+}
+
+/**
+ * 读取待回收限时权限队列（按到期时间升序排列）
+ */
+async function getTtlQueue() {
+  const data = await chrome.storage.local.get('ttlPermissionsQueue');
+  const list = Array.isArray(data.ttlPermissionsQueue) ? data.ttlPermissionsQueue : [];
+  return [...list].sort((a, b) => (Date.parse(a?.expiresAt || '') || 0) - (Date.parse(b?.expiresAt || '') || 0));
+}
+
+function isSameTtlTarget(existingItem, incomingItem) {
+  if (!existingItem || !incomingItem) return false;
+  if (existingItem.fileId !== incomingItem.fileId) return false;
+
+  const existEmail = normalizeEntry(existingItem.targetEmail || '');
+  const nextEmail = normalizeEntry(incomingItem.targetEmail || '');
+  if (existEmail && nextEmail) {
+    return existEmail === nextEmail;
+  }
+
+  if (existingItem.permissionId && incomingItem.permissionId) {
+    return existingItem.permissionId === incomingItem.permissionId;
+  }
+
+  const existKey = `${existingItem.targetType || 'user'}:${String(existingItem.domain || '').toLowerCase()}`;
+  const nextKey = `${incomingItem.targetType || 'user'}:${String(incomingItem.domain || '').toLowerCase()}`;
+  return !existEmail && !nextEmail && existKey === nextKey;
+}
+
+/**
+ * 将单条或多条限时授权写入持久化队列（同文件同目标幂等覆盖）并唤醒后台定时器同步
+ */
+async function enqueueTtlPermissions(entries) {
+  const rawList = Array.isArray(entries) ? entries : entries ? [entries] : [];
+  const normalizedIncoming = [];
+
+  for (const raw of rawList) {
+    if (!raw || !raw.fileId || !raw.expiresAt) continue;
+    const expMs = Date.parse(String(raw.expiresAt));
+    if (!Number.isFinite(expMs)) continue;
+
+    const cleanEmail = normalizeEntry(raw.targetEmail || raw.emailAddress || '');
+    const targetType = raw.targetType || raw.type || (cleanEmail ? 'user' : 'anyone');
+    const cleanDomain = String(raw.domain || '').trim().toLowerCase();
+    const fallbackLabel =
+      cleanEmail ||
+      (targetType === 'anyone'
+        ? '公开链接 (任何人)'
+        : targetType === 'domain'
+          ? `域内共享 (${cleanDomain || '未知域'})`
+          : '协作者');
+
+    normalizedIncoming.push({
+      id: raw.id || `ttl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      fileId: String(raw.fileId),
+      fileName: raw.fileName || '(无名称)',
+      mimeType: raw.mimeType || '',
+      webViewLink: raw.webViewLink || `https://drive.google.com/open?id=${raw.fileId}`,
+      accountEmail: normalizeEntry(raw.accountEmail || ''),
+      permissionId: raw.permissionId || '',
+      targetType,
+      targetEmail: cleanEmail,
+      domain: cleanDomain,
+      targetLabel: raw.targetLabel || fallbackLabel,
+      grantedRole: raw.grantedRole || raw.role || 'reader',
+      expireAction: raw.expireAction === 'downgrade_reader' ? 'downgrade_reader' : 'revoke',
+      expiresAt: new Date(expMs).toISOString(),
+      createdAt: raw.createdAt || new Date().toISOString(),
+      nativeExpirationApplied: Boolean(raw.nativeExpirationApplied),
+      status: 'pending',
+      retryCount: 0,
+      lastError: ''
+    });
+  }
+
+  if (!normalizedIncoming.length) return [];
+
+  const currentQueue = await getTtlQueue();
+  const kept = currentQueue.filter(oldItem => !normalizedIncoming.some(inc => isSameTtlTarget(oldItem, inc)));
+  const merged = [...kept, ...normalizedIncoming].sort(
+    (a, b) => (Date.parse(a.expiresAt) || 0) - (Date.parse(b.expiresAt) || 0)
+  );
+
+  await safeStorageSet({ ttlPermissionsQueue: merged });
+  await notifyRuntimeSafe({ type: 'SYNC_TTL_ALARM' });
+  await notifyRuntimeSafe({ type: 'TTL_UPDATED' });
+  return normalizedIncoming;
+}
+
+/**
+ * 取消限时回收（将权限转为长期有效，不删除云端权限）
+ */
+async function cancelTtlEntry(ttlId) {
+  if (!ttlId) return { removed: false, entry: null };
+  const currentQueue = await getTtlQueue();
+  const target = currentQueue.find(item => item.id === ttlId) || null;
+  if (!target) {
+    return { removed: false, entry: null };
+  }
+
+  const nextQueue = currentQueue.filter(item => item.id !== ttlId);
+  await safeStorageSet({ ttlPermissionsQueue: nextQueue });
+
+  await appendAuditLogs({
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: new Date().toISOString(),
+    source: 'manual',
+    actionType: 'ttl_cancel',
+    isTtl: true,
+    accountEmail: target.accountEmail || '',
+    fileId: target.fileId,
+    fileName: target.fileName || '(无名称)',
+    webViewLink: target.webViewLink || '',
+    permissionId: target.permissionId || '',
+    targetType: target.targetType || 'user',
+    targetEmail: target.targetEmail || '',
+    domain: target.domain || '',
+    targetLabel: target.targetLabel || target.targetEmail || '',
+    previousRole: target.grantedRole || 'reader',
+    newRole: target.grantedRole || 'reader',
+    restored: true,
+    message: `限时授权已转为长期有效：保留 ${target.targetLabel || target.targetEmail} 的「${roleLabel(target.grantedRole)}」权限`
+  });
+
+  await notifyRuntimeSafe({ type: 'SYNC_TTL_ALARM' });
+  await notifyRuntimeSafe({ type: 'TTL_UPDATED' });
+  return { removed: true, entry: target };
+}
+
+async function resolveTtlOperationToken(accountEmail = '', interactive = false) {
+  const norm = normalizeEntry(accountEmail);
+  try {
+    return await getValidTokenForAccount(norm, interactive);
+  } catch (primaryErr) {
+    const accounts = await getAuthorizedAccounts();
+    for (const acc of accounts) {
+      if (norm && normalizeEntry(acc.email) === norm) continue;
+      try {
+        const tk = await getValidTokenForAccount(acc.email, false);
+        if (tk) return tk;
+      } catch (_e) {}
+    }
+    throw primaryErr;
+  }
+}
+
+async function syncSnapshotAfterTtlMutations(mutations = []) {
+  if (!Array.isArray(mutations) || !mutations.length) return;
+  try {
+    const data = await chrome.storage.local.get('scanSnapshot');
+    const snap = data.scanSnapshot;
+    if (!snap || !Array.isArray(snap.files) || !snap.files.length) return;
+
+    const byFileId = new Map();
+    for (const m of mutations) {
+      if (!m?.fileId) continue;
+      if (!byFileId.has(m.fileId)) byFileId.set(m.fileId, []);
+      byFileId.get(m.fileId).push(m);
+    }
+
+    let touched = false;
+    for (const file of snap.files) {
+      const fileMuts = byFileId.get(file.id);
+      if (!fileMuts || !Array.isArray(file.permissions)) continue;
+      for (const m of fileMuts) {
+        const normTargetEmail = normalizeEntry(m.targetEmail || '');
+        if (m.actionDone === 'downgraded') {
+          for (const p of file.permissions) {
+            if (
+              (m.permissionId && p.id === m.permissionId) ||
+              (normTargetEmail && normalizeEntry(p.emailAddress || '') === normTargetEmail)
+            ) {
+              p.role = 'reader';
+              touched = true;
+            }
+          }
+        } else {
+          const beforeLen = file.permissions.length;
+          file.permissions = file.permissions.filter(p => {
+            if (p.role === 'owner') return true;
+            if (m.permissionId && p.id === m.permissionId) return false;
+            if (normTargetEmail && normalizeEntry(p.emailAddress || '') === normTargetEmail) return false;
+            if (!normTargetEmail && !m.permissionId && p.type === m.targetType) return false;
+            return true;
+          });
+          if (file.permissions.length !== beforeLen) touched = true;
+        }
+      }
+      if (snap.permFingerprints && typeof snap.permFingerprints === 'object') {
+        const fp = buildFilePermissionFingerprint(file);
+        if (fp) snap.permFingerprints[file.id] = fp;
+      }
+    }
+
+    if (touched) {
+      await saveSnapshot(snap);
+    }
+  } catch (_e) {
+    // 快照同步异常不影响主回收流程
+  }
+}
+
+async function executeSingleTtlReapItem(entry, { interactive = false } = {}) {
+  const token = await resolveTtlOperationToken(entry.accountEmail || '', interactive);
+  let permId = entry.permissionId || '';
+
+  if (!permId) {
+    const permData = await driveApi(
+      token,
+      `/files/${encodeURIComponent(entry.fileId)}/permissions?supportsAllDrives=true&pageSize=100&fields=permissions(id,type,role,emailAddress,domain)`
+    );
+    const perms = Array.isArray(permData?.permissions) ? permData.permissions : [];
+    const normEmail = normalizeEntry(entry.targetEmail || '');
+    const matched = perms.find(p => {
+      if (!p || p.role === 'owner') return false;
+      if (normEmail) return normalizeEntry(p.emailAddress || '') === normEmail;
+      if (entry.targetType === 'domain') {
+        return p.type === 'domain' && String(p.domain || '').toLowerCase() === String(entry.domain || '').toLowerCase();
+      }
+      return p.type === entry.targetType;
+    });
+    permId = matched?.id || '';
+  }
+
+  if (!permId) {
+    return { actionDone: 'revoked', permissionId: '', alreadyGone: true };
+  }
+
+  if (entry.expireAction === 'downgrade_reader') {
+    try {
+      await updatePermissionRole(token, entry.fileId, permId, 'reader');
+      return { actionDone: 'downgraded', permissionId: permId, alreadyGone: false };
+    } catch (err) {
+      if (/not found|404/i.test(String(err?.message || err))) {
+        return { actionDone: 'revoked', permissionId: permId, alreadyGone: true };
+      }
+      throw err;
+    }
+  }
+
+  try {
+    await deletePermission(token, entry.fileId, permId);
+    return { actionDone: 'revoked', permissionId: permId, alreadyGone: false };
+  } catch (err) {
+    if (/not found|404/i.test(String(err?.message || err))) {
+      return { actionDone: 'revoked', permissionId: permId, alreadyGone: true };
+    }
+    throw err;
+  }
+}
+
+/**
+ * 立即提前收回单条限时授权
+ */
+async function revokeTtlEntryNow(ttlId, { interactive = true } = {}) {
+  const currentQueue = await getTtlQueue();
+  const target = currentQueue.find(item => item.id === ttlId);
+  if (!target) {
+    throw new Error('未找到对应的限时授权记录，可能已被回收');
+  }
+
+  const reapRes = await executeSingleTtlReapItem(target, { interactive });
+  const nextQueue = currentQueue.filter(item => item.id !== ttlId);
+  await safeStorageSet({ ttlPermissionsQueue: nextQueue });
+
+  await syncSnapshotAfterTtlMutations([
+    {
+      fileId: target.fileId,
+      permissionId: reapRes.permissionId || target.permissionId,
+      targetEmail: target.targetEmail,
+      targetType: target.targetType,
+      actionDone: reapRes.actionDone
+    }
+  ]);
+
+  const isDowngrade = reapRes.actionDone === 'downgraded';
+  await appendAuditLogs({
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: new Date().toISOString(),
+    source: 'manual',
+    actionType: isDowngrade ? 'downgrade' : 'revoke',
+    isTtl: true,
+    accountEmail: target.accountEmail || '',
+    fileId: target.fileId,
+    fileName: target.fileName || '(无名称)',
+    webViewLink: target.webViewLink || '',
+    permissionId: reapRes.permissionId || target.permissionId || '',
+    targetType: target.targetType || 'user',
+    targetEmail: target.targetEmail || '',
+    domain: target.domain || '',
+    targetLabel: target.targetLabel || target.targetEmail || '',
+    previousRole: target.grantedRole || 'reader',
+    newRole: isDowngrade ? 'reader' : '',
+    restored: false,
+    message: isDowngrade
+      ? `限时授权提前降级：已将 ${target.targetLabel || target.targetEmail} 降为仅查看`
+      : `限时授权提前收回：已移除 ${target.targetLabel || target.targetEmail} 的「${roleLabel(target.grantedRole)}」权限`
+  });
+
+  await notifyRuntimeSafe({ type: 'SYNC_TTL_ALARM' });
+  await notifyRuntimeSafe({ type: 'TTL_UPDATED' });
+  return {
+    revoked: reapRes.actionDone === 'revoked',
+    downgraded: isDowngrade,
+    entry: target
+  };
+}
+
+/**
+ * 批量巡检并自动回收所有已到期的限时授权（4 线程并发）
+ */
+async function processExpiredTtlPermissions({ now = Date.now() } = {}) {
+  const currentQueue = await getTtlQueue();
+  const dueItems = [];
+  const untouchedItems = [];
+
+  for (const item of currentQueue) {
+    const expMs = Date.parse(item?.expiresAt || '');
+    if (item?.status === 'pending' && Number.isFinite(expMs) && expMs <= now) {
+      dueItems.push(item);
+    } else {
+      untouchedItems.push(item);
+    }
+  }
+
+  if (!dueItems.length) {
+    const remainingPendingCount = untouchedItems.filter(x => x?.status === 'pending').length;
+    return {
+      processedCount: 0,
+      revokedCount: 0,
+      downgradedCount: 0,
+      failedCount: 0,
+      remainingPendingCount,
+      reapedItems: []
+    };
+  }
+
+  let revokedCount = 0;
+  let downgradedCount = 0;
+  let failedCount = 0;
+  const reapedItems = [];
+  const retryOrFailedItems = [];
+  const snapshotMutations = [];
+  const logs = [];
+  let cursor = 0;
+
+  const workerCount = Math.min(4, dueItems.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (cursor < dueItems.length) {
+      const entry = dueItems[cursor++];
+      try {
+        const reapRes = await executeSingleTtlReapItem(entry, { interactive: false });
+        const isDowngrade = reapRes.actionDone === 'downgraded';
+        if (isDowngrade) {
+          downgradedCount++;
+        } else {
+          revokedCount++;
+        }
+        reapedItems.push({ ...entry, actionDone: reapRes.actionDone });
+        snapshotMutations.push({
+          fileId: entry.fileId,
+          permissionId: reapRes.permissionId || entry.permissionId,
+          targetEmail: entry.targetEmail,
+          targetType: entry.targetType,
+          actionDone: reapRes.actionDone
+        });
+        logs.push({
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: new Date().toISOString(),
+          source: 'auto',
+          actionType: isDowngrade ? 'downgrade' : 'revoke',
+          isTtl: true,
+          accountEmail: entry.accountEmail || '',
+          fileId: entry.fileId,
+          fileName: entry.fileName || '(无名称)',
+          webViewLink: entry.webViewLink || '',
+          permissionId: reapRes.permissionId || entry.permissionId || '',
+          targetType: entry.targetType || 'user',
+          targetEmail: entry.targetEmail || '',
+          domain: entry.domain || '',
+          targetLabel: entry.targetLabel || entry.targetEmail || '',
+          previousRole: entry.grantedRole || 'reader',
+          newRole: isDowngrade ? 'reader' : '',
+          restored: false,
+          message: isDowngrade
+            ? `限时授权到期自动收回：已将 ${entry.targetLabel || entry.targetEmail} 从${roleLabel(entry.grantedRole)}降为仅查看`
+            : `限时授权到期自动收回：已移除 ${entry.targetLabel || entry.targetEmail} 的「${roleLabel(entry.grantedRole)}」权限`
+        });
+      } catch (error) {
+        failedCount++;
+        const errMsg = error?.message || String(error);
+        const nextRetry = (Number(entry.retryCount) || 0) + 1;
+        const nextStatus = nextRetry >= 5 ? 'failed' : 'pending';
+        retryOrFailedItems.push({
+          ...entry,
+          retryCount: nextRetry,
+          status: nextStatus,
+          lastError: errMsg
+        });
+        if (nextStatus === 'failed') {
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'auto',
+            actionType: 'error',
+            isTtl: true,
+            accountEmail: entry.accountEmail || '',
+            fileId: entry.fileId,
+            fileName: entry.fileName || '(无名称)',
+            webViewLink: entry.webViewLink || '',
+            permissionId: entry.permissionId || '',
+            targetType: entry.targetType || 'user',
+            targetEmail: entry.targetEmail || '',
+            targetLabel: entry.targetLabel || entry.targetEmail || '',
+            previousRole: entry.grantedRole || 'reader',
+            newRole: '',
+            restored: false,
+            message: `限时授权到期回收连续失败 (${entry.targetLabel || entry.targetEmail})：${errMsg}`
+          });
+        }
+      }
+    }
+  });
+
+  await Promise.all(workers);
+
+  const updatedQueue = [...untouchedItems, ...retryOrFailedItems].sort(
+    (a, b) => (Date.parse(a?.expiresAt || '') || 0) - (Date.parse(b?.expiresAt || '') || 0)
+  );
+  await safeStorageSet({ ttlPermissionsQueue: updatedQueue });
+
+  if (snapshotMutations.length) {
+    await syncSnapshotAfterTtlMutations(snapshotMutations);
+  }
+  if (logs.length) {
+    await appendAuditLogs(logs);
+  }
+
+  const remainingPendingCount = updatedQueue.filter(x => x?.status === 'pending').length;
+  return {
+    processedCount: dueItems.length,
+    revokedCount,
+    downgradedCount,
+    failedCount,
+    remainingPendingCount,
+    reapedItems
+  };
+}
+
+/**
+ * 底层限时权限创建辅助（优先尝试 Drive API 原生 expirationTime，400/403 不支持时无感回退）
+ */
+async function grantPermissionCoreApi(
+  token,
+  file,
+  fileId,
+  { type = 'user', role = 'reader', emailAddress = '', domain = '', expiresAt = '' } = {}
+) {
+  const targetFileId = fileId || file?.id || '';
+  if (!targetFileId) {
+    throw new Error('缺少目标文件 ID');
+  }
+
+  const expMs = expiresAt ? Date.parse(String(expiresAt)) : NaN;
+  const now = Date.now();
+  const maxNativeSpanMs = 364 * 24 * 60 * 60 * 1000;
+  const isFolder = file?.mimeType === 'application/vnd.google-apps.folder';
+  const canTryNative =
+    Number.isFinite(expMs) &&
+    expMs > now &&
+    expMs - now <= maxNativeSpanMs &&
+    (type === 'user' || type === 'group') &&
+    !isFolder;
+
+  if (canTryNative) {
+    const params = new URLSearchParams({
+      supportsAllDrives: 'true',
+      sendNotificationEmail: 'false'
+    });
+    const body = {
+      type,
+      role,
+      expirationTime: new Date(expMs).toISOString()
+    };
+    if (emailAddress) body.emailAddress = emailAddress;
+    if (domain) body.domain = domain;
+
+    try {
+      const createdPermission = await driveApi(
+        token,
+        `/files/${encodeURIComponent(targetFileId)}/permissions?${params}`,
+        {
+          method: 'POST',
+          body: JSON.stringify(body)
+        }
+      );
+      return { createdPermission, nativeExpirationApplied: true };
+    } catch (err) {
+      const msg = String(err?.message || err || '');
+      // Drive API 对个人版账号、文件夹或特定共享云端硬盘不支持 expirationTime 时返回 400/403，自动回退普通创建
+      if (!/400|403|expiration|cannotSetExpiration|not supported|invalid/i.test(msg)) {
+        throw err;
+      }
+    }
+  }
+
+  const createdPermission = await createPermission(token, targetFileId, {
+    type,
+    role,
+    emailAddress: emailAddress || undefined,
+    domain: domain || undefined
+  });
+  return { createdPermission, nativeExpirationApplied: false };
+}
+
+/**
+ * 授予单条权限并按需绑定 TTL 到期自动回收队列
+ */
+async function grantPermissionWithTtl({
+  token = '',
+  accountEmail = '',
+  file = null,
+  fileId = '',
+  type = 'user',
+  role = 'reader',
+  emailAddress = '',
+  domain = '',
+  expiresAt = '',
+  expireAction = 'revoke'
+} = {}) {
+  const resolvedFileId = fileId || file?.id || '';
+  if (!resolvedFileId) {
+    throw new Error('缺少目标文件 ID');
+  }
+
+  const resolvedAccount = normalizeEntry(
+    accountEmail || file?.ownerAccount || file?.owners?.[0]?.emailAddress || ''
+  );
+  const activeToken = token || (await getValidTokenForAccount(resolvedAccount, true));
+
+  const validExpiresAt =
+    expiresAt && Number.isFinite(Date.parse(String(expiresAt)))
+      ? new Date(Date.parse(String(expiresAt))).toISOString()
+      : '';
+
+  const { createdPermission, nativeExpirationApplied } = await grantPermissionCoreApi(
+    activeToken,
+    file,
+    resolvedFileId,
+    {
+      type,
+      role,
+      emailAddress: normalizeEntry(emailAddress),
+      domain,
+      expiresAt: validExpiresAt
+    }
+  );
+
+  let ttlEntry = null;
+  if (validExpiresAt) {
+    const enqueued = await enqueueTtlPermissions({
+      fileId: resolvedFileId,
+      fileName: file?.name || '(无名称)',
+      mimeType: file?.mimeType || '',
+      webViewLink: file ? formatDriveCanonicalLink(file) : `https://drive.google.com/open?id=${resolvedFileId}`,
+      accountEmail: resolvedAccount,
+      permissionId: createdPermission?.id || '',
+      targetType: type,
+      targetEmail: normalizeEntry(emailAddress),
+      domain,
+      targetLabel:
+        normalizeEntry(emailAddress) ||
+        (type === 'anyone' ? '公开链接 (任何人)' : domain ? `域内共享 (${domain})` : '协作者'),
+      grantedRole: role,
+      expireAction,
+      expiresAt: validExpiresAt,
+      nativeExpirationApplied
+    });
+    ttlEntry = enqueued[0] || null;
+  }
+
+  return {
+    createdPermission,
+    nativeExpirationApplied,
+    ttlEntry
+  };
+}
+
+/* ==================== B. 两次扫描「权限变更 Diff」引擎 ==================== */
+
+/**
+ * 生成单文件共享权限的确定性指纹（排除所有者，用于跨扫描对比）
+ */
+function buildFilePermissionFingerprint(file) {
+  if (!file || file.permissionsLoading || file.permissionError) return null;
+  if (!Array.isArray(file.permissions)) return null;
+
+  const fileOwner = normalizeEntry(file.ownerAccount || file.owners?.[0]?.emailAddress || '');
+  let anyoneRole = '';
+  const domainMap = new Map();
+  const userMap = new Map();
+
+  for (const p of file.permissions) {
+    if (!p) continue;
+    if (p.type === 'anyone') {
+      if (!anyoneRole || permissionRoleRank(p.role) > permissionRoleRank(anyoneRole)) {
+        anyoneRole = p.role || 'reader';
+      }
+    } else if (p.type === 'domain') {
+      const d = String(p.domain || '').trim().toLowerCase();
+      if (!d) continue;
+      const prev = domainMap.get(d);
+      if (!prev || permissionRoleRank(p.role) > permissionRoleRank(prev)) {
+        domainMap.set(d, p.role || 'reader');
+      }
+    } else if (p.type === 'user' || p.type === 'group') {
+      if (p.role === 'owner') continue;
+      const em = normalizeEntry(p.emailAddress || '');
+      if (!em || em === fileOwner) continue;
+      const prev = userMap.get(em);
+      if (!prev || permissionRoleRank(p.role) > permissionRoleRank(prev)) {
+        userMap.set(em, p.role || 'reader');
+      }
+    }
+  }
+
+  const domains = [...domainMap.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([d, r]) => `${d}:${r}`);
+  const users = [...userMap.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([u, r]) => `${u}:${r}`);
+
+  const sig = `anyone=${anyoneRole}|domains=${domains.join(',')}|users=${users.join(',')}`;
+  return {
+    anyoneRole,
+    domains,
+    users,
+    sig
+  };
+}
+
+function parseRolePairEntries(entries = []) {
+  const map = new Map();
+  for (const item of entries || []) {
+    const idx = String(item).lastIndexOf(':');
+    if (idx <= 0) continue;
+    const key = String(item).slice(0, idx);
+    const role = String(item).slice(idx + 1);
+    map.set(key, role);
+  }
+  return map;
+}
+
+/**
+ * 对比前后两次权限指纹，生成结构化变更明细与零破折号摘要
+ */
+function computeFilePermissionDiff(prevFp, currFp) {
+  if (!prevFp || !currFp || prevFp.sig === currFp.sig) return null;
+
+  const changes = [];
+  let riskIncreased = false;
+
+  const prevAnyone = prevFp.anyoneRole || '';
+  const currAnyone = currFp.anyoneRole || '';
+  if (!prevAnyone && currAnyone) {
+    riskIncreased = true;
+    changes.push({
+      type: 'anyone_added',
+      target: '公开链接 (任何人)',
+      previousRole: '',
+      newRole: currAnyone,
+      riskIncreased: true,
+      text: `新增公开链接（${roleLabel(currAnyone)}）`
+    });
+  } else if (prevAnyone && !currAnyone) {
+    changes.push({
+      type: 'anyone_removed',
+      target: '公开链接 (任何人)',
+      previousRole: prevAnyone,
+      newRole: '',
+      riskIncreased: false,
+      text: `关闭公开链接（原：${roleLabel(prevAnyone)}）`
+    });
+  } else if (prevAnyone && currAnyone && prevAnyone !== currAnyone) {
+    const up = permissionRoleRank(currAnyone) > permissionRoleRank(prevAnyone);
+    if (up) riskIncreased = true;
+    changes.push({
+      type: up ? 'anyone_upgraded' : 'anyone_downgraded',
+      target: '公开链接 (任何人)',
+      previousRole: prevAnyone,
+      newRole: currAnyone,
+      riskIncreased: up,
+      text: `公开链接角色变更：${roleLabel(prevAnyone)} -> ${roleLabel(currAnyone)}`
+    });
+  }
+
+  const prevDomains = parseRolePairEntries(prevFp.domains);
+  const currDomains = parseRolePairEntries(currFp.domains);
+  const allDomKeys = new Set([...prevDomains.keys(), ...currDomains.keys()]);
+  for (const dom of [...allDomKeys].sort()) {
+    const pRole = prevDomains.get(dom) || '';
+    const cRole = currDomains.get(dom) || '';
+    if (!pRole && cRole) {
+      riskIncreased = true;
+      changes.push({
+        type: 'domain_added',
+        target: dom,
+        previousRole: '',
+        newRole: cRole,
+        riskIncreased: true,
+        text: `新增域内共享 ${dom}（${roleLabel(cRole)}）`
+      });
+    } else if (pRole && !cRole) {
+      changes.push({
+        type: 'domain_removed',
+        target: dom,
+        previousRole: pRole,
+        newRole: '',
+        riskIncreased: false,
+        text: `移除域内共享 ${dom}（原：${roleLabel(pRole)}）`
+      });
+    } else if (pRole !== cRole) {
+      const up = permissionRoleRank(cRole) > permissionRoleRank(pRole);
+      if (up) riskIncreased = true;
+      changes.push({
+        type: up ? 'domain_upgraded' : 'domain_downgraded',
+        target: dom,
+        previousRole: pRole,
+        newRole: cRole,
+        riskIncreased: up,
+        text: `域内共享 ${dom} 角色变更：${roleLabel(pRole)} -> ${roleLabel(cRole)}`
+      });
+    }
+  }
+
+  const prevUsers = parseRolePairEntries(prevFp.users);
+  const currUsers = parseRolePairEntries(currFp.users);
+  const allUserKeys = new Set([...prevUsers.keys(), ...currUsers.keys()]);
+  for (const email of [...allUserKeys].sort()) {
+    const pRole = prevUsers.get(email) || '';
+    const cRole = currUsers.get(email) || '';
+    if (!pRole && cRole) {
+      riskIncreased = true;
+      changes.push({
+        type: 'user_added',
+        target: email,
+        previousRole: '',
+        newRole: cRole,
+        riskIncreased: true,
+        text: `新增协作者 ${email}（${roleLabel(cRole)}）`
+      });
+    } else if (pRole && !cRole) {
+      changes.push({
+        type: 'user_removed',
+        target: email,
+        previousRole: pRole,
+        newRole: '',
+        riskIncreased: false,
+        text: `移除协作者 ${email}（原：${roleLabel(pRole)}）`
+      });
+    } else if (pRole !== cRole) {
+      const up = permissionRoleRank(cRole) > permissionRoleRank(pRole);
+      if (up) riskIncreased = true;
+      changes.push({
+        type: up ? 'user_upgraded' : 'user_downgraded',
+        target: email,
+        previousRole: pRole,
+        newRole: cRole,
+        riskIncreased: up,
+        text: `${email} 角色变更：${roleLabel(pRole)} -> ${roleLabel(cRole)}`
+      });
+    }
+  }
+
+  if (!changes.length) return null;
+
+  const summaryText =
+    changes.length <= 2
+      ? changes.map(c => c.text).join(' · ')
+      : `${changes[0].text} · ${changes[1].text} 等 ${changes.length} 项变动`;
+
+  return {
+    changed: true,
+    riskIncreased,
+    changes,
+    summaryText,
+    detectedAt: new Date().toISOString()
+  };
+}
+
+function setFilePermissionDiff(file, diffInfo) {
+  if (!file || typeof file !== 'object') return;
+  const cleanDiff = diffInfo && diffInfo.changed ? diffInfo : null;
+  file.hasPermDiff = Boolean(cleanDiff);
+  try {
+    Object.defineProperty(file, '_permDiff', {
+      value: cleanDiff,
+      writable: true,
+      configurable: true,
+      enumerable: false
+    });
+  } catch (_e) {
+    // 忽略只读对象异常
+  }
+}
+
+function getFilePermissionDiff(file, permDiffsMap = null) {
+  if (!file || typeof file !== 'object') return null;
+  if (permDiffsMap instanceof Map && file.id) {
+    return permDiffsMap.get(file.id) || null;
+  }
+  if (permDiffsMap && typeof permDiffsMap === 'object' && file.id && permDiffsMap[file.id]) {
+    return permDiffsMap[file.id];
+  }
+  return file._permDiff || null;
+}
+
+function hydrateFilesPermissionDiffs(files = [], permDiffs = {}) {
+  if (!Array.isArray(files)) return files;
+  const isMap = permDiffs instanceof Map;
+  const diffObj = !isMap && permDiffs && typeof permDiffs === 'object' ? permDiffs : {};
+  for (const file of files) {
+    if (!file || !file.id) continue;
+    const diffInfo = isMap ? permDiffs.get(file.id) || null : diffObj[file.id] || null;
+    setFilePermissionDiff(file, diffInfo);
+  }
+  return files;
+}
+
+/**
+ * 清除所有扫描权限变动标记，并以当前文件列表状态刷新基线指纹
+ */
+async function clearScanDiffFlags() {
+  const snap = await getSnapshot();
+  const refreshedFingerprints = { ...(snap.permFingerprints || {}) };
+  for (const file of snap.files || []) {
+    if (!file?.id) continue;
+    setFilePermissionDiff(file, null);
+    const fp = buildFilePermissionFingerprint(file);
+    if (fp) {
+      refreshedFingerprints[file.id] = fp;
+    }
+  }
+  snap.permDiffs = {};
+  snap.permFingerprints = refreshedFingerprints;
+  await saveSnapshot(snap);
+  return snap;
+}
+
+/* ==================== C. Google Drive 网页伴随侧边栏解析与单文件深度核查 ==================== */
+
+/**
+ * 解析 Google Drive / Google Docs 网页 URL 或裸文件 ID
+ * 返回 { fileId, kind, isDriveDomain, rawUrl }
+ */
+function parseDriveUrlOrId(input = '') {
+  const rawUrl = String(input || '').trim();
+  if (!rawUrl) {
+    return { fileId: '', kind: 'none', isDriveDomain: false, rawUrl: '' };
+  }
+
+  // 直接传入裸 ID
+  if (/^[a-zA-Z0-9_-]{15,80}$/.test(rawUrl) && !rawUrl.includes('@')) {
+    return { fileId: rawUrl, kind: 'id', isDriveDomain: false, rawUrl };
+  }
+
+  let isDriveDomain = false;
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    isDriveDomain = host === 'drive.google.com' || host === 'docs.google.com';
+
+    const pathname = parsed.pathname || '';
+    const folderMatch = pathname.match(/\/folders\/([a-zA-Z0-9_-]{15,})/);
+    if (folderMatch) {
+      return { fileId: folderMatch[1], kind: 'folder', isDriveDomain, rawUrl };
+    }
+
+    const docTypeMatch = pathname.match(
+      /\/(document|spreadsheets|presentation|forms|drawings|file)\/(?:u\/\d+\/)?d\/([a-zA-Z0-9_-]{15,})/
+    );
+    if (docTypeMatch) {
+      const kindMap = {
+        document: 'document',
+        spreadsheets: 'spreadsheet',
+        presentation: 'presentation',
+        forms: 'form',
+        drawings: 'drawing',
+        file: 'file'
+      };
+      return {
+        fileId: docTypeMatch[2],
+        kind: kindMap[docTypeMatch[1]] || 'file',
+        isDriveDomain,
+        rawUrl
+      };
+    }
+
+    const genericDMatch = pathname.match(/\/d\/([a-zA-Z0-9_-]{15,})/);
+    if (genericDMatch) {
+      return { fileId: genericDMatch[1], kind: 'file', isDriveDomain, rawUrl };
+    }
+
+    const queryId = parsed.searchParams.get('id') || '';
+    if (/^[a-zA-Z0-9_-]{15,80}$/.test(queryId)) {
+      return { fileId: queryId, kind: 'file', isDriveDomain, rawUrl };
+    }
+
+    if (isDriveDomain) {
+      return { fileId: '', kind: 'drive_home', isDriveDomain: true, rawUrl };
+    }
+  } catch (_urlErr) {
+    // 非标准完整 URL 时尝试正则提取片段
+    const fallbackIds = parseDriveLinksInput(rawUrl);
+    if (fallbackIds.length > 0) {
+      return {
+        fileId: fallbackIds[0],
+        kind: rawUrl.includes('/folders/') ? 'folder' : 'file',
+        isDriveDomain: /drive\.google\.com|docs\.google\.com/i.test(rawUrl),
+        rawUrl
+      };
+    }
+  }
+
+  return { fileId: '', kind: 'none', isDriveDomain, rawUrl };
+}
+
+/**
+ * 单文件/文件夹实时深度核查（供伴随侧边栏与定点刷新使用）：
+ * 自动匹配具备访问/管理权限的已授权账号，拉取完整权限与父目录对比逃逸状态，并同步更新本地快照同 ID 项
+ */
+async function inspectSingleDriveItem(fileId, { preferredAccount = '' } = {}) {
+  const parsed = parseDriveUrlOrId(fileId);
+  const cleanId = parsed.fileId || String(fileId || '').trim();
+  if (!cleanId) {
+    throw new Error('请输入有效的 Google Drive 文件链接或文件 ID');
+  }
+
+  const accounts = await getAuthorizedAccounts();
+  const normPreferred = normalizeEntry(preferredAccount);
+  const orderedAccounts =
+    normPreferred && accounts.length > 0
+      ? [
+          ...accounts.filter(a => normalizeEntry(a.email) === normPreferred),
+          ...accounts.filter(a => normalizeEntry(a.email) !== normPreferred)
+        ]
+      : accounts;
+
+  const tokenCandidates = [];
+  for (const acc of orderedAccounts) {
+    try {
+      const tk = await getValidTokenForAccount(acc.email, false);
+      if (tk) {
+        tokenCandidates.push({ email: normalizeEntry(acc.email), token: tk });
+      }
+    } catch (_e) {
+      // 跳过单个失效凭证
+    }
+  }
+
+  if (!tokenCandidates.length) {
+    const fallbackTk = await getValidTokenForAccount(normPreferred || '', false);
+    let resolvedFallbackEmail = normPreferred || '';
+    try {
+      const about = await fetchAboutUser(fallbackTk);
+      if (about?.email) resolvedFallbackEmail = about.email;
+    } catch (_aboutErr) {}
+    tokenCandidates.push({ email: normalizeEntry(resolvedFallbackEmail), token: fallbackTk });
+  }
+
+  const SINGLE_FIELDS =
+    'id,name,mimeType,webViewLink,createdTime,modifiedTime,viewedByMeTime,writersCanShare,copyRequiresWriterPermission,contentRestrictions(readOnly,reason),ownedByMe,shared,owners(emailAddress,displayName),capabilities(canEdit,canComment,canShare),permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(role,inherited,inheritedFrom,permissionType)),parents';
+
+  let bestFile = null;
+  let bestAccount = '';
+  let bestToken = '';
+  let lastError = null;
+
+  for (const cand of tokenCandidates) {
+    try {
+      const meta = await driveApi(
+        cand.token,
+        `/files/${encodeURIComponent(cleanId)}?supportsAllDrives=true&fields=${encodeURIComponent(SINGLE_FIELDS)}`
+      );
+      if (!meta || !meta.id) continue;
+
+      if ((!Array.isArray(meta.permissions) || meta.permissions.length === 0) && meta.capabilities?.canShare) {
+        try {
+          const pData = await driveApi(
+            cand.token,
+            `/files/${encodeURIComponent(cleanId)}/permissions?supportsAllDrives=true&pageSize=100&fields=permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(role,inherited,inheritedFrom,permissionType))`
+          );
+          meta.permissions = pData?.permissions || [];
+        } catch (_pe) {
+          meta.permissions = meta.permissions || [];
+        }
+      }
+
+      if (!bestFile) {
+        bestFile = meta;
+        bestAccount = cand.email || normalizeEntry(meta.owners?.[0]?.emailAddress || '');
+        bestToken = cand.token;
+      }
+
+      if (meta.ownedByMe || (Array.isArray(meta.permissions) && meta.permissions.length > 0 && meta.capabilities?.canShare)) {
+        bestFile = meta;
+        bestAccount = cand.email || normalizeEntry(meta.owners?.[0]?.emailAddress || '');
+        bestToken = cand.token;
+        break;
+      }
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  if (!bestFile) {
+    throw new Error(
+      lastError?.message || '当前已授权账号均无法访问此文件，请确认文件 ID 是否正确或切换对应 Google 账号授权'
+    );
+  }
+
+  bestFile.permissions = Array.isArray(bestFile.permissions) ? bestFile.permissions : [];
+  normalizeScannedFileItem(bestFile, bestAccount);
+  bestFile.permissionsLoading = false;
+
+  const [policy, directory, ttlQueue] = await Promise.all([getPolicy(), getDirectory(), getTtlQueue()]);
+  const cleanExcluded = sanitizeExcludedFoldersList(policy?.excludedFolders || []);
+  const excludedById = new Map();
+  for (const ef of cleanExcluded) {
+    excludedById.set(ef.id, ef);
+  }
+  let matchedExcludedFolder = excludedById.get(bestFile.id) || null;
+
+  // 若存在上级父文件夹，拉取直接父目录权限以便精准执行子项逃逸比对，并沿 parents 轻量回溯最多 6 层识别顶层排除目录
+  const compareList = [bestFile];
+  const ancestorChainMeta = [];
+  const ancestorIds = [];
+  const visitedAncestors = new Set([bestFile.id]);
+  const parentId =
+    Array.isArray(bestFile.parents) && bestFile.parents[0] ? String(bestFile.parents[0]).trim() : '';
+  let nextParentId = '';
+
+  if (parentId) {
+    visitedAncestors.add(parentId);
+    ancestorIds.push(parentId);
+    const directMatched = excludedById.get(parentId);
+    if (!matchedExcludedFolder && directMatched && directMatched.includeSubitems !== false) {
+      matchedExcludedFolder = directMatched;
+    }
+
+    if (bestToken) {
+      try {
+        const parentMeta = await driveApi(
+          bestToken,
+          `/files/${encodeURIComponent(parentId)}?supportsAllDrives=true&fields=${encodeURIComponent(SINGLE_FIELDS)}`
+        );
+        if (parentMeta && parentMeta.id) {
+          if (
+            (!Array.isArray(parentMeta.permissions) || parentMeta.permissions.length === 0) &&
+            parentMeta.capabilities?.canShare
+          ) {
+            try {
+              const ppData = await driveApi(
+                bestToken,
+                `/files/${encodeURIComponent(parentId)}/permissions?supportsAllDrives=true&pageSize=100&fields=permissions(id,type,role,emailAddress,domain,displayName,permissionDetails(role,inherited,inheritedFrom,permissionType))`
+              );
+              parentMeta.permissions = ppData?.permissions || [];
+            } catch (_ppe) {}
+          }
+          parentMeta.permissions = Array.isArray(parentMeta.permissions) ? parentMeta.permissions : [];
+          normalizeScannedFileItem(parentMeta, bestAccount);
+          parentMeta.permissionsLoading = false;
+          compareList.unshift(parentMeta);
+          nextParentId =
+            Array.isArray(parentMeta.parents) && parentMeta.parents[0]
+              ? String(parentMeta.parents[0]).trim()
+              : '';
+        }
+      } catch (_parentErr) {
+        // 无父目录读取权限时自动退化为基于 permissionDetails 的逃逸判定
+      }
+    }
+  }
+
+  let hop = 1;
+  while (
+    !matchedExcludedFolder &&
+    nextParentId &&
+    bestToken &&
+    hop < 6 &&
+    !visitedAncestors.has(nextParentId)
+  ) {
+    const currentAncId = nextParentId;
+    visitedAncestors.add(currentAncId);
+    ancestorIds.push(currentAncId);
+
+    const ancRule = excludedById.get(currentAncId);
+    if (ancRule && ancRule.includeSubitems !== false) {
+      matchedExcludedFolder = ancRule;
+      break;
+    }
+
+    try {
+      const ancMeta = await driveApi(
+        bestToken,
+        `/files/${encodeURIComponent(currentAncId)}?supportsAllDrives=true&fields=id,name,parents`
+      );
+      hop++;
+      if (ancMeta && ancMeta.id) {
+        ancestorChainMeta.push({
+          id: ancMeta.id,
+          name: ancMeta.name || '',
+          mimeType: 'application/vnd.google-apps.folder',
+          parents: Array.isArray(ancMeta.parents) ? ancMeta.parents : []
+        });
+        nextParentId =
+          Array.isArray(ancMeta.parents) && ancMeta.parents[0]
+            ? String(ancMeta.parents[0]).trim()
+            : '';
+        if (hop >= 6 && nextParentId && !visitedAncestors.has(nextParentId)) {
+          const topRule = excludedById.get(nextParentId);
+          if (topRule && topRule.includeSubitems !== false) {
+            ancestorIds.push(nextParentId);
+            matchedExcludedFolder = topRule;
+          }
+        }
+      } else {
+        break;
+      }
+    } catch (_ancErr) {
+      break;
+    }
+  }
+
+  Object.defineProperty(bestFile, '_ancestorIds', {
+    value: ancestorIds,
+    configurable: true,
+    writable: true,
+    enumerable: false
+  });
+
+  const breakageMap = analyzeInheritanceBreakage(compareList);
+  const breakage = breakageMap.get(bestFile.id) || null;
+
+  const excludedSet = buildExcludedFileIdSet(
+    [...ancestorChainMeta, ...compareList],
+    policy.excludedFolders || []
+  );
+  const isExcluded =
+    Boolean(matchedExcludedFolder) ||
+    isFileInExcludedFolders(bestFile, policy.excludedFolders || [], excludedSet);
+  let evaluation = evaluateFile(bestFile, policy, bestAccount, excludedSet);
+  if (isExcluded && !evaluation.isExcluded) {
+    evaluation = {
+      ...evaluation,
+      removeCount: 0,
+      downgradeCount: 0,
+      inheritedIssueCount: 0,
+      hasActionableViolation: false,
+      isExcluded: true
+    };
+  }
+  const wideRisk = assessWidePermissionRisk(bestFile, policy, bestAccount, isExcluded);
+  const ttlEntries = ttlQueue.filter(item => item.fileId === bestFile.id && item.status === 'pending');
+
+  // 若本地扫描快照中已包含该文件，顺带同步刷新其最新权限与指纹
+  try {
+    const rawSnapData = await chrome.storage.local.get('scanSnapshot');
+    const snap = rawSnapData.scanSnapshot;
+    if (snap && Array.isArray(snap.files)) {
+      const idx = snap.files.findIndex(f => f?.id === bestFile.id);
+      if (idx !== -1) {
+        bestFile.isNew = Boolean(snap.files[idx].isNew);
+        snap.files[idx] = bestFile;
+        snap.permFingerprints = snap.permFingerprints || {};
+        const fp = buildFilePermissionFingerprint(bestFile);
+        if (fp) snap.permFingerprints[bestFile.id] = fp;
+        await saveSnapshot(snap);
+      }
+    }
+  } catch (_snapErr) {}
+
+  return {
+    file: bestFile,
+    matchedAccount: bestAccount,
+    policy,
+    directory,
+    evaluation,
+    breakage,
+    ttlEntries,
+    isExcluded,
+    matchedExcludedFolder,
+    ancestorIds,
+    wideRisk
+  };
+}
+
+
+// ============================================================================
+// v1.0.0：防扩散/锁定加固、IMPORTRANGE 跨表放行、岗位权限包、合作方档案、沉睡编辑权与目录树分叉引擎
+// ============================================================================
+
+/* ==================== 1. 文件防扩散 / 防复制 / 内容锁定加固引擎 ==================== */
+
+function resolveContentLockDirective(contentLock) {
+  if (contentLock === true || contentLock === 'lock') return true;
+  if (contentLock === false || contentLock === 'unlock') return false;
+  return undefined;
+}
+
+/**
+ * 批量或单文件执行安全加固（禁止编辑者拉人 / 禁止查看者下载打印复制 / 文件防篡改锁定）
+ */
+async function applyFileSecurityHardening({
+  files = [],
+  writersCanShare = undefined,
+  copyRequiresWriterPermission = undefined,
+  contentLock = undefined,
+  lockReason = '由 Drive 权限管理中心锁定保护',
+  onProgress = null,
+  shouldStop = null
+} = {}) {
+  const validFiles = (Array.isArray(files) ? files : [files]).filter(f => f && f.id);
+  const lockBool = resolveContentLockDirective(contentLock);
+
+  let changedCount = 0;
+  let skippedCount = 0;
+  let failedCount = 0;
+  let stopped = false;
+  let cursor = 0;
+  const failedItems = [];
+  const mutatedById = new Map();
+  const logs = [];
+
+  const tokenCache = new Map();
+  async function resolveToken(ownerEmail) {
+    const norm = normalizeEntry(ownerEmail || '');
+    if (tokenCache.has(norm)) return tokenCache.get(norm);
+    const tk = await getValidTokenForAccount(norm, true);
+    tokenCache.set(norm, tk);
+    return tk;
+  }
+
+  const workerCount = Math.min(4, Math.max(1, validFiles.length));
+  const workers = Array.from({ length: validFiles.length ? workerCount : 0 }, async () => {
+    while (cursor < validFiles.length) {
+      if (shouldStop?.()) {
+        stopped = true;
+        break;
+      }
+      const file = validFiles[cursor++];
+      const isFolder = file.mimeType === 'application/vnd.google-apps.folder';
+      const ownerEmail = normalizeEntry(
+        file.ownerAccount || file.scannedByAccount || file.owners?.[0]?.emailAddress || ''
+      );
+
+      const curWritersCanShare = file.writersCanShare !== false;
+      const curCopyReq = Boolean(file.copyRequiresWriterPermission);
+      const curLocked = Boolean(file.contentLocked || file.contentRestrictions?.some(r => r?.readOnly));
+
+      const patchBody = {};
+      const changeLabels = [];
+
+      if (writersCanShare !== undefined) {
+        const nextW = Boolean(writersCanShare);
+        if (curWritersCanShare !== nextW) {
+          patchBody.writersCanShare = nextW;
+          changeLabels.push(nextW ? '允许编辑者拉人共享' : '禁止编辑者拉人共享');
+        }
+      }
+
+      if (!isFolder && copyRequiresWriterPermission !== undefined) {
+        const nextC = Boolean(copyRequiresWriterPermission);
+        if (curCopyReq !== nextC) {
+          patchBody.copyRequiresWriterPermission = nextC;
+          changeLabels.push(nextC ? '禁止查看/评论者下载打印复制' : '允许查看/评论者下载打印复制');
+        }
+      }
+
+      if (!isFolder && lockBool !== undefined) {
+        if (curLocked !== lockBool) {
+          const cleanReason = String(lockReason || '由 Drive 权限管理中心锁定保护').trim();
+          patchBody.contentRestrictions = [
+            lockBool ? { readOnly: true, reason: cleanReason } : { readOnly: false }
+          ];
+          changeLabels.push(lockBool ? '开启文件防篡改锁定' : '解除文件防篡改锁定');
+        }
+      }
+
+      if (Object.keys(patchBody).length === 0) {
+        skippedCount++;
+        if (onProgress) {
+          const done = changedCount + skippedCount + failedCount;
+          onProgress({
+            done,
+            total: validFiles.length,
+            changedCount,
+            skippedCount,
+            failedCount,
+            stopped,
+            message: `正在执行安全加固 ${done}/${validFiles.length}（已加固 ${changedCount}，无需变更 ${skippedCount}）…`
+          });
+        }
+        continue;
+      }
+
+      try {
+        const token = await resolveToken(ownerEmail);
+        const updatedMeta = await driveApi(
+          token,
+          `/files/${encodeURIComponent(file.id)}?supportsAllDrives=true&fields=id,writersCanShare,copyRequiresWriterPermission,contentRestrictions(readOnly,reason)`,
+          {
+            method: 'PATCH',
+            body: JSON.stringify(patchBody)
+          }
+        );
+
+        if ('writersCanShare' in patchBody) {
+          file.writersCanShare =
+            updatedMeta?.writersCanShare !== undefined
+              ? Boolean(updatedMeta.writersCanShare)
+              : patchBody.writersCanShare;
+        }
+        if ('copyRequiresWriterPermission' in patchBody) {
+          file.copyRequiresWriterPermission =
+            updatedMeta?.copyRequiresWriterPermission !== undefined
+              ? Boolean(updatedMeta.copyRequiresWriterPermission)
+              : patchBody.copyRequiresWriterPermission;
+        }
+        if ('contentRestrictions' in patchBody) {
+          const nextRestrictions = Array.isArray(updatedMeta?.contentRestrictions)
+            ? updatedMeta.contentRestrictions
+            : patchBody.contentRestrictions[0]?.readOnly
+              ? patchBody.contentRestrictions
+              : [];
+          file.contentRestrictions = nextRestrictions;
+          const roItem = nextRestrictions.find(r => r && r.readOnly);
+          file.contentLocked = Boolean(roItem);
+          file.contentLockReason = roItem?.reason || '';
+        }
+
+        mutatedById.set(file.id, {
+          writersCanShare: file.writersCanShare !== false,
+          copyRequiresWriterPermission: Boolean(file.copyRequiresWriterPermission),
+          contentLocked: Boolean(file.contentLocked),
+          contentLockReason: file.contentLockReason || ''
+        });
+
+        changedCount++;
+        logs.push({
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: new Date().toISOString(),
+          source: 'manual',
+          actionType: 'harden',
+          accountEmail: ownerEmail,
+          fileId: file.id,
+          fileName: file.name || '(无名称)',
+          webViewLink: formatDriveCanonicalLink(file),
+          permissionId: '',
+          targetType: 'file_security',
+          targetEmail: '',
+          targetLabel: changeLabels.join(' · '),
+          previousRole: '',
+          newRole: '',
+          restored: false,
+          message: `文件安全加固：${changeLabels.join(' · ')}`
+        });
+      } catch (error) {
+        failedCount++;
+        const errMsg = error?.message || String(error);
+        failedItems.push({
+          fileId: file.id,
+          fileName: file.name || '(无名称)',
+          accountEmail: ownerEmail,
+          errorMessage: errMsg
+        });
+      }
+
+      if (onProgress) {
+        const done = changedCount + skippedCount + failedCount;
+        onProgress({
+          done,
+          total: validFiles.length,
+          changedCount,
+          skippedCount,
+          failedCount,
+          stopped,
+          message: `正在执行安全加固 ${done}/${validFiles.length}（已加固 ${changedCount}，失败 ${failedCount}）…`
+        });
+      }
+    }
+  });
+
+  await Promise.all(workers);
+
+  if (mutatedById.size > 0) {
+    try {
+      const rawSnap = await chrome.storage.local.get('scanSnapshot');
+      const snap = rawSnap?.scanSnapshot;
+      if (snap && Array.isArray(snap.files)) {
+        let touched = false;
+        for (const sf of snap.files) {
+          if (sf && mutatedById.has(sf.id)) {
+            Object.assign(sf, mutatedById.get(sf.id));
+            touched = true;
+          }
+        }
+        if (touched) {
+          await saveSnapshot(snap);
+        }
+      }
+    } catch (_snapErr) {}
+  }
+
+  if (logs.length > 0) {
+    await appendAuditLogs(logs);
+  }
+
+  return {
+    changedCount,
+    failedCount,
+    skippedCount,
+    failedItems,
+    stopped
+  };
+}
+
+/* ==================== 2. 锁定表格 =IMPORTRANGE 跨表关联解析与放行引擎 ==================== */
+
+function decodeXmlEntities(str = '') {
+  return String(str || '')
+    .replace(/&#x([0-9a-fA-F]+);/g, (_m, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_m, dec) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+function resolveSpreadsheetIdFromRef(rawRef = '') {
+  const trimmed = String(rawRef || '').trim();
+  if (!trimmed) return '';
+  const dMatch = trimmed.match(/\/spreadsheets\/(?:u\/\d+\/)?d\/([a-zA-Z0-9_-]{10,})/);
+  if (dMatch) return dMatch[1];
+  const genericD = trimmed.match(/\/d\/([a-zA-Z0-9_-]{10,})/);
+  if (genericD) return genericD[1];
+  const idParam = trimmed.match(/[?&](?:id|key)=([a-zA-Z0-9_-]{10,})/);
+  if (idParam) return idParam[1];
+  if (/^[a-zA-Z0-9_-]{8,90}$/.test(trimmed) && !trimmed.includes('!')) {
+    return trimmed;
+  }
+  return '';
+}
+
+/**
+ * 正则提取公式内所有 IMPORTRANGE("...", ...) 的源表 URL/ID
+ * 兼容同一公式多处调用、转义双引号 ""、XML 实体、完整链接与纯 ID
+ */
+function extractImportRangeFormulaRefs(formulaText = '') {
+  const decoded = decodeXmlEntities(String(formulaText || ''));
+  if (!/importrange/i.test(decoded)) return [];
+
+  const refs = [];
+  const seen = new Set();
+  const pattern = /IMPORTRANGE(?:_OFF)?\s*\(\s*(?:"((?:[^"]|"")*)"|'((?:[^']|'')*)')/gi;
+  let match;
+  while ((match = pattern.exec(decoded)) !== null) {
+    const rawQuoted = match[1] !== undefined ? match[1].replace(/""/g, '"') : (match[2] || '').replace(/''/g, "'");
+    const rawSourceRef = rawQuoted.trim();
+    if (!rawSourceRef) continue;
+    const sourceSpreadsheetId = resolveSpreadsheetIdFromRef(rawSourceRef);
+    const dedupeKey = `${sourceSpreadsheetId}::${rawSourceRef}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    refs.push({
+      rawSourceRef,
+      sourceSpreadsheetId,
+      id: sourceSpreadsheetId
+    });
+  }
+  return refs;
+}
+
+/**
+ * 纯 JS RFC-1951 Deflate-Raw 解压兜底（当无 DecompressionStream 且无 Node zlib 时使用）
+ */
+function pureJsInflateRaw(src) {
+  let bitPos = 0;
+  const srcLen = src.length;
+  const out = [];
+
+  function readBits(n) {
+    let val = 0;
+    for (let i = 0; i < n; i++) {
+      const byteIdx = bitPos >>> 3;
+      if (byteIdx >= srcLen) throw new Error('Deflate 数据流意外结束');
+      val |= ((src[byteIdx] >>> (bitPos & 7)) & 1) << i;
+      bitPos++;
+    }
+    return val;
+  }
+
+  function buildHuffmanTable(lengths) {
+    let maxBits = 0;
+    for (let i = 0; i < lengths.length; i++) {
+      if (lengths[i] > maxBits) maxBits = lengths[i];
+    }
+    if (maxBits === 0) return { counts: new Int32Array(1), symbols: new Int32Array(0), maxBits: 0 };
+    const counts = new Int32Array(maxBits + 1);
+    for (let i = 0; i < lengths.length; i++) {
+      if (lengths[i] > 0) counts[lengths[i]]++;
+    }
+    const offsets = new Int32Array(maxBits + 1);
+    let total = 0;
+    for (let b = 1; b <= maxBits; b++) {
+      offsets[b] = total;
+      total += counts[b];
+    }
+    const symbols = new Int32Array(total);
+    for (let sym = 0; sym < lengths.length; sym++) {
+      const len = lengths[sym];
+      if (len > 0) symbols[offsets[len]++] = sym;
+    }
+    return { counts, symbols, maxBits };
+  }
+
+  function decodeSymbol(table) {
+    let code = 0;
+    let first = 0;
+    let index = 0;
+    for (let len = 1; len <= table.maxBits; len++) {
+      code |= readBits(1);
+      const count = table.counts[len];
+      if (code - count < first) {
+        return table.symbols[index + (code - first)];
+      }
+      index += count;
+      first += count;
+      first <<= 1;
+      code <<= 1;
+    }
+    throw new Error('无效的 Huffman 编码');
+  }
+
+  const fixedLitLengths = new Uint8Array(288);
+  for (let i = 0; i <= 143; i++) fixedLitLengths[i] = 8;
+  for (let i = 144; i <= 255; i++) fixedLitLengths[i] = 9;
+  for (let i = 256; i <= 279; i++) fixedLitLengths[i] = 7;
+  for (let i = 280; i <= 287; i++) fixedLitLengths[i] = 8;
+  const fixedDistLengths = new Uint8Array(32);
+  fixedDistLengths.fill(5);
+
+  const lenBase = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+    35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
+  ];
+  const lenExtra = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+    3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0
+  ];
+  const distBase = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+    257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577
+  ];
+  const distExtra = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+    7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
+  ];
+  const clOrder = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+  let isFinal = 0;
+  while (!isFinal) {
+    isFinal = readBits(1);
+    const blockType = readBits(2);
+    if (blockType === 0) {
+      bitPos = (bitPos + 7) & ~7;
+      const bytePos = bitPos >>> 3;
+      const blockLen = src[bytePos] | (src[bytePos + 1] << 8);
+      const start = bytePos + 4;
+      for (let i = 0; i < blockLen; i++) {
+        out.push(src[start + i]);
+      }
+      bitPos = (start + blockLen) << 3;
+    } else if (blockType === 1 || blockType === 2) {
+      let litTable;
+      let distTable;
+      if (blockType === 1) {
+        litTable = buildHuffmanTable(fixedLitLengths);
+        distTable = buildHuffmanTable(fixedDistLengths);
+      } else {
+        const hlit = readBits(5) + 257;
+        const hdist = readBits(5) + 1;
+        const hclen = readBits(4) + 4;
+        const clLengths = new Uint8Array(19);
+        for (let i = 0; i < hclen; i++) {
+          clLengths[clOrder[i]] = readBits(3);
+        }
+        const clTable = buildHuffmanTable(clLengths);
+        const combined = new Uint8Array(hlit + hdist);
+        let idx = 0;
+        while (idx < hlit + hdist) {
+          const sym = decodeSymbol(clTable);
+          if (sym < 16) {
+            combined[idx++] = sym;
+          } else if (sym === 16) {
+            const repeat = readBits(2) + 3;
+            const prev = idx > 0 ? combined[idx - 1] : 0;
+            for (let r = 0; r < repeat; r++) combined[idx++] = prev;
+          } else if (sym === 17) {
+            const repeat = readBits(3) + 3;
+            for (let r = 0; r < repeat; r++) combined[idx++] = 0;
+          } else {
+            const repeat = readBits(7) + 11;
+            for (let r = 0; r < repeat; r++) combined[idx++] = 0;
+          }
+        }
+        litTable = buildHuffmanTable(combined.subarray(0, hlit));
+        distTable = buildHuffmanTable(combined.subarray(hlit));
+      }
+
+      while (true) {
+        const sym = decodeSymbol(litTable);
+        if (sym < 256) {
+          out.push(sym);
+        } else if (sym === 256) {
+          break;
+        } else {
+          const lenIdx = sym - 257;
+          const length = lenBase[lenIdx] + readBits(lenExtra[lenIdx]);
+          const distSym = decodeSymbol(distTable);
+          const distance = distBase[distSym] + readBits(distExtra[distSym]);
+          const copyStart = out.length - distance;
+          for (let i = 0; i < length; i++) {
+            out.push(out[copyStart + i]);
+          }
+        }
+      }
+    } else {
+      throw new Error('不支持的 Deflate 块类型');
+    }
+  }
+
+  return new Uint8Array(out);
+}
+
+async function decompressZipEntryText(compressedBytes, method) {
+  if (method === 0) {
+    return new TextDecoder('utf-8').decode(compressedBytes);
+  }
+  if (method !== 8) {
+    throw new Error(`不支持的 ZIP 压缩算法 (${method})`);
+  }
+
+  if (typeof DecompressionStream === 'function' && typeof Response === 'function') {
+    const ds = new DecompressionStream('deflate-raw');
+    const writer = ds.writable.getWriter();
+    await writer.write(compressedBytes);
+    await writer.close();
+    const ab = await new Response(ds.readable).arrayBuffer();
+    return new TextDecoder('utf-8').decode(ab);
+  }
+
+  if (typeof zlib !== 'undefined' && typeof zlib.inflateRawSync === 'function') {
+    const buf = zlib.inflateRawSync(compressedBytes);
+    return new TextDecoder('utf-8').decode(buf);
+  }
+
+  if (typeof require === 'function') {
+    try {
+      const nodeZlib = require('zlib');
+      if (nodeZlib && typeof nodeZlib.inflateRawSync === 'function') {
+        const buf = nodeZlib.inflateRawSync(compressedBytes);
+        return new TextDecoder('utf-8').decode(buf);
+      }
+    } catch (_reqErr) {}
+  }
+
+  const rawOut = pureJsInflateRaw(compressedBytes);
+  return new TextDecoder('utf-8').decode(rawOut);
+}
+
+function readZipCentralDirectory(bytes) {
+  if (!bytes || bytes.length < 22) {
+    throw new Error('无效的 XLSX 文件数据（长度不足）');
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let eocdPos = -1;
+  const minPos = Math.max(0, bytes.length - 65557);
+  for (let i = bytes.length - 22; i >= minPos; i--) {
+    if (
+      bytes[i] === 0x50 &&
+      bytes[i + 1] === 0x4b &&
+      bytes[i + 2] === 0x05 &&
+      bytes[i + 3] === 0x06
+    ) {
+      eocdPos = i;
+      break;
+    }
+  }
+  if (eocdPos === -1) {
+    throw new Error('无法识别 XLSX ZIP 目录结构');
+  }
+
+  const totalEntries = view.getUint16(eocdPos + 10, true);
+  const cdOffset = view.getUint32(eocdPos + 16, true);
+  const entries = new Map();
+  let pos = cdOffset;
+  const decoder = new TextDecoder('utf-8');
+
+  for (let idx = 0; idx < totalEntries && pos + 46 <= bytes.length; idx++) {
+    if (view.getUint32(pos, true) !== 0x02014b50) break;
+    const method = view.getUint16(pos + 10, true);
+    const compressedSize = view.getUint32(pos + 20, true);
+    const nameLen = view.getUint16(pos + 28, true);
+    const extraLen = view.getUint16(pos + 30, true);
+    const commentLen = view.getUint16(pos + 32, true);
+    const localOffset = view.getUint32(pos + 42, true);
+    const rawName = decoder.decode(bytes.subarray(pos + 46, pos + 46 + nameLen));
+    const normName = rawName.replace(/\\/g, '/').replace(/^\/+/, '');
+    pos += 46 + nameLen + extraLen + commentLen;
+
+    if (localOffset + 30 <= bytes.length && view.getUint32(localOffset, true) === 0x04034b50) {
+      const lNameLen = view.getUint16(localOffset + 26, true);
+      const lExtraLen = view.getUint16(localOffset + 28, true);
+      const dataStart = localOffset + 30 + lNameLen + lExtraLen;
+      entries.set(normName, {
+        name: normName,
+        method,
+        compressedBytes: bytes.subarray(dataStart, dataStart + compressedSize)
+      });
+    }
+  }
+  return entries;
+}
+
+function getXmlAttr(attrText = '', attrName = '') {
+  const escaped = attrName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(?:^|\\s)${escaped}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, 'i');
+  const m = String(attrText || '').match(re);
+  if (!m) return '';
+  return decodeXmlEntities(m[1] !== undefined ? m[1] : m[2] || '');
+}
+
+/**
+ * 纯 JS 解析 .xlsx 二进制包，提取所有工作表中含 =IMPORTRANGE 的公式单元格及 #REF! 错误状态
+ */
+async function parseXlsxImportRangeFormulas(arrayBuffer) {
+  let bytes;
+  if (arrayBuffer instanceof Uint8Array) {
+    bytes = arrayBuffer;
+  } else if (arrayBuffer instanceof ArrayBuffer) {
+    bytes = new Uint8Array(arrayBuffer);
+  } else if (arrayBuffer && arrayBuffer.buffer instanceof ArrayBuffer) {
+    bytes = new Uint8Array(arrayBuffer.buffer, arrayBuffer.byteOffset || 0, arrayBuffer.byteLength);
+  } else {
+    throw new Error('无效的 XLSX 二进制缓冲区');
+  }
+
+  const entries = readZipCentralDirectory(bytes);
+
+  const relsMap = new Map();
+  const relsEntry = entries.get('xl/_rels/workbook.xml.rels');
+  if (relsEntry) {
+    const relsXml = await decompressZipEntryText(relsEntry.compressedBytes, relsEntry.method);
+    const relRe = /<Relationship\b([^>]*?)\/?>/gi;
+    let rm;
+    while ((rm = relRe.exec(relsXml)) !== null) {
+      const attrs = rm[1] || '';
+      const rId = getXmlAttr(attrs, 'Id');
+      let target = getXmlAttr(attrs, 'Target');
+      if (rId && target) {
+        target = target.replace(/\\/g, '/');
+        if (target.startsWith('/')) {
+          target = target.replace(/^\/+/, '');
+        } else if (!target.startsWith('xl/')) {
+          target = `xl/${target.replace(/^\.\//, '')}`;
+        }
+        relsMap.set(rId, target);
+      }
+    }
+  }
+
+  const sheetDefs = [];
+  const wbEntry = entries.get('xl/workbook.xml');
+  if (wbEntry) {
+    const wbXml = await decompressZipEntryText(wbEntry.compressedBytes, wbEntry.method);
+    const sheetRe = /<sheet\b([^>]*?)\/?>/gi;
+    let sm;
+    let idx = 0;
+    while ((sm = sheetRe.exec(wbXml)) !== null) {
+      const attrs = sm[1] || '';
+      const sheetName = getXmlAttr(attrs, 'name') || `Sheet${idx + 1}`;
+      const explicitGid = getXmlAttr(attrs, 'gid');
+      const sheetId = getXmlAttr(attrs, 'sheetId');
+      const relId = getXmlAttr(attrs, 'r:id') || getXmlAttr(attrs, 'id');
+      const entryPath = (relId && relsMap.get(relId)) || `xl/worksheets/sheet${idx + 1}.xml`;
+      const sheetGid = explicitGid !== '' ? explicitGid : sheetId !== '' ? sheetId : String(idx);
+      sheetDefs.push({ sheetName, sheetGid, entryPath });
+      idx++;
+    }
+  }
+
+  if (sheetDefs.length === 0) {
+    let fallbackIdx = 0;
+    for (const key of entries.keys()) {
+      if (/^xl\/worksheets\/sheet\d+\.xml$/i.test(key)) {
+        sheetDefs.push({
+          sheetName: `Sheet${fallbackIdx + 1}`,
+          sheetGid: String(fallbackIdx),
+          entryPath: key
+        });
+        fallbackIdx++;
+      }
+    }
+  }
+
+  const results = [];
+
+  for (const sDef of sheetDefs) {
+    const wsEntry = entries.get(sDef.entryPath);
+    if (!wsEntry) continue;
+    const wsXml = await decompressZipEntryText(wsEntry.compressedBytes, wsEntry.method);
+    const sharedFormulas = new Map();
+    const cellRe = /<c\b([^>]*?)>([\s\S]*?)<\/c>/gi;
+    let cm;
+
+    while ((cm = cellRe.exec(wsXml)) !== null) {
+      const cAttrs = cm[1] || '';
+      const cInner = cm[2] || '';
+      const cellRef = getXmlAttr(cAttrs, 'r') || 'A1';
+      const cellType = getXmlAttr(cAttrs, 't');
+
+      let rawFormula = '';
+      const fFullMatch = cInner.match(/<f\b([^>]*)>([\s\S]*?)<\/f>/i);
+      if (fFullMatch) {
+        const fAttrs = fFullMatch[1] || '';
+        rawFormula = decodeXmlEntities(fFullMatch[2] || '').trim();
+        const fType = getXmlAttr(fAttrs, 't');
+        const fSi = getXmlAttr(fAttrs, 'si');
+        if (fType === 'shared' && fSi !== '' && rawFormula) {
+          sharedFormulas.set(fSi, rawFormula);
+        }
+      } else {
+        const fSelfClose = cInner.match(/<f\b([^>]*)\/>/i);
+        if (fSelfClose) {
+          const fSi = getXmlAttr(fSelfClose[1] || '', 'si');
+          if (fSi !== '' && sharedFormulas.has(fSi)) {
+            rawFormula = sharedFormulas.get(fSi);
+          }
+        }
+      }
+
+      if (!rawFormula || !/importrange/i.test(rawFormula)) continue;
+
+      const vMatch = cInner.match(/<v(?:\s[^>]*)?>([\s\S]*?)<\/v>/i);
+      const isTextMatch = !vMatch ? cInner.match(/<is>[\s\S]*?<t(?:\s[^>]*)?>([\s\S]*?)<\/t>[\s\S]*?<\/is>/i) : null;
+      const cachedValue = decodeXmlEntities((vMatch ? vMatch[1] : isTextMatch ? isTextMatch[1] : '') || '').trim();
+      const isRefError = cellType === 'e' || /#REF!/i.test(cachedValue);
+
+      const extractedRefs = extractImportRangeFormulaRefs(rawFormula);
+      const normalizedFormula = rawFormula.startsWith('=') ? rawFormula : `=${rawFormula}`;
+
+      for (const ref of extractedRefs) {
+        results.push({
+          sheetName: sDef.sheetName,
+          sheetGid: String(sDef.sheetGid ?? '0'),
+          cellRef,
+          formula: normalizedFormula,
+          rawSourceRef: ref.rawSourceRef,
+          sourceSpreadsheetId: ref.sourceSpreadsheetId,
+          isRefError
+        });
+      }
+    }
+  }
+
+  return results;
+}
+
+async function buildAuthorizedTokenPool(preferredAccount = '') {
+  const accounts = await getAuthorizedAccounts();
+  const normPref = preferredAccount && preferredAccount !== 'all' ? normalizeEntry(preferredAccount) : '';
+  const ordered =
+    normPref && accounts.length > 0
+      ? [
+          ...accounts.filter(a => normalizeEntry(a.email) === normPref),
+          ...accounts.filter(a => normalizeEntry(a.email) !== normPref)
+        ]
+      : accounts;
+
+  const pool = [];
+  for (const acc of ordered) {
+    try {
+      const tk = await getValidTokenForAccount(acc.email, false);
+      if (tk) {
+        pool.push({ email: normalizeEntry(acc.email), token: tk });
+      }
+    } catch (_e) {}
+  }
+
+  if (!pool.length) {
+    try {
+      const fallbackTk = await getValidTokenForAccount(normPref || '', true);
+      let em = normPref || '';
+      if (!em && fallbackTk) {
+        try {
+          const about = await fetchAboutUser(fallbackTk);
+          em = normalizeEntry(about?.email || '');
+        } catch (_ae) {}
+      }
+      if (fallbackTk) {
+        pool.push({ email: em, token: fallbackTk });
+      }
+    } catch (_fe) {}
+  }
+  return pool;
+}
+
+/**
+ * 扫描并诊断目标汇总表中的全部 =IMPORTRANGE 跨表上游源表权限状态与 #REF! 阻塞原因
+ */
+async function inspectImportRangeDependencies(targetSheetIdOrUrl, { accountEmail = '' } = {}) {
+  const parsedTarget = parseDriveUrlOrId(targetSheetIdOrUrl);
+  const targetId = parsedTarget.fileId || extractDriveFileId(targetSheetIdOrUrl);
+  if (!targetId) {
+    throw new Error('请输入有效的目标 Google 表格链接或文件 ID');
+  }
+
+  const tokenPool = await buildAuthorizedTokenPool(accountEmail);
+  if (!tokenPool.length) {
+    throw new Error('尚未找到可用的已授权账号令牌，请先完成 Google OAuth 客户端或服务账号授权');
+  }
+
+  const META_FIELDS =
+    'id,name,mimeType,webViewLink,ownedByMe,shared,owners(emailAddress,displayName),capabilities(canEdit,canComment,canShare),permissions(id,type,role,emailAddress,domain,displayName),writersCanShare,copyRequiresWriterPermission,contentRestrictions(readOnly,reason)';
+
+  let targetMeta = null;
+  let targetToken = '';
+  let matchedAccount = '';
+  let lastErr = null;
+
+  for (const entry of tokenPool) {
+    try {
+      const meta = await driveApi(
+        entry.token,
+        `/files/${encodeURIComponent(targetId)}?supportsAllDrives=true&fields=${encodeURIComponent(META_FIELDS)}`
+      );
+      if (meta && meta.id) {
+        targetMeta = meta;
+        targetToken = entry.token;
+        matchedAccount = entry.email || normalizeEntry(meta.owners?.[0]?.emailAddress || '');
+        if (meta.ownedByMe || meta.capabilities?.canShare) {
+          break;
+        }
+      }
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+
+  if (!targetMeta || !targetToken) {
+    throw new Error(lastErr?.message || '当前已授权账号无法读取目标汇总表，请确认表格链接及账号权限');
+  }
+
+  const xlsxMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  const exportResp = await fetch(
+    `${DRIVE_API}/files/${encodeURIComponent(targetId)}/export?mimeType=${encodeURIComponent(xlsxMime)}`,
+    {
+      headers: { Authorization: `Bearer ${targetToken}` }
+    }
+  );
+  if (!exportResp.ok) {
+    let errDetail = '';
+    try {
+      const body = await exportResp.json();
+      errDetail = body?.error?.message || '';
+    } catch (_je) {}
+    throw new Error(errDetail || `导出目标表格公式结构失败 (${exportResp.status})`);
+  }
+
+  const xlsxBuffer = await exportResp.arrayBuffer();
+  const formulaHits = await parseXlsxImportRangeFormulas(xlsxBuffer);
+
+  const targetOwnerEmail = normalizeEntry(targetMeta.owners?.[0]?.emailAddress || matchedAccount || '');
+  const target = {
+    id: targetMeta.id,
+    name: targetMeta.name || '(未命名表格)',
+    mimeType: targetMeta.mimeType || '',
+    webViewLink: formatDriveCanonicalLink(targetMeta),
+    ownerEmail: targetOwnerEmail,
+    owners: targetMeta.owners || [],
+    contentLocked: Boolean(targetMeta.contentRestrictions?.some(r => r?.readOnly)),
+    matchedAccount
+  };
+
+  const groupedBySource = new Map();
+  for (const hit of formulaHits) {
+    const srcKey = hit.sourceSpreadsheetId || hit.rawSourceRef;
+    if (!srcKey) continue;
+    const jumpUrl = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(
+      targetId
+    )}/edit#gid=${encodeURIComponent(hit.sheetGid || '0')}&range=${encodeURIComponent(hit.cellRef || 'A1')}`;
+
+    if (!groupedBySource.has(srcKey)) {
+      groupedBySource.set(srcKey, {
+        sourceSpreadsheetId: hit.sourceSpreadsheetId || '',
+        rawSourceRef: hit.rawSourceRef,
+        cells: []
+      });
+    }
+    groupedBySource.get(srcKey).cells.push({
+      sheetName: hit.sheetName,
+      sheetGid: hit.sheetGid,
+      cellRef: hit.cellRef,
+      formula: hit.formula,
+      rawSourceRef: hit.rawSourceRef,
+      isRefError: Boolean(hit.isRefError),
+      jumpUrl
+    });
+  }
+
+  const sourceGroups = [...groupedBySource.values()];
+  const dependencies = new Array(sourceGroups.length);
+  let depCursor = 0;
+
+  const workers = Array.from({ length: Math.min(4, Math.max(1, sourceGroups.length)) }, async () => {
+    while (depCursor < sourceGroups.length) {
+      const idx = depCursor++;
+      const grp = sourceGroups[idx];
+      const srcId = grp.sourceSpreadsheetId;
+      const hasRefError = grp.cells.some(c => c.isRefError);
+      const refErrorCellCount = grp.cells.filter(c => c.isRefError).length;
+      const firstJumpUrl = (grp.cells.find(c => c.isRefError) || grp.cells[0])?.jumpUrl || '';
+
+      if (!srcId) {
+        dependencies[idx] = {
+          sourceSpreadsheetId: '',
+          rawSourceRef: grp.rawSourceRef,
+          sourceName: `无法识别的源表引用 (${grp.rawSourceRef})`,
+          sourceWebViewLink: '',
+          sourceOwnerEmail: '',
+          manageAccountEmail: '',
+          sourceLocked: true,
+          contentLocked: false,
+          writersCanShare: true,
+          copyRequiresWriterPermission: false,
+          hasPublicAccess: false,
+          targetOwnerEmail,
+          targetOwnerHasAccess: false,
+          canFixSourcePerm: false,
+          hasRefError,
+          refErrorCellCount,
+          firstJumpUrl,
+          cells: grp.cells,
+          status: 'source_inaccessible'
+        };
+        continue;
+      }
+
+      let srcMeta = null;
+      let bestSrcAccount = '';
+
+      for (const entry of tokenPool) {
+        try {
+          const meta = await driveApi(
+            entry.token,
+            `/files/${encodeURIComponent(srcId)}?supportsAllDrives=true&fields=${encodeURIComponent(META_FIELDS)}`
+          );
+          if (!meta || !meta.id) continue;
+          if ((!Array.isArray(meta.permissions) || meta.permissions.length === 0) && meta.capabilities?.canShare) {
+            try {
+              const pRes = await driveApi(
+                entry.token,
+                `/files/${encodeURIComponent(srcId)}/permissions?supportsAllDrives=true&pageSize=100&fields=permissions(id,type,role,emailAddress,domain,displayName)`
+              );
+              meta.permissions = pRes?.permissions || [];
+            } catch (_pe) {}
+          }
+          if (!srcMeta) {
+            srcMeta = meta;
+            bestSrcAccount = entry.email;
+          }
+          if (meta.ownedByMe || meta.capabilities?.canShare) {
+            srcMeta = meta;
+            bestSrcAccount = entry.email;
+            break;
+          }
+        } catch (_srcErr) {}
+      }
+
+      if (!srcMeta) {
+        dependencies[idx] = {
+          sourceSpreadsheetId: srcId,
+          rawSourceRef: grp.rawSourceRef,
+          sourceName: `未授权访问的源表 (${srcId.slice(0, 8)}…)`,
+          sourceWebViewLink: `https://docs.google.com/spreadsheets/d/${encodeURIComponent(srcId)}/edit`,
+          sourceOwnerEmail: '',
+          manageAccountEmail: '',
+          sourceLocked: true,
+          contentLocked: false,
+          writersCanShare: true,
+          copyRequiresWriterPermission: false,
+          hasPublicAccess: false,
+          targetOwnerEmail,
+          targetOwnerHasAccess: false,
+          canFixSourcePerm: false,
+          hasRefError,
+          refErrorCellCount,
+          firstJumpUrl,
+          cells: grp.cells,
+          status: 'source_inaccessible'
+        };
+        continue;
+      }
+
+      const perms = Array.isArray(srcMeta.permissions) ? srcMeta.permissions : [];
+      const hasPublicAccess = perms.some(p => p && p.type === 'anyone');
+      const contentLocked = Boolean(srcMeta.contentRestrictions?.some(r => r?.readOnly));
+      const sourceLocked = Boolean(!hasPublicAccess || contentLocked);
+      const srcOwnerEmail = normalizeEntry(srcMeta.owners?.[0]?.emailAddress || '');
+      const ownerInPerms =
+        Boolean(targetOwnerEmail) &&
+        (targetOwnerEmail === srcOwnerEmail ||
+          perms.some(p => p && p.emailAddress && normalizeEntry(p.emailAddress) === targetOwnerEmail));
+      const targetOwnerHasAccess = Boolean(hasPublicAccess || ownerInPerms);
+      const canFixSourcePerm = Boolean(srcMeta.ownedByMe || srcMeta.capabilities?.canShare);
+
+      let status = 'accessible_or_public';
+      if (!targetOwnerHasAccess) {
+        status = 'missing_source_perm';
+      } else if (hasRefError) {
+        status = 'needs_allow_click';
+      }
+
+      dependencies[idx] = {
+        sourceSpreadsheetId: srcId,
+        rawSourceRef: grp.rawSourceRef,
+        sourceName: srcMeta.name || `源表格 (${srcId.slice(0, 8)}…)`,
+        sourceWebViewLink: formatDriveCanonicalLink(srcMeta),
+        sourceOwnerEmail: srcOwnerEmail,
+        manageAccountEmail: bestSrcAccount,
+        sourceLocked,
+        contentLocked,
+        writersCanShare: srcMeta.writersCanShare !== false,
+        copyRequiresWriterPermission: Boolean(srcMeta.copyRequiresWriterPermission),
+        hasPublicAccess,
+        targetOwnerEmail,
+        targetOwnerHasAccess,
+        canFixSourcePerm,
+        hasRefError,
+        refErrorCellCount,
+        firstJumpUrl,
+        cells: grp.cells,
+        status
+      };
+    }
+  });
+
+  if (sourceGroups.length > 0) {
+    await Promise.all(workers);
+  }
+
+  const refErrorCount = formulaHits.filter(h => h.isRefError).length;
+  return {
+    target,
+    dependencies,
+    totalFormulas: formulaHits.length,
+    refErrorCount
+  };
+}
+
+/**
+ * 为汇总表所有者批量补齐被引用上游源表的 reader 只读访问权限
+ */
+async function grantImportRangeSourceAccess({ targetOwnerEmail, sourceIds = [], onProgress = null } = {}) {
+  const cleanOwner = normalizeEntry(targetOwnerEmail || '');
+  if (!cleanOwner || !cleanOwner.includes('@')) {
+    throw new Error('缺少有效的目标汇总表所有者邮箱，无法补齐源表只读权限');
+  }
+
+  const cleanSourceIds = [
+    ...new Set(
+      (Array.isArray(sourceIds) ? sourceIds : [sourceIds])
+        .map(x => parseDriveUrlOrId(x).fileId || String(x || '').trim())
+        .filter(Boolean)
+    )
+  ];
+
+  if (!cleanSourceIds.length) {
+    return { grantedCount: 0, skippedCount: 0, failedCount: 0, failedItems: [] };
+  }
+
+  const tokenPool = await buildAuthorizedTokenPool('');
+  if (!tokenPool.length) {
+    throw new Error('尚未找到可用的已授权账号令牌');
+  }
+
+  let grantedCount = 0;
+  let skippedCount = 0;
+  let failedCount = 0;
+  let cursor = 0;
+  const failedItems = [];
+  const logs = [];
+  const grantedByFileId = new Map();
+
+  const workers = Array.from({ length: Math.min(4, cleanSourceIds.length) }, async () => {
+    while (cursor < cleanSourceIds.length) {
+      const srcId = cleanSourceIds[cursor++];
+      try {
+        let manageToken = '';
+        let manageAccount = '';
+        let srcMeta = null;
+
+        for (const entry of tokenPool) {
+          try {
+            const meta = await driveApi(
+              entry.token,
+              `/files/${encodeURIComponent(srcId)}?supportsAllDrives=true&fields=id,name,mimeType,webViewLink,ownedByMe,owners(emailAddress),capabilities(canShare),permissions(id,type,role,emailAddress)`
+            );
+            if (!meta || !meta.id) continue;
+            if ((!Array.isArray(meta.permissions) || meta.permissions.length === 0) && meta.capabilities?.canShare) {
+              try {
+                const pRes = await driveApi(
+                  entry.token,
+                  `/files/${encodeURIComponent(srcId)}/permissions?supportsAllDrives=true&pageSize=100&fields=permissions(id,type,role,emailAddress)`
+                );
+                meta.permissions = pRes?.permissions || [];
+              } catch (_pe) {}
+            }
+            if (!srcMeta) {
+              srcMeta = meta;
+              manageToken = entry.token;
+              manageAccount = entry.email;
+            }
+            if (meta.ownedByMe || meta.capabilities?.canShare) {
+              srcMeta = meta;
+              manageToken = entry.token;
+              manageAccount = entry.email;
+              break;
+            }
+          } catch (_e) {}
+        }
+
+        if (!srcMeta || !manageToken) {
+          throw new Error('当前已授权账号无权读取或管理该源表');
+        }
+
+        const srcOwner = normalizeEntry(srcMeta.owners?.[0]?.emailAddress || '');
+        const existingPerms = Array.isArray(srcMeta.permissions) ? srcMeta.permissions : [];
+        const alreadyHasAccess =
+          cleanOwner === srcOwner ||
+          existingPerms.some(p => p && p.emailAddress && normalizeEntry(p.emailAddress) === cleanOwner);
+
+        if (alreadyHasAccess) {
+          skippedCount++;
+        } else {
+          const created = await createPermission(manageToken, srcId, {
+            type: 'user',
+            role: 'reader',
+            emailAddress: cleanOwner
+          });
+          grantedCount++;
+          grantedByFileId.set(srcId, {
+            id: created?.id || `ir-${Date.now()}-${Math.random()}`,
+            type: 'user',
+            role: 'reader',
+            emailAddress: cleanOwner
+          });
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'manual',
+            actionType: 'grant',
+            accountEmail: manageAccount || srcOwner,
+            fileId: srcId,
+            fileName: srcMeta.name || `源表格 (${srcId.slice(0, 8)}…)`,
+            webViewLink: formatDriveCanonicalLink(srcMeta),
+            permissionId: created?.id || '',
+            targetType: 'user',
+            targetEmail: cleanOwner,
+            targetLabel: cleanOwner,
+            previousRole: '',
+            newRole: 'reader',
+            restored: false,
+            message: `IMPORTRANGE 跨表放行：为汇总表所有者 ${cleanOwner} 补齐源表「仅查看」权限`
+          });
+        }
+      } catch (error) {
+        failedCount++;
+        failedItems.push({
+          sourceSpreadsheetId: srcId,
+          targetOwnerEmail: cleanOwner,
+          errorMessage: error?.message || String(error)
+        });
+      }
+
+      if (onProgress) {
+        const done = grantedCount + skippedCount + failedCount;
+        onProgress({
+          done,
+          total: cleanSourceIds.length,
+          grantedCount,
+          skippedCount,
+          failedCount,
+          message: `正在放行上游源表权限 ${done}/${cleanSourceIds.length}（已授权 ${grantedCount}，已具备 ${skippedCount}，失败 ${failedCount}）…`
+        });
+      }
+    }
+  });
+
+  await Promise.all(workers);
+
+  if (grantedByFileId.size > 0) {
+    try {
+      const rawSnap = await chrome.storage.local.get('scanSnapshot');
+      const snap = rawSnap?.scanSnapshot;
+      if (snap && Array.isArray(snap.files)) {
+        let touched = false;
+        for (const sf of snap.files) {
+          if (sf && grantedByFileId.has(sf.id)) {
+            sf.permissions = Array.isArray(sf.permissions) ? sf.permissions : [];
+            const newPerm = grantedByFileId.get(sf.id);
+            if (!sf.permissions.some(p => normalizeEntry(p.emailAddress || '') === cleanOwner)) {
+              sf.permissions.push(newPerm);
+              touched = true;
+            }
+          }
+        }
+        if (touched) {
+          await saveSnapshot(snap);
+        }
+      }
+    } catch (_se) {}
+  }
+
+  if (logs.length > 0) {
+    await appendAuditLogs(logs);
+  }
+
+  return {
+    grantedCount,
+    skippedCount,
+    failedCount,
+    failedItems
+  };
+}
+
+/* ==================== 3. 岗位权限包（Role Bundles：入职赋权与转岗差集切换） ==================== */
+
+function parseRoleBundleAssetsInput(rawText = '', existingFiles = [], defaultRole = 'reader') {
+  const cleanDefault = normalizePermissionRole(defaultRole, 'reader') || 'reader';
+  const fileMap = new Map();
+  for (const f of existingFiles || []) {
+    if (f && f.id) fileMap.set(f.id, f);
+  }
+
+  const lines = String(rawText || '')
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(Boolean);
+
+  const itemMap = new Map();
+  for (const line of lines) {
+    const parts = line
+      .split(/[\t,，;；|]+/)
+      .map(s => s.trim())
+      .filter(Boolean);
+    if (!parts.length) continue;
+
+    let fid = '';
+    let role = cleanDefault;
+    let customName = '';
+
+    for (const part of parts) {
+      const roleHit = normalizePermissionRole(part, '');
+      if (roleHit) {
+        role = roleHit;
+        continue;
+      }
+      if (!fid) {
+        const parsed = parseDriveUrlOrId(part);
+        if (parsed.fileId) {
+          fid = parsed.fileId;
+          continue;
+        }
+        const extracted = parseDriveLinksInput(part);
+        if (extracted.length > 0) {
+          fid = extracted[0];
+          continue;
+        }
+      } else if (!customName) {
+        customName = part;
+      }
+    }
+
+    if (!fid) continue;
+    const local = fileMap.get(fid);
+    itemMap.set(fid, {
+      fileId: fid,
+      fileName: local?.name || customName || `云盘资产 (${fid.slice(0, 8)}…)`,
+      mimeType: local?.mimeType || '',
+      webViewLink: local ? formatDriveCanonicalLink(local) : `https://drive.google.com/open?id=${encodeURIComponent(fid)}`,
+      role
+    });
+  }
+
+  return [...itemMap.values()];
+}
+
+async function getRoleBundles() {
+  const data = await chrome.storage.local.get('roleBundles');
+  return Array.isArray(data.roleBundles) ? data.roleBundles : [];
+}
+
+async function saveRoleBundles(bundles = []) {
+  const list = Array.isArray(bundles) ? bundles : [];
+  const cleaned = [];
+  const seenIds = new Set();
+  const nowIso = new Date().toISOString();
+
+  for (const b of list) {
+    if (!b || typeof b !== 'object') continue;
+    const name = String(b.name || '').trim();
+    if (!name) continue;
+    const id = String(b.id || `bundle_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`).trim();
+    if (seenIds.has(id)) continue;
+    seenIds.add(id);
+
+    const itemById = new Map();
+    for (const rawIt of b.items || []) {
+      if (!rawIt) continue;
+      const fid =
+        parseDriveUrlOrId(rawIt.fileId || rawIt.link || '').fileId || String(rawIt.fileId || '').trim();
+      if (!fid) continue;
+      const role = normalizePermissionRole(rawIt.role, 'reader') || 'reader';
+      itemById.set(fid, {
+        fileId: fid,
+        fileName: String(rawIt.fileName || rawIt.name || `云盘资产 (${fid.slice(0, 8)}…)`).trim(),
+        mimeType: String(rawIt.mimeType || ''),
+        webViewLink: String(rawIt.webViewLink || `https://drive.google.com/open?id=${encodeURIComponent(fid)}`),
+        role
+      });
+    }
+
+    cleaned.push({
+      id,
+      name,
+      description: String(b.description || '').trim(),
+      items: [...itemById.values()],
+      updatedAt: String(b.updatedAt || nowIso)
+    });
+  }
+
+  await safeStorageSet({ roleBundles: cleaned });
+  return cleaned;
+}
+
+async function runRoleBundleOperations({
+  operations = [],
+  actionSummaryPrefix = '岗位权限包',
+  expiresAt = '',
+  expireAction = 'revoke',
+  onProgress = null,
+  shouldStop = null
+} = {}) {
+  const validExpiresAt =
+    expiresAt && Number.isFinite(Date.parse(expiresAt)) ? new Date(Date.parse(expiresAt)).toISOString() : '';
+  const tokenPool = await buildAuthorizedTokenPool('');
+  if (!tokenPool.length && operations.length > 0) {
+    throw new Error('尚未找到可用的已授权账号令牌');
+  }
+
+  let snap = null;
+  const snapFileMap = new Map();
+  try {
+    const rawSnap = await chrome.storage.local.get('scanSnapshot');
+    snap = rawSnap?.scanSnapshot || null;
+    if (snap && Array.isArray(snap.files)) {
+      for (const sf of snap.files) {
+        if (sf && sf.id) snapFileMap.set(sf.id, sf);
+      }
+    }
+  } catch (_e) {}
+
+  const uniqueFileIds = [...new Set(operations.map(op => op.fileId).filter(Boolean))];
+  const fileContextMap = new Map();
+  let metaCursor = 0;
+
+  const metaWorkers = Array.from({ length: Math.min(6, Math.max(1, uniqueFileIds.length)) }, async () => {
+    while (metaCursor < uniqueFileIds.length) {
+      if (shouldStop?.()) break;
+      const fid = uniqueFileIds[metaCursor++];
+      const snapFile = snapFileMap.get(fid) || null;
+      let resolvedToken = tokenPool[0]?.token || '';
+      let resolvedAccount = tokenPool[0]?.email || '';
+      let fileName = snapFile?.name || `云盘资产 (${fid.slice(0, 8)}…)`;
+      let mimeType = snapFile?.mimeType || '';
+      let webViewLink = snapFile ? formatDriveCanonicalLink(snapFile) : `https://drive.google.com/open?id=${encodeURIComponent(fid)}`;
+      let livePermissions = Array.isArray(snapFile?.permissions) ? [...snapFile.permissions] : null;
+
+      const prefOwner = normalizeEntry(snapFile?.ownerAccount || snapFile?.owners?.[0]?.emailAddress || '');
+      const orderedPool = prefOwner
+        ? [
+            ...tokenPool.filter(x => x.email === prefOwner),
+            ...tokenPool.filter(x => x.email !== prefOwner)
+          ]
+        : tokenPool;
+
+      for (const entry of orderedPool) {
+        try {
+          const meta = await driveApi(
+            entry.token,
+            `/files/${encodeURIComponent(fid)}?supportsAllDrives=true&fields=id,name,mimeType,webViewLink,ownedByMe,owners(emailAddress),capabilities(canShare),permissions(id,type,role,emailAddress,permissionDetails(role,inherited))`
+          );
+          if (!meta || !meta.id) continue;
+          if ((!Array.isArray(meta.permissions) || meta.permissions.length === 0) && meta.capabilities?.canShare) {
+            try {
+              const pData = await driveApi(
+                entry.token,
+                `/files/${encodeURIComponent(fid)}/permissions?supportsAllDrives=true&pageSize=100&fields=permissions(id,type,role,emailAddress,permissionDetails(role,inherited))`
+              );
+              meta.permissions = pData?.permissions || [];
+            } catch (_pe) {}
+          }
+          resolvedToken = entry.token;
+          resolvedAccount = entry.email || normalizeEntry(meta.owners?.[0]?.emailAddress || '');
+          fileName = meta.name || fileName;
+          mimeType = meta.mimeType || mimeType;
+          webViewLink = formatDriveCanonicalLink(meta);
+          livePermissions = Array.isArray(meta.permissions) ? meta.permissions : livePermissions || [];
+          if (meta.ownedByMe || meta.capabilities?.canShare) break;
+        } catch (_me) {}
+      }
+
+      fileContextMap.set(fid, {
+        fileId: fid,
+        fileName,
+        mimeType,
+        webViewLink,
+        token: resolvedToken,
+        accountEmail: resolvedAccount,
+        permissions: livePermissions || [],
+        snapFile
+      });
+    }
+  });
+
+  if (uniqueFileIds.length > 0) {
+    await Promise.all(metaWorkers);
+  }
+
+  let grantedCount = 0;
+  let updatedCount = 0;
+  let revokedCount = 0;
+  let unchangedCount = 0;
+  let failedCount = 0;
+  let stopped = false;
+  let opCursor = 0;
+  const failedItems = [];
+  const ttlBatch = [];
+  const logs = [];
+  let snapTouched = false;
+
+  const workers = Array.from({ length: Math.min(4, Math.max(1, operations.length)) }, async () => {
+    while (opCursor < operations.length) {
+      if (shouldStop?.()) {
+        stopped = true;
+        break;
+      }
+      const op = operations[opCursor++];
+      const ctx = fileContextMap.get(op.fileId);
+      if (!ctx || !ctx.token) {
+        failedCount++;
+        failedItems.push({ ...op, errorMessage: '未找到可管理此文件的账号令牌' });
+        continue;
+      }
+
+      const email = normalizeEntry(op.email);
+      const existing = (ctx.permissions || []).find(p => normalizeEntry(p?.emailAddress || '') === email);
+
+      try {
+        if (op.opType === 'grant_or_adjust') {
+          const desiredRole = normalizePermissionRole(op.role, 'reader') || 'reader';
+          if (existing && existing.role === 'owner') {
+            unchangedCount++;
+          } else if (existing && !permIsInherited(existing)) {
+            if (existing.role === desiredRole && !validExpiresAt) {
+              unchangedCount++;
+            } else {
+              const prevRole = existing.role;
+              if (prevRole !== desiredRole) {
+                await updatePermissionRole(ctx.token, ctx.fileId, existing.id, desiredRole);
+                existing.role = desiredRole;
+                if (ctx.snapFile && Array.isArray(ctx.snapFile.permissions)) {
+                  const sp = ctx.snapFile.permissions.find(p => p.id === existing.id || normalizeEntry(p.emailAddress || '') === email);
+                  if (sp) {
+                    sp.role = desiredRole;
+                    snapTouched = true;
+                  }
+                }
+              }
+              if (validExpiresAt) {
+                ttlBatch.push({
+                  fileId: ctx.fileId,
+                  fileName: ctx.fileName,
+                  mimeType: ctx.mimeType,
+                  webViewLink: ctx.webViewLink,
+                  accountEmail: ctx.accountEmail,
+                  permissionId: existing.id,
+                  targetType: 'user',
+                  targetEmail: email,
+                  targetLabel: email,
+                  grantedRole: desiredRole,
+                  expireAction: expireAction || 'revoke',
+                  expiresAt: validExpiresAt,
+                  nativeExpirationApplied: false
+                });
+              }
+              updatedCount++;
+              logs.push({
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                timestamp: new Date().toISOString(),
+                source: 'manual',
+                actionType: 'downgrade',
+                isTtl: Boolean(validExpiresAt),
+                accountEmail: ctx.accountEmail,
+                fileId: ctx.fileId,
+                fileName: ctx.fileName,
+                webViewLink: ctx.webViewLink,
+                permissionId: existing.id,
+                targetType: 'user',
+                targetEmail: email,
+                targetLabel: email,
+                previousRole: prevRole,
+                newRole: desiredRole,
+                restored: false,
+                message: `${actionSummaryPrefix}：调整角色 ${roleLabel(prevRole)} -> ${roleLabel(desiredRole)}${
+                  validExpiresAt ? `（限时：${formatTtlRemaining(validExpiresAt)}）` : ''
+                }`
+              });
+            }
+          } else {
+            let created = null;
+            let nativeExpirationApplied = false;
+            if (validExpiresAt) {
+              const grantRes = await grantPermissionCoreApi(
+                ctx.token,
+                { mimeType: ctx.mimeType },
+                ctx.fileId,
+                {
+                  type: 'user',
+                  role: desiredRole,
+                  emailAddress: email,
+                  expiresAt: validExpiresAt
+                }
+              );
+              created = grantRes.createdPermission;
+              nativeExpirationApplied = grantRes.nativeExpirationApplied;
+            } else {
+              created = await createPermission(ctx.token, ctx.fileId, {
+                type: 'user',
+                role: desiredRole,
+                emailAddress: email
+              });
+            }
+            const newPermObj = {
+              id: created?.id || `bdl-${Date.now()}-${Math.random()}`,
+              type: 'user',
+              role: desiredRole,
+              emailAddress: email
+            };
+            ctx.permissions.push(newPermObj);
+            if (ctx.snapFile) {
+              ctx.snapFile.permissions = Array.isArray(ctx.snapFile.permissions) ? ctx.snapFile.permissions : [];
+              ctx.snapFile.permissions.push(newPermObj);
+              snapTouched = true;
+            }
+            if (validExpiresAt) {
+              ttlBatch.push({
+                fileId: ctx.fileId,
+                fileName: ctx.fileName,
+                mimeType: ctx.mimeType,
+                webViewLink: ctx.webViewLink,
+                accountEmail: ctx.accountEmail,
+                permissionId: created?.id || '',
+                targetType: 'user',
+                targetEmail: email,
+                targetLabel: email,
+                grantedRole: desiredRole,
+                expireAction: expireAction || 'revoke',
+                expiresAt: validExpiresAt,
+                nativeExpirationApplied
+              });
+            }
+            grantedCount++;
+            logs.push({
+              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              timestamp: new Date().toISOString(),
+              source: 'manual',
+              actionType: 'grant',
+              isTtl: Boolean(validExpiresAt),
+              accountEmail: ctx.accountEmail,
+              fileId: ctx.fileId,
+              fileName: ctx.fileName,
+              webViewLink: ctx.webViewLink,
+              permissionId: created?.id || '',
+              targetType: 'user',
+              targetEmail: email,
+              targetLabel: email,
+              previousRole: '',
+              newRole: desiredRole,
+              restored: false,
+              message: `${actionSummaryPrefix}：授予「${roleLabel(desiredRole)}」权限${
+                validExpiresAt ? `（限时：${formatTtlRemaining(validExpiresAt)}）` : ''
+              }`
+            });
+          }
+        } else if (op.opType === 'revoke') {
+          if (!existing || existing.role === 'owner' || permIsInherited(existing)) {
+            unchangedCount++;
+          } else {
+            await deletePermission(ctx.token, ctx.fileId, existing.id);
+            ctx.permissions = ctx.permissions.filter(p => p.id !== existing.id);
+            if (ctx.snapFile && Array.isArray(ctx.snapFile.permissions)) {
+              ctx.snapFile.permissions = ctx.snapFile.permissions.filter(p => p.id !== existing.id);
+              snapTouched = true;
+            }
+            revokedCount++;
+            logs.push({
+              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              timestamp: new Date().toISOString(),
+              source: 'manual',
+              actionType: 'revoke',
+              accountEmail: ctx.accountEmail,
+              fileId: ctx.fileId,
+              fileName: ctx.fileName,
+              webViewLink: ctx.webViewLink,
+              permissionId: existing.id,
+              targetType: 'user',
+              targetEmail: email,
+              targetLabel: email,
+              previousRole: existing.role,
+              newRole: '',
+              restored: false,
+              message: `${actionSummaryPrefix}：收回原岗「${roleLabel(existing.role)}」权限`
+            });
+          }
+        }
+      } catch (error) {
+        failedCount++;
+        failedItems.push({
+          ...op,
+          fileName: ctx.fileName,
+          errorMessage: error?.message || String(error)
+        });
+      }
+
+      if (onProgress) {
+        const done = grantedCount + updatedCount + revokedCount + unchangedCount + failedCount;
+        onProgress({
+          done,
+          total: operations.length,
+          grantedCount,
+          updatedCount,
+          revokedCount,
+          unchangedCount,
+          failedCount,
+          stopped,
+          message: `${actionSummaryPrefix}执行中 ${done}/${operations.length}…`
+        });
+      }
+    }
+  });
+
+  if (operations.length > 0) {
+    await Promise.all(workers);
+  }
+
+  if (ttlBatch.length > 0) {
+    await enqueueTtlPermissions(ttlBatch);
+  }
+  if (snapTouched && snap) {
+    try {
+      await saveSnapshot(snap);
+    } catch (_se) {}
+  }
+  if (logs.length > 0) {
+    await appendAuditLogs(logs);
+  }
+
+  const changedCount = grantedCount + updatedCount + revokedCount;
+  return {
+    grantedCount,
+    updatedCount,
+    revokedCount,
+    unchangedCount,
+    changedCount,
+    failedCount,
+    total: operations.length,
+    failedItems,
+    stopped
+  };
+}
+
+/**
+ * 岗位权限包：新员工入职一键赋权
+ */
+async function executeRoleBundleOnboarding({
+  bundle,
+  emails = [],
+  expiresAt = '',
+  expireAction = 'revoke',
+  onProgress = null,
+  shouldStop = null
+} = {}) {
+  const cleanEmails = parseEmailListInput(emails);
+  if (!bundle || !Array.isArray(bundle.items) || bundle.items.length === 0) {
+    throw new Error('所选岗位权限包内暂无云盘资产');
+  }
+  if (!cleanEmails.length) {
+    throw new Error('请输入至少 1 个入职人员邮箱');
+  }
+
+  const operations = [];
+  for (const item of bundle.items) {
+    if (!item?.fileId) continue;
+    for (const em of cleanEmails) {
+      operations.push({
+        opType: 'grant_or_adjust',
+        fileId: item.fileId,
+        email: em,
+        role: normalizePermissionRole(item.role, 'reader') || 'reader'
+      });
+    }
+  }
+
+  return runRoleBundleOperations({
+    operations,
+    actionSummaryPrefix: `岗位包【${bundle.name || '未命名'}】入职赋权`,
+    expiresAt,
+    expireAction,
+    onProgress,
+    shouldStop
+  });
+}
+
+/**
+ * 岗位权限包：一键转岗权限差集切换（收回旧岗独有资产 · 升降级重叠资产 · 开通新岗新增资产）
+ */
+async function executeRoleBundleTransfer({
+  fromBundle,
+  toBundle,
+  emails = [],
+  expiresAt = '',
+  expireAction = 'revoke',
+  onProgress = null,
+  shouldStop = null
+} = {}) {
+  const cleanEmails = parseEmailListInput(emails);
+  if (!fromBundle || !toBundle) {
+    throw new Error('请同时选择原岗位包与新岗位包');
+  }
+  if (fromBundle.id && toBundle.id && fromBundle.id === toBundle.id) {
+    throw new Error('原岗位包与新岗位包不能相同');
+  }
+  if (!cleanEmails.length) {
+    throw new Error('请输入至少 1 个转岗人员邮箱');
+  }
+
+  const fromMap = new Map();
+  for (const it of fromBundle.items || []) {
+    if (it?.fileId) fromMap.set(it.fileId, normalizePermissionRole(it.role, 'reader') || 'reader');
+  }
+  const toMap = new Map();
+  for (const it of toBundle.items || []) {
+    if (it?.fileId) toMap.set(it.fileId, normalizePermissionRole(it.role, 'reader') || 'reader');
+  }
+
+  const operations = [];
+  // 1. 旧岗独有资产 -> 收回权限
+  for (const oldFid of fromMap.keys()) {
+    if (!toMap.has(oldFid)) {
+      for (const em of cleanEmails) {
+        operations.push({
+          opType: 'revoke',
+          fileId: oldFid,
+          email: em,
+          role: ''
+        });
+      }
+    }
+  }
+  // 2. 重叠资产与新岗新增资产 -> 按新岗角色开通或升降级
+  for (const [newFid, newRole] of toMap.entries()) {
+    for (const em of cleanEmails) {
+      operations.push({
+        opType: 'grant_or_adjust',
+        fileId: newFid,
+        email: em,
+        role: newRole
+      });
+    }
+  }
+
+  return runRoleBundleOperations({
+    operations,
+    actionSummaryPrefix: `转岗切换【${fromBundle.name || '原岗'} -> ${toBundle.name || '新岗'}】`,
+    expiresAt,
+    expireAction,
+    onProgress,
+    shouldStop
+  });
+}
+
+/* ==================== 4. 外部合作方生命周期档案（Partner Profiles） ==================== */
+
+async function getPartnerProfiles() {
+  const data = await chrome.storage.local.get('partnerProfiles');
+  return Array.isArray(data.partnerProfiles) ? data.partnerProfiles : [];
+}
+
+async function savePartnerProfiles(profiles = []) {
+  const list = Array.isArray(profiles) ? profiles : [];
+  const cleaned = [];
+  const seenIds = new Set();
+  const nowIso = new Date().toISOString();
+
+  for (const p of list) {
+    if (!p || typeof p !== 'object') continue;
+    const name = String(p.name || '').trim();
+    if (!name) continue;
+    const id = String(p.id || `partner_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`).trim();
+    if (seenIds.has(id)) continue;
+    seenIds.add(id);
+
+    const rawDomainTokens = Array.isArray(p.domains)
+      ? p.domains.join('\n')
+      : String(p.domains || '');
+    const rawEmailTokens = Array.isArray(p.emails)
+      ? p.emails.join('\n')
+      : String(p.emails || '');
+
+    const domainsSet = new Set();
+    const emailsSet = new Set(parseEmailListInput(rawEmailTokens));
+
+    for (const token of rawDomainTokens.split(/[\r\n\s,，;；]+/).map(s => s.trim()).filter(Boolean)) {
+      if (token.includes('@') && !token.startsWith('@')) {
+        const parsedEm = parseEmailListInput(token);
+        for (const em of parsedEm) emailsSet.add(em);
+      } else {
+        const cleanDom = token.toLowerCase().replace(/^@+/, '').trim();
+        if (cleanDom && cleanDom.includes('.')) {
+          domainsSet.add(cleanDom);
+        }
+      }
+    }
+
+    let cleanExpiresAt = '';
+    if (p.expiresAt) {
+      const rawExp = String(p.expiresAt).trim();
+      if (/^\d{4}-\d{2}-\d{2}$/.test(rawExp)) {
+        cleanExpiresAt = `${rawExp}T23:59:59.999Z`;
+      } else if (Number.isFinite(Date.parse(rawExp))) {
+        cleanExpiresAt = new Date(Date.parse(rawExp)).toISOString();
+      }
+    }
+
+    cleaned.push({
+      id,
+      name,
+      domains: [...domainsSet],
+      emails: [...emailsSet],
+      expiresAt: cleanExpiresAt,
+      note: String(p.note || '').trim(),
+      updatedAt: String(p.updatedAt || nowIso)
+    });
+  }
+
+  await safeStorageSet({ partnerProfiles: cleaned });
+  return cleaned;
+}
+
+/**
+ * 匹配外部合作方档案关联的云盘文件、命中邮箱及合同到期状态
+ */
+function matchFilesForPartner(files = [], partner = {}, nowMs = Date.now()) {
+  const domainSet = new Set(
+    (partner?.domains || [])
+      .map(d => String(d || '').trim().toLowerCase().replace(/^@+/, ''))
+      .filter(Boolean)
+  );
+  const emailSet = new Set((partner?.emails || []).map(normalizeEntry).filter(Boolean));
+
+  const matchedFiles = [];
+  const matchedEmailSet = new Set();
+
+  for (const file of files || []) {
+    if (!file || !file.id) continue;
+    const ownerEmail = normalizeEntry(file.ownerAccount || file.owners?.[0]?.emailAddress || '');
+    let fileHit = false;
+
+    for (const perm of file.permissions || []) {
+      if (!perm || perm.role === 'owner') continue;
+      if (perm.emailAddress) {
+        const em = normalizeEntry(perm.emailAddress);
+        if (em && em !== ownerEmail) {
+          const dom = extractEmailDomain(em);
+          if (emailSet.has(em) || (dom && domainSet.has(dom))) {
+            fileHit = true;
+            matchedEmailSet.add(em);
+          }
+        }
+      } else if (perm.type === 'domain' && perm.domain) {
+        const pDom = String(perm.domain).trim().toLowerCase();
+        if (domainSet.has(pDom)) {
+          fileHit = true;
+        }
+      }
+    }
+
+    if (fileHit) {
+      matchedFiles.push(file);
+    }
+  }
+
+  let daysRemaining = null;
+  let isExpired = false;
+  let isExpiringSoon = false;
+
+  if (partner?.expiresAt && Number.isFinite(Date.parse(partner.expiresAt))) {
+    const diffMs = Date.parse(partner.expiresAt) - nowMs;
+    daysRemaining = Math.ceil(diffMs / 86400000);
+    isExpired = diffMs <= 0;
+    isExpiringSoon = !isExpired && daysRemaining <= 7;
+  }
+
+  return {
+    files: matchedFiles,
+    matchedEmails: [...matchedEmailSet],
+    daysRemaining,
+    isExpired,
+    isExpiringSoon
+  };
+}
+
+/* ==================== 5. 沉睡编辑权雷达（Dormant Permissions） ==================== */
+
+/**
+ * 扫描超过指定天数未发生修改/访问却仍持有编辑权的非所有者直接权限项
+ */
+function findDormantEditorEntries(files = [], { inactiveDays = 90, nowMs = Date.now() } = {}) {
+  const thresholdDays = Math.max(1, Number(inactiveDays) || 90);
+  const cutoffMs = nowMs - thresholdDays * 86400000;
+  const entries = [];
+
+  for (const file of files || []) {
+    if (!file || !file.id) continue;
+    const modMs = file.modifiedTime ? Date.parse(file.modifiedTime) : NaN;
+    const viewMs = file.viewedByMeTime ? Date.parse(file.viewedByMeTime) : NaN;
+    const createdMs = file.createdTime ? Date.parse(file.createdTime) : NaN;
+    const lastActiveMs = Number.isFinite(modMs)
+      ? modMs
+      : Number.isFinite(viewMs)
+        ? viewMs
+        : createdMs;
+
+    if (!Number.isFinite(lastActiveMs) || lastActiveMs > cutoffMs) continue;
+
+    const dormantDays = Math.max(thresholdDays, Math.floor((nowMs - lastActiveMs) / 86400000));
+    const ownerEmail = normalizeEntry(file.ownerAccount || file.owners?.[0]?.emailAddress || '');
+
+    for (const perm of file.permissions || []) {
+      if (!perm || !perm.id || perm.role === 'owner') continue;
+      if (permIsInherited(perm)) continue;
+      if (!['writer', 'organizer', 'fileOrganizer'].includes(perm.role)) continue;
+      const pEmail = normalizeEntry(perm.emailAddress || '');
+      if (pEmail && pEmail === ownerEmail) continue;
+
+      entries.push({
+        id: `${file.id}::${perm.id}`,
+        fileId: file.id,
+        fileName: file.name || '(无名称)',
+        mimeType: file.mimeType || '',
+        webViewLink: formatDriveCanonicalLink(file),
+        accountEmail: ownerEmail,
+        permissionId: perm.id,
+        targetType: perm.type || 'user',
+        targetEmail: pEmail,
+        domain: perm.domain || '',
+        targetLabel: permissionLabel(perm),
+        currentRole: perm.role,
+        modifiedTime: file.modifiedTime || '',
+        viewedByMeTime: file.viewedByMeTime || '',
+        dormantDays
+      });
+    }
+  }
+
+  entries.sort((a, b) => b.dormantDays - a.dormantDays);
+  return entries;
+}
+
+/**
+ * 对沉睡编辑权条目批量降级为只读/评论或直接收回权限
+ */
+async function downgradeOrRevokeDormantEntries({
+  entries = [],
+  mode = 'downgrade_reader',
+  files = null,
+  onProgress = null,
+  shouldStop = null
+} = {}) {
+  const validEntries = (Array.isArray(entries) ? entries : []).filter(e => e && e.fileId && e.permissionId);
+  const isRevoke = mode === 'revoke' || mode === 'remove' || mode === 'delete';
+  const targetRole = mode === 'downgrade_commenter' || mode === 'commenter' ? 'commenter' : 'reader';
+
+  const localMap = new Map();
+  if (Array.isArray(files)) {
+    for (const f of files) {
+      if (f && f.id) localMap.set(f.id, f);
+    }
+  }
+
+  let snap = null;
+  const snapMap = new Map();
+  try {
+    const rawSnap = await chrome.storage.local.get('scanSnapshot');
+    snap = rawSnap?.scanSnapshot || null;
+    if (snap && Array.isArray(snap.files)) {
+      for (const sf of snap.files) {
+        if (sf && sf.id) snapMap.set(sf.id, sf);
+      }
+    }
+  } catch (_e) {}
+
+  const tokenCache = new Map();
+  async function getToken(accEmail) {
+    const norm = normalizeEntry(accEmail || '');
+    if (tokenCache.has(norm)) return tokenCache.get(norm);
+    const tk = await getValidTokenForAccount(norm, true);
+    tokenCache.set(norm, tk);
+    return tk;
+  }
+
+  let downgradedCount = 0;
+  let revokedCount = 0;
+  let failedCount = 0;
+  let stopped = false;
+  let cursor = 0;
+  let snapTouched = false;
+  const failedItems = [];
+  const logs = [];
+
+  const workers = Array.from({ length: Math.min(4, Math.max(1, validEntries.length)) }, async () => {
+    while (cursor < validEntries.length) {
+      if (shouldStop?.()) {
+        stopped = true;
+        break;
+      }
+      const entry = validEntries[cursor++];
+      try {
+        const token = await getToken(entry.accountEmail);
+        if (isRevoke) {
+          await deletePermission(token, entry.fileId, entry.permissionId);
+          for (const targetFile of [localMap.get(entry.fileId), snapMap.get(entry.fileId)]) {
+            if (targetFile && Array.isArray(targetFile.permissions)) {
+              targetFile.permissions = targetFile.permissions.filter(p => p.id !== entry.permissionId);
+              if (targetFile === snapMap.get(entry.fileId)) snapTouched = true;
+            }
+          }
+          revokedCount++;
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'manual',
+            actionType: 'revoke',
+            accountEmail: entry.accountEmail || '',
+            fileId: entry.fileId,
+            fileName: entry.fileName || '(无名称)',
+            webViewLink: entry.webViewLink || '',
+            permissionId: entry.permissionId,
+            targetType: entry.targetType || 'user',
+            targetEmail: entry.targetEmail || '',
+            domain: entry.domain || '',
+            targetLabel: entry.targetLabel || entry.targetEmail || '',
+            previousRole: entry.currentRole || 'writer',
+            newRole: '',
+            restored: false,
+            message: `沉睡编辑权瘦身（闲置 ${entry.dormantDays || 90} 天）：已移除权限`
+          });
+        } else {
+          await updatePermissionRole(token, entry.fileId, entry.permissionId, targetRole);
+          for (const targetFile of [localMap.get(entry.fileId), snapMap.get(entry.fileId)]) {
+            if (targetFile && Array.isArray(targetFile.permissions)) {
+              const hit = targetFile.permissions.find(p => p.id === entry.permissionId);
+              if (hit) {
+                hit.role = targetRole;
+                if (targetFile === snapMap.get(entry.fileId)) snapTouched = true;
+              }
+            }
+          }
+          downgradedCount++;
+          logs.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            source: 'manual',
+            actionType: 'downgrade',
+            accountEmail: entry.accountEmail || '',
+            fileId: entry.fileId,
+            fileName: entry.fileName || '(无名称)',
+            webViewLink: entry.webViewLink || '',
+            permissionId: entry.permissionId,
+            targetType: entry.targetType || 'user',
+            targetEmail: entry.targetEmail || '',
+            domain: entry.domain || '',
+            targetLabel: entry.targetLabel || entry.targetEmail || '',
+            previousRole: entry.currentRole || 'writer',
+            newRole: targetRole,
+            restored: false,
+            message: `沉睡编辑权瘦身（闲置 ${entry.dormantDays || 90} 天）：${roleLabel(
+              entry.currentRole || 'writer'
+            )} -> ${roleLabel(targetRole)}`
+          });
+        }
+      } catch (error) {
+        failedCount++;
+        failedItems.push({
+          ...entry,
+          errorMessage: error?.message || String(error)
+        });
+      }
+
+      if (onProgress) {
+        const done = downgradedCount + revokedCount + failedCount;
+        onProgress({
+          done,
+          total: validEntries.length,
+          changedCount: downgradedCount + revokedCount,
+          downgradedCount,
+          revokedCount,
+          failedCount,
+          stopped,
+          message: `正在处理沉睡编辑权 ${done}/${validEntries.length}…`
+        });
+      }
+    }
+  });
+
+  if (validEntries.length > 0) {
+    await Promise.all(workers);
+  }
+
+  if (snapTouched && snap) {
+    try {
+      await saveSnapshot(snap);
+    } catch (_se) {}
+  }
+
+  if (logs.length > 0) {
+    await appendAuditLogs(logs);
+  }
+
+  return {
+    changedCount: downgradedCount + revokedCount,
+    downgradedCount,
+    revokedCount,
+    failedCount,
+    total: validEntries.length,
+    failedItems,
+    stopped
+  };
+}
+
+/* ==================== 6. 目录树权限分叉构建器（Folder Tree Topology） ==================== */
+
+/**
+ * 基于 parents 构建云盘资产目录树，精准识别子项相对父目录的权限分叉 (diverged)
+ * 并统计每个父目录下与父目录权限完全一致的子项数 uniformChildCount
+ */
+function buildFolderPermissionTree(files = [], policy = DEFAULT_POLICY, accountEmail = '') {
+  const validFiles = (Array.isArray(files) ? files : []).filter(f => f && f.id);
+  const excludedSet =
+    policy?.excludedFolders?.length > 0
+      ? buildExcludedFileIdSet(validFiles, policy.excludedFolders)
+      : null;
+  const nodeMap = new Map();
+  const breakageMap = analyzeInheritanceBreakage(validFiles);
+
+  for (const file of validFiles) {
+    const isFolder = file.mimeType === 'application/vnd.google-apps.folder';
+    const ownerEmail = file.ownerAccount || file.owners?.[0]?.emailAddress || accountEmail || '';
+    const evaluation = evaluateFile(file, policy, ownerEmail, excludedSet);
+    const fingerprint = buildFilePermissionFingerprint(file);
+    const rawParentId = Array.isArray(file.parents) && file.parents[0] ? String(file.parents[0]) : '';
+
+    nodeMap.set(file.id, {
+      id: file.id,
+      file,
+      name: file.name || '(无名称)',
+      mimeType: file.mimeType || '',
+      isFolder,
+      rawParentId,
+      parentId: '',
+      depth: 0,
+      path: file.name || '(无名称)',
+      fingerprint,
+      evaluation,
+      breakage: breakageMap.get(file.id) || null,
+      diverged: false,
+      divergenceReason: '',
+      hasDescendantDivergence: false,
+      securityFlags: {
+        writersCanShare: file.writersCanShare !== false,
+        copyRequiresWriterPermission: Boolean(file.copyRequiresWriterPermission),
+        contentLocked: Boolean(file.contentLocked || file.contentRestrictions?.some(r => r?.readOnly)),
+        unhardened: Boolean(
+          (file.shared || evaluation.hasNonOwner) &&
+            (file.writersCanShare !== false || (!isFolder && !file.copyRequiresWriterPermission))
+        )
+      },
+      children: [],
+      divergedChildren: [],
+      uniformChildren: [],
+      uniformChildCount: 0,
+      divergedChildCount: 0,
+      totalChildCount: 0
+    });
+  }
+
+  // 建立防环父子挂载关系
+  const roots = [];
+  for (const node of nodeMap.values()) {
+    let pId = node.rawParentId;
+    if (pId && pId !== node.id && nodeMap.has(pId)) {
+      // 检测潜在环路
+      const visited = new Set([node.id]);
+      let cur = pId;
+      let hasCycle = false;
+      while (cur && nodeMap.has(cur)) {
+        if (visited.has(cur)) {
+          hasCycle = true;
+          break;
+        }
+        visited.add(cur);
+        cur = nodeMap.get(cur).rawParentId;
+      }
+      if (!hasCycle) {
+        node.parentId = pId;
+        nodeMap.get(pId).children.push(node);
+        continue;
+      }
+    }
+    roots.push(node);
+  }
+
+  let divergedCount = 0;
+  let uniformCount = 0;
+
+  // 自顶向下计算深度、路径与相对父目录的权限分叉状态
+  function traverseTopDown(node, parentNode, depth, ancestorPath) {
+    node.depth = depth;
+    node.path = ancestorPath ? `${ancestorPath} / ${node.name}` : node.name;
+
+    if (parentNode) {
+      const parentSig = parentNode.fingerprint?.sig ?? '';
+      const childSig = node.fingerprint?.sig ?? '';
+      if (node.breakage?.broken) {
+        node.diverged = true;
+        node.divergenceReason = node.breakage.summaryText || '子项存在超出父目录的单独权限';
+      } else if (parentNode.fingerprint && node.fingerprint && parentSig !== childSig) {
+        node.diverged = true;
+        const diff = computeFilePermissionDiff(parentNode.fingerprint, node.fingerprint);
+        node.divergenceReason = diff?.summaryText || '子项共享权限与父文件夹不一致';
+      } else {
+        node.diverged = false;
+        node.divergenceReason = '';
+      }
+    } else if (node.breakage?.broken) {
+      node.diverged = true;
+      node.divergenceReason = node.breakage.summaryText || '存在超出继承链的单独权限';
+    }
+
+    if (node.diverged) {
+      divergedCount++;
+    } else if (parentNode) {
+      uniformCount++;
+    }
+
+    for (const child of node.children) {
+      traverseTopDown(child, node, depth + 1, node.path);
+    }
+  }
+
+  for (const root of roots) {
+    traverseTopDown(root, null, 0, '');
+  }
+
+  const hasNodeViolation = n =>
+    Boolean(n?.evaluation?.hasActionableViolation || n?.evaluation?.status === 'violation');
+
+  const sortTreeNodes = (a, b) => {
+    if (a.isFolder !== b.isFolder) return a.isFolder ? -1 : 1;
+    const aImportant = a.diverged || a.hasDescendantDivergence || hasNodeViolation(a) ? 1 : 0;
+    const bImportant = b.diverged || b.hasDescendantDivergence || hasNodeViolation(b) ? 1 : 0;
+    if (aImportant !== bImportant) return bImportant - aImportant;
+    return String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN');
+  };
+
+  // 自底向上汇总子目录分叉状态与一致子项统计
+  function summarizeBottomUp(node) {
+    let anyDescendantDiverged = false;
+    for (const child of node.children) {
+      const childHasIssue = summarizeBottomUp(child);
+      if (childHasIssue) anyDescendantDiverged = true;
+    }
+
+    node.children.sort(sortTreeNodes);
+    node.divergedChildren = node.children.filter(
+      ch => ch.diverged || ch.hasDescendantDivergence || hasNodeViolation(ch)
+    );
+    node.uniformChildren = node.children.filter(
+      ch => !ch.diverged && !ch.hasDescendantDivergence && !hasNodeViolation(ch)
+    );
+    node.uniformChildCount = node.children.filter(ch => !ch.diverged).length;
+    node.divergedChildCount = node.children.filter(ch => ch.diverged).length;
+    node.totalChildCount = node.children.length;
+    node.hasDescendantDivergence = anyDescendantDiverged;
+
+    return Boolean(node.diverged || anyDescendantDiverged || hasNodeViolation(node));
+  }
+
+  for (const root of roots) {
+    summarizeBottomUp(root);
+  }
+  roots.sort(sortTreeNodes);
+
+  const flatNodes = [];
+  function collectFlat(node) {
+    flatNodes.push(node);
+    for (const child of node.children) {
+      collectFlat(child);
+    }
+  }
+  for (const root of roots) {
+    collectFlat(root);
+  }
+
+  Object.defineProperties(roots, {
+    roots: { value: roots, enumerable: false },
+    nodes: { value: roots, enumerable: false },
+    flatNodes: { value: flatNodes, enumerable: false },
+    nodeMap: { value: nodeMap, enumerable: false },
+    totalCount: { value: validFiles.length, enumerable: false },
+    divergedCount: { value: divergedCount, enumerable: false },
+    uniformCount: { value: uniformCount, enumerable: false }
+  });
+
+  return roots;
+}
+
+
+// ============================================================================
+// v1.1.0：IMPORTRANGE 多账号极速批授权 (A->B)、公式防卡顿开关与分组批量增删/资产绑定引擎
+// ============================================================================
+
+const IMPORTRANGE_BATCH_SUCCESS_MARK = '✅ 已授权(A->B)';
+
+function extractSpreadsheetIdStrictOrUrl(rawVal = '') {
+  if (rawVal === null || rawVal === undefined) return '';
+  const str = String(rawVal).trim();
+  if (!str || str.toLowerCase() === 'nan') return '';
+  const dMatch = str.match(/\/spreadsheets\/(?:u\/\d+\/)?d\/([a-zA-Z0-9_-]{10,})/);
+  if (dMatch) return dMatch[1];
+  const genericD = str.match(/\/d\/([a-zA-Z0-9_-]{10,})/);
+  if (genericD) return genericD[1];
+  const idParam = str.match(/[?&](?:id|key)=([a-zA-Z0-9_-]{10,})/);
+  if (idParam) return idParam[1];
+  if (/^[a-zA-Z0-9_-]{15,90}$/.test(str) && !str.includes('@') && !str.includes('!')) {
+    return str;
+  }
+  return '';
+}
+
+/**
+ * 一键暂停或恢复目标汇总表内的全部 IMPORTRANGE 公式重算（防批量授权期间卡顿）
+ * - pause = true : IMPORTRANGE( -> IMPORTRANGE_OFF(
+ * - pause = false: IMPORTRANGE_OFF( -> IMPORTRANGE(
+ */
+async function toggleTargetSheetImportRangeFormulas(targetId, { pause = true, accountEmail = '' } = {}) {
+  const cleanTargetId =
+    extractSpreadsheetIdStrictOrUrl(targetId) ||
+    parseDriveUrlOrId(targetId).fileId ||
+    extractDriveFileId(targetId);
+
+  if (!cleanTargetId) {
+    return {
+      ok: false,
+      targetId: '',
+      formulasChanged: 0,
+      status: 0,
+      error: '无效的目标 Google 表格链接或文件 ID'
+    };
+  }
+
+  const tokenPool = await buildAuthorizedTokenPool(accountEmail);
+  if (!tokenPool.length) {
+    return {
+      ok: false,
+      targetId: cleanTargetId,
+      formulasChanged: 0,
+      status: 0,
+      error: '尚未找到可用的已授权账号令牌'
+    };
+  }
+
+  const findStr = pause ? 'IMPORTRANGE(' : 'IMPORTRANGE_OFF(';
+  const replStr = pause ? 'IMPORTRANGE_OFF(' : 'IMPORTRANGE(';
+  const endpoint = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(cleanTargetId)}:batchUpdate`;
+  const bodyJson = JSON.stringify({
+    requests: [
+      {
+        findReplace: {
+          find: findStr,
+          replacement: replStr,
+          matchCase: false,
+          includeFormulas: true,
+          allSheets: true
+        }
+      }
+    ]
+  });
+
+  let lastStatus = 0;
+  let lastError = '未能修改目标表公式状态';
+
+  for (const entry of tokenPool) {
+    let activeToken = entry.token;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const resp = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${activeToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: bodyJson
+        });
+        lastStatus = resp.status;
+
+        if (resp.status === 200) {
+          let parsed = {};
+          try {
+            parsed = await resp.json();
+          } catch (_je) {}
+          const formulasChanged = Number(parsed?.replies?.[0]?.findReplace?.formulasChanged || 0);
+          return {
+            ok: true,
+            targetId: cleanTargetId,
+            formulasChanged,
+            status: 200,
+            error: ''
+          };
+        }
+
+        if (resp.status === 401 && attempt === 0 && entry.email) {
+          try {
+            const refreshed = await getValidTokenForAccount(entry.email, false, true);
+            if (refreshed) {
+              activeToken = refreshed;
+              entry.token = refreshed;
+              continue;
+            }
+          } catch (_re) {}
+        }
+
+        let errText = '';
+        try {
+          errText = await resp.text();
+        } catch (_te) {}
+
+        if (
+          resp.status === 403 &&
+          /ACCESS_TOKEN_SCOPE_INSUFFICIENT|insufficient authentication scopes|scope/i.test(errText)
+        ) {
+          lastError =
+            '当前账号令牌尚未包含 Google Sheets 公式编辑权限（不影响跨表授权；如需使用暂停/恢复公式功能，请在账号设置中重新授权一次该账号）';
+        } else {
+          try {
+            const errObj = JSON.parse(errText);
+            lastError = errObj?.error?.message || `Sheets API 返回状态码 ${resp.status}`;
+          } catch (_pe) {
+            lastError = `Sheets API 返回状态码 ${resp.status}`;
+          }
+        }
+        break;
+      } catch (err) {
+        lastError = err?.message || String(err);
+        break;
+      }
+    }
+  }
+
+  return {
+    ok: false,
+    targetId: cleanTargetId,
+    formulasChanged: 0,
+    status: lastStatus,
+    error: lastError
+  };
+}
+
+/**
+ * 解析 .xlsx / .csv / .tsv / .txt 中的 IMPORTRANGE 授权任务对（A列来源表 -> B列目标表 -> C列状态）
+ * 支持 B 列为空时自动继承首行有效目标表 ID（多对一 & 多对多自适应）
+ */
+async function parseImportRangePairsFromFile(arrayBufferOrText, fileName = '') {
+  let rawRows = [];
+
+  const isBinaryBuffer =
+    arrayBufferOrText instanceof ArrayBuffer ||
+    arrayBufferOrText instanceof Uint8Array ||
+    (arrayBufferOrText && arrayBufferOrText.buffer instanceof ArrayBuffer);
+
+  let treatAsXlsx = false;
+  let bytes = null;
+  if (isBinaryBuffer) {
+    if (arrayBufferOrText instanceof Uint8Array) {
+      bytes = arrayBufferOrText;
+    } else if (arrayBufferOrText instanceof ArrayBuffer) {
+      bytes = new Uint8Array(arrayBufferOrText);
+    } else {
+      bytes = new Uint8Array(
+        arrayBufferOrText.buffer,
+        arrayBufferOrText.byteOffset || 0,
+        arrayBufferOrText.byteLength
+      );
+    }
+    if (bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b) {
+      treatAsXlsx = true;
+    } else if (/\.xlsx$/i.test(String(fileName || ''))) {
+      treatAsXlsx = true;
+    }
+  }
+
+  if (treatAsXlsx && bytes) {
+    const entries = readZipCentralDirectory(bytes);
+    const sharedStrings = [];
+    const sstEntry = entries.get('xl/sharedStrings.xml');
+    if (sstEntry) {
+      const sstXml = await decompressZipEntryText(sstEntry.compressedBytes, sstEntry.method);
+      const siRe = /<si\b[^>]*>([\s\S]*?)<\/si>/gi;
+      let sim;
+      while ((sim = siRe.exec(sstXml)) !== null) {
+        const siInner = sim[1] || '';
+        const tRe = /<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/gi;
+        let tm;
+        let parts = '';
+        while ((tm = tRe.exec(siInner)) !== null) {
+          parts += decodeXmlEntities(tm[1] || '');
+        }
+        sharedStrings.push(parts);
+      }
+    }
+
+    let firstSheetPath = 'xl/worksheets/sheet1.xml';
+    const relsMap = new Map();
+    const relsEntry = entries.get('xl/_rels/workbook.xml.rels');
+    if (relsEntry) {
+      const relsXml = await decompressZipEntryText(relsEntry.compressedBytes, relsEntry.method);
+      const relRe = /<Relationship\b([^>]*?)\/?>/gi;
+      let rm;
+      while ((rm = relRe.exec(relsXml)) !== null) {
+        const attrs = rm[1] || '';
+        const rId = getXmlAttr(attrs, 'Id');
+        let target = getXmlAttr(attrs, 'Target');
+        if (rId && target) {
+          target = target.replace(/\\/g, '/');
+          if (target.startsWith('/')) {
+            target = target.replace(/^\/+/, '');
+          } else if (!target.startsWith('xl/')) {
+            target = `xl/${target.replace(/^\.\//, '')}`;
+          }
+          relsMap.set(rId, target);
+        }
+      }
+    }
+
+    const wbEntry = entries.get('xl/workbook.xml');
+    if (wbEntry) {
+      const wbXml = await decompressZipEntryText(wbEntry.compressedBytes, wbEntry.method);
+      const sheetMatch = wbXml.match(/<sheet\b([^>]*?)\/?>/i);
+      if (sheetMatch) {
+        const relId = getXmlAttr(sheetMatch[1] || '', 'r:id') || getXmlAttr(sheetMatch[1] || '', 'id');
+        if (relId && relsMap.has(relId)) {
+          firstSheetPath = relsMap.get(relId);
+        }
+      }
+    }
+    if (!entries.has(firstSheetPath)) {
+      for (const k of entries.keys()) {
+        if (/^xl\/worksheets\/sheet\d+\.xml$/i.test(k)) {
+          firstSheetPath = k;
+          break;
+        }
+      }
+    }
+
+    const wsEntry = entries.get(firstSheetPath);
+    if (wsEntry) {
+      const wsXml = await decompressZipEntryText(wsEntry.compressedBytes, wsEntry.method);
+      const rowRe = /<row\b[^>]*>([\s\S]*?)<\/row>/gi;
+      let rowMatch;
+      while ((rowMatch = rowRe.exec(wsXml)) !== null) {
+        const rowInner = rowMatch[1] || '';
+        const cols = ['', '', ''];
+        let seqCol = 0;
+        const cRe = /<c\b([^>]*?)(?:>([\s\S]*?)<\/c>|\/>)/gi;
+        let cm;
+        while ((cm = cRe.exec(rowInner)) !== null) {
+          const cAttrs = cm[1] || '';
+          const cInner = cm[2] || '';
+          const rAttr = getXmlAttr(cAttrs, 'r');
+          let colIdx = seqCol;
+          if (rAttr) {
+            const lettersMatch = rAttr.match(/^[A-Za-z]+/);
+            if (lettersMatch) {
+              const letters = lettersMatch[0].toUpperCase();
+              let n = 0;
+              for (let i = 0; i < letters.length; i++) {
+                n = n * 26 + (letters.charCodeAt(i) - 64);
+              }
+              colIdx = n - 1;
+            }
+          }
+          seqCol = colIdx + 1;
+          if (colIdx < 0 || colIdx > 2) continue;
+
+          const cType = getXmlAttr(cAttrs, 't');
+          let valText = '';
+          if (cType === 's') {
+            const vm = cInner.match(/<v(?:\s[^>]*)?>([\s\S]*?)<\/v>/i);
+            const sIdx = vm ? parseInt(String(vm[1] || '').trim(), 10) : NaN;
+            if (Number.isInteger(sIdx) && sIdx >= 0 && sIdx < sharedStrings.length) {
+              valText = sharedStrings[sIdx];
+            }
+          } else if (cType === 'inlineStr') {
+            const isMatch = cInner.match(/<is\b[^>]*>([\s\S]*?)<\/is>/i);
+            const scopeXml = isMatch ? isMatch[1] : cInner;
+            const tRe = /<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/gi;
+            let tm;
+            while ((tm = tRe.exec(scopeXml)) !== null) {
+              valText += decodeXmlEntities(tm[1] || '');
+            }
+          } else {
+            const vm = cInner.match(/<v(?:\s[^>]*)?>([\s\S]*?)<\/v>/i);
+            if (vm) {
+              valText = decodeXmlEntities(vm[1] || '');
+            }
+          }
+          cols[colIdx] = String(valText || '').trim();
+        }
+        if (cols[0] || cols[1] || cols[2]) {
+          rawRows.push(cols);
+        }
+      }
+    }
+  } else {
+    const rawText = isBinaryBuffer
+      ? new TextDecoder('utf-8').decode(bytes)
+      : String(arrayBufferOrText || '');
+    const cleanText = rawText.replace(/^\uFEFF/, '');
+    const lines = cleanText.split(/\r?\n/);
+    for (const line of lines) {
+      if (!line || !line.trim()) continue;
+      const cells = splitTabularRowCells(line);
+      if (cells[0] || cells[1] || cells[2]) {
+        rawRows.push([cells[0] || '', cells[1] || '', cells[2] || '']);
+      }
+    }
+  }
+
+  const parsedPairs = [];
+  let defaultTargetId = '';
+  let defaultTargetInput = '';
+
+  for (let i = 0; i < rawRows.length; i++) {
+    const [colA, colB, colC] = rawRows[i];
+    const dId = extractSpreadsheetIdStrictOrUrl(colA);
+    const tId = extractSpreadsheetIdStrictOrUrl(colB);
+
+    // 若首行 A/B 均非有效表格链接/ID，则视为表头自动跳过
+    if (i === 0 && !dId && !tId) {
+      continue;
+    }
+
+    if (tId && !defaultTargetId) {
+      defaultTargetId = tId;
+      defaultTargetInput = colB.trim();
+    }
+
+    const resolvedTargetId = tId || defaultTargetId;
+    const resolvedTargetInput = colB.trim() || (resolvedTargetId ? defaultTargetInput : '');
+
+    if (!colA.trim() && !colB.trim()) continue;
+
+    parsedPairs.push({
+      donorInput: colA.trim(),
+      targetInput: resolvedTargetInput,
+      donorId: dId,
+      targetId: resolvedTargetId,
+      status: String(colC || '').trim()
+    });
+  }
+
+  return parsedPairs;
+}
+
+/**
+ * IMPORTRANGE A列(来源表) -> B列(目标表) 多账号轮询极速批量授权引擎
+ * 支持多对一（B列留空继承首行）、多对多、自动暂停/恢复公式、限流冷却、401自动续期及 302/403 自动补齐源表只读权限重试
+ */
+async function executeBatchImportRangeAuth({
+  pairs = [],
+  autoPauseFormulas = true,
+  concurrency = 6,
+  ensureDonorReader = true,
+  onProgress = null,
+  onRowUpdate = null,
+  shouldStop = null
+} = {}) {
+  const inputList = Array.isArray(pairs) ? pairs : [];
+  let defaultTargetId = '';
+  for (const raw of inputList) {
+    if (!raw) continue;
+    const rawTarget = Array.isArray(raw) ? raw[1] : raw.targetId || raw.targetInput || raw.target || '';
+    const tid = extractSpreadsheetIdStrictOrUrl(rawTarget) || resolveSpreadsheetIdFromRef(rawTarget);
+    if (tid) {
+      defaultTargetId = tid;
+      break;
+    }
+  }
+
+  const tasks = [];
+  const uniqueTargets = new Set();
+
+  for (let idx = 0; idx < inputList.length; idx++) {
+    const raw = inputList[idx];
+    if (!raw) continue;
+    const isArr = Array.isArray(raw);
+    const rowIndex = !isArr && Number.isInteger(raw.rowIndex)
+      ? raw.rowIndex
+      : !isArr && Number.isInteger(raw.rowIdx)
+        ? raw.rowIdx
+        : idx;
+    const donorInput = String(isArr ? raw[0] || '' : raw.donorInput || raw.donorId || raw.sourceId || '').trim();
+    const targetInput = String(isArr ? raw[1] || '' : raw.targetInput || raw.targetId || '').trim();
+    const curStatus = String(isArr ? raw[2] || '' : raw.status || '').trim();
+
+    const donorId =
+      (!isArr && raw.donorId ? extractSpreadsheetIdStrictOrUrl(raw.donorId) || String(raw.donorId).trim() : '') ||
+      extractSpreadsheetIdStrictOrUrl(donorInput) ||
+      resolveSpreadsheetIdFromRef(donorInput);
+    const explicitTargetId =
+      (!isArr && raw.targetId ? extractSpreadsheetIdStrictOrUrl(raw.targetId) || String(raw.targetId).trim() : '') ||
+      extractSpreadsheetIdStrictOrUrl(targetInput) ||
+      resolveSpreadsheetIdFromRef(targetInput);
+    const targetId = explicitTargetId || defaultTargetId;
+
+    if (!donorId || !targetId) continue;
+    if (curStatus === IMPORTRANGE_BATCH_SUCCESS_MARK) continue;
+
+    tasks.push({
+      rowIndex,
+      donorId,
+      targetId,
+      donorInput: donorInput || donorId,
+      targetInput: targetInput || targetId
+    });
+    uniqueTargets.add(targetId);
+  }
+
+  if (tasks.length === 0) {
+    return {
+      total: 0,
+      successCount: 0,
+      failedCount: 0,
+      stopped: false,
+      failedPairs: [],
+      pausedTargetsCount: 0
+    };
+  }
+
+  const basePool = await buildAuthorizedTokenPool('');
+  if (!basePool.length) {
+    throw new Error('尚未找到可用的已授权账号令牌，请先导入 Google OAuth 客户端或服务账号完成授权');
+  }
+
+  const poolWorkers = basePool.map((item, i) => ({
+    id: i,
+    email: item.email || `account_${i + 1}`,
+    token: item.token,
+    cooldownUntil: 0
+  }));
+  let rrCursor = 0;
+
+  async function acquireWorker() {
+    while (!shouldStop?.()) {
+      const now = Date.now();
+      for (let i = 0; i < poolWorkers.length; i++) {
+        const w = poolWorkers[rrCursor % poolWorkers.length];
+        rrCursor++;
+        if (now >= w.cooldownUntil && w.token) {
+          return w;
+        }
+      }
+      const soonest = Math.min(...poolWorkers.map(w => w.cooldownUntil));
+      const waitMs = Math.min(1000, Math.max(100, soonest - now));
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+    return poolWorkers[0];
+  }
+
+  function markRateLimited(worker, attempt = 1) {
+    if (!worker) return;
+    worker.cooldownUntil = Math.max(worker.cooldownUntil, Date.now() + Math.round(3500 * attempt));
+  }
+
+  async function refreshWorker(worker) {
+    if (!worker || !worker.email || worker.email.startsWith('account_')) return false;
+    try {
+      const fresh = await getValidTokenForAccount(worker.email, false, true);
+      if (fresh) {
+        worker.token = fresh;
+        return true;
+      }
+    } catch (_e) {}
+    return false;
+  }
+
+  const targetOwnerCache = new Map();
+  async function resolveTargetSheetOwnerEmail(targetId) {
+    if (targetOwnerCache.has(targetId)) return targetOwnerCache.get(targetId);
+    for (const w of poolWorkers) {
+      if (!w.token) continue;
+      try {
+        const meta = await driveApi(
+          w.token,
+          `/files/${encodeURIComponent(targetId)}?supportsAllDrives=true&fields=id,owners(emailAddress)`
+        );
+        const ownerEm = normalizeEntry(meta?.owners?.[0]?.emailAddress || '');
+        if (ownerEm) {
+          targetOwnerCache.set(targetId, ownerEm);
+          return ownerEm;
+        }
+      } catch (_e) {}
+    }
+    targetOwnerCache.set(targetId, '');
+    return '';
+  }
+
+  const ensuredDonorPairSet = new Set();
+  async function tryEnsureDonorReaderAccess(donorId, targetId, currentWorkerEmail) {
+    const candidateEmails = new Set();
+    const targetOwner = await resolveTargetSheetOwnerEmail(targetId);
+    if (targetOwner && targetOwner.includes('@')) candidateEmails.add(targetOwner);
+    if (currentWorkerEmail && currentWorkerEmail.includes('@')) {
+      candidateEmails.add(normalizeEntry(currentWorkerEmail));
+    }
+    let anyGrantedOrPresent = false;
+    for (const em of candidateEmails) {
+      const pairKey = `${donorId}::${em}`;
+      if (ensuredDonorPairSet.has(pairKey)) {
+        anyGrantedOrPresent = true;
+        continue;
+      }
+      ensuredDonorPairSet.add(pairKey);
+      try {
+        const res = await grantImportRangeSourceAccess({
+          targetOwnerEmail: em,
+          sourceIds: [donorId]
+        });
+        if ((res?.grantedCount || 0) > 0 || (res?.skippedCount || 0) > 0) {
+          anyGrantedOrPresent = true;
+        }
+      } catch (_ge) {}
+    }
+    return anyGrantedOrPresent;
+  }
+
+  const pausedTargets = [];
+  if (autoPauseFormulas && uniqueTargets.size >= 1 && uniqueTargets.size <= 5) {
+    for (const tid of uniqueTargets) {
+      if (shouldStop?.()) break;
+      if (onProgress) {
+        onProgress({
+          done: 0,
+          total: tasks.length,
+          successCount: 0,
+          failedCount: 0,
+          stopped: false,
+          message: `正在暂停目标汇总表 (${tid.slice(0, 8)}…) 公式重算以加速批量授权…`
+        });
+      }
+      const pRes = await toggleTargetSheetImportRangeFormulas(tid, { pause: true });
+      if (pRes.ok) {
+        pausedTargets.push(tid);
+      }
+    }
+  }
+
+  let successCount = 0;
+  let failedCount = 0;
+  let completed = 0;
+  let stopped = false;
+  let taskCursor = 0;
+  const failedPairs = [];
+  const workerLimit = Math.max(1, Math.min(16, Number(concurrency) || 6, tasks.length));
+
+  async function authorizeSinglePairTask(task) {
+    const url = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(
+      task.targetId
+    )}/externaldata/addimportrangepermissions?donorDocId=${encodeURIComponent(task.donorId)}`;
+
+    const maxAttempts = Math.max(3, poolWorkers.length + 1);
+    let triedEnsureDonor = false;
+    let lastErrText = '❌ 授权失败';
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (shouldStop?.()) {
+        stopped = true;
+        return { ok: false, aborted: true, statusText: '已暂停' };
+      }
+      const worker = await acquireWorker();
+      if (shouldStop?.()) {
+        stopped = true;
+        return { ok: false, aborted: true, statusText: '已暂停' };
+      }
+
+      try {
+        const resp = await fetch(url, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${worker.token}`
+          },
+          redirect: 'manual'
+        });
+
+        const code = resp.status;
+        const isOpaqueRedirect = resp.type === 'opaqueredirect' || (code >= 300 && code < 400);
+        let bodySnippet = '';
+        if (!isOpaqueRedirect) {
+          try {
+            bodySnippet = (await resp.text()).slice(0, 180);
+          } catch (_be) {}
+        }
+
+        if ((code === 200 || code === 204) && !/<html/i.test(bodySnippet)) {
+          return { ok: true, aborted: false, statusText: IMPORTRANGE_BATCH_SUCCESS_MARK };
+        }
+
+        if (code === 429 || (code === 403 && /rate|quota|limit/i.test(bodySnippet))) {
+          markRateLimited(worker, attempt);
+          lastErrText = `❌ 触发限流 (${code})`;
+          continue;
+        }
+
+        if (code === 401) {
+          await refreshWorker(worker);
+          lastErrText = '❌ 令牌已过期 (401)';
+          continue;
+        }
+
+        if (isOpaqueRedirect || code === 302 || code === 403 || code === 404) {
+          const dispCode = isOpaqueRedirect && !code ? 302 : code;
+          lastErrText = `❌ 失败(状态码:${dispCode}, 请确认对源表与目标表有权限)`;
+
+          if (ensureDonorReader && !triedEnsureDonor && (isOpaqueRedirect || dispCode === 302 || dispCode === 403)) {
+            triedEnsureDonor = true;
+            const fixed = await tryEnsureDonorReaderAccess(task.donorId, task.targetId, worker.email);
+            if (fixed) {
+              // 补齐源表只读权限后立即重试一次当前授权对
+              const retryResp = await fetch(url, {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${worker.token}`
+                },
+                redirect: 'manual'
+              });
+              const rCode = retryResp.status;
+              let rBody = '';
+              if (retryResp.type !== 'opaqueredirect') {
+                try {
+                  rBody = (await retryResp.text()).slice(0, 180);
+                } catch (_rbe) {}
+              }
+              if ((rCode === 200 || rCode === 204) && !/<html/i.test(rBody)) {
+                return { ok: true, aborted: false, statusText: IMPORTRANGE_BATCH_SUCCESS_MARK };
+              }
+            }
+          }
+
+          if (poolWorkers.length > 1 && attempt < maxAttempts) {
+            continue;
+          }
+          return { ok: false, aborted: false, statusText: lastErrText };
+        }
+
+        lastErrText = `❌ 失败(状态码:${code || '未知'})`;
+      } catch (err) {
+        const msg = String(err?.message || err || '').slice(0, 48);
+        lastErrText = `❌ 网络或请求异常: ${msg}`;
+        await new Promise(r => setTimeout(r, 250 * attempt));
+      }
+    }
+
+    return { ok: false, aborted: false, statusText: lastErrText };
+  }
+
+  try {
+    const workers = Array.from({ length: workerLimit }, async () => {
+      while (taskCursor < tasks.length) {
+        if (shouldStop?.()) {
+          stopped = true;
+          break;
+        }
+        const task = tasks[taskCursor++];
+        const outcome = await authorizeSinglePairTask(task);
+        if (outcome.aborted) {
+          stopped = true;
+          break;
+        }
+
+        completed++;
+        if (outcome.ok) {
+          successCount++;
+        } else {
+          failedCount++;
+          failedPairs.push({
+            rowIndex: task.rowIndex,
+            donorId: task.donorId,
+            targetId: task.targetId,
+            donorInput: task.donorInput,
+            targetInput: task.targetInput,
+            status: outcome.statusText,
+            errorMessage: outcome.statusText
+          });
+        }
+
+        if (onRowUpdate) {
+          onRowUpdate(task.rowIndex, {
+            ok: outcome.ok,
+            statusText: outcome.statusText,
+            donorId: task.donorId,
+            targetId: task.targetId
+          });
+        }
+
+        if (onProgress) {
+          onProgress({
+            done: completed,
+            total: tasks.length,
+            successCount,
+            failedCount,
+            stopped,
+            message: `正在极速授权 IMPORTRANGE (${completed}/${tasks.length})：成功 ${successCount} · 失败 ${failedCount}…`
+          });
+        }
+      }
+    });
+
+    await Promise.all(workers);
+  } finally {
+    // 无论正常结束还是中途暂停/中断，无条件恢复所有被自动暂停的目标汇总表公式
+    for (const tid of pausedTargets) {
+      try {
+        await toggleTargetSheetImportRangeFormulas(tid, { pause: false });
+      } catch (_resumeErr) {}
+    }
+  }
+
+  if (successCount > 0 || failedCount > 0) {
+    try {
+      await appendAuditLogs({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        timestamp: new Date().toISOString(),
+        source: 'manual',
+        actionType: 'grant',
+        accountEmail: poolWorkers[0]?.email || '',
+        fileId: [...uniqueTargets][0] || '',
+        fileName: `IMPORTRANGE 跨表批量授权 (${uniqueTargets.size} 张目标表)`,
+        webViewLink: '',
+        permissionId: '',
+        targetType: 'importrange_batch',
+        targetEmail: '',
+        targetLabel: `共 ${completed} 对（成功 ${successCount} · 失败 ${failedCount}）`,
+        previousRole: '',
+        newRole: 'reader',
+        restored: false,
+        message: `IMPORTRANGE 极速批量授权完成：成功 ${successCount} 项，失败 ${failedCount} 项${
+          stopped ? '（已手动中止）' : ''
+        }`
+      });
+    } catch (_logErr) {}
+  }
+
+  return {
+    total: tasks.length,
+    successCount,
+    failedCount,
+    stopped,
+    failedPairs,
+    pausedTargetsCount: pausedTargets.length
+  };
+}
+
+/* ==================== 分组批量增删邮箱与资产绑定分组引擎 ==================== */
+
+/**
+ * 批量解析多个邮箱并加入指定分组（保留成员原有其他分组，更新该组个人角色并同步白名单）
+ */
+async function batchAddEmailsToGroup(groupName, rawEmailsText, role = '') {
+  const cleanGroup = String(groupName || '').trim();
+  if (!cleanGroup) {
+    throw new Error('请先选择或输入目标分组名称');
+  }
+  const emails = parseEmailListInput(rawEmailsText);
+  if (!emails.length) {
+    throw new Error('请至少输入 1 个有效的邮箱地址');
+  }
+
+  const dir = await getDirectory();
+  let targetGrp = (dir.groups || []).find(g => g.name === cleanGroup);
+  const explicitRole = role ? normalizePermissionRole(role, '') : '';
+
+  if (!targetGrp) {
+    const defRole = explicitRole || 'reader';
+    targetGrp = {
+      name: cleanGroup,
+      defaultRole: defRole,
+      policyTier: defRole === 'writer' ? 'writer' : 'reader',
+      assets: []
+    };
+    dir.groups = [...(dir.groups || []), targetGrp];
+  }
+
+  const assignedRole = explicitRole || normalizePermissionRole(targetGrp.defaultRole, 'reader') || 'reader';
+  const contactByEmail = new Map();
+  for (const c of dir.contacts || []) {
+    const em = normalizeEntry(c?.email || '');
+    if (em) contactByEmail.set(em, c);
+  }
+
+  let addedCount = 0;
+  let updatedCount = 0;
+
+  for (const em of emails) {
+    const existing = contactByEmail.get(em);
+    if (existing) {
+      const prevGroups = Array.isArray(existing.groups) ? existing.groups : [];
+      const alreadyIn = prevGroups.includes(cleanGroup);
+      existing.groups = [...new Set([...prevGroups, cleanGroup])];
+      existing.groupRoles = {
+        ...(existing.groupRoles || {}),
+        [cleanGroup]: assignedRole
+      };
+      if (!existing.role || permissionRoleRank(assignedRole) > permissionRoleRank(existing.role) || existing.groups.length === 1) {
+        existing.role = assignedRole;
+      }
+      if (alreadyIn) {
+        updatedCount++;
+      } else {
+        addedCount++;
+      }
+    } else {
+      const newContact = {
+        email: em,
+        name: '',
+        groups: [cleanGroup],
+        role: assignedRole,
+        groupRoles: { [cleanGroup]: assignedRole },
+        hasExplicitRole: true
+      };
+      dir.contacts.push(newContact);
+      contactByEmail.set(em, newContact);
+      addedCount++;
+    }
+  }
+
+  const savedDir = await saveDirectory(dir);
+  return {
+    directory: savedDir,
+    addedCount,
+    updatedCount,
+    emails
+  };
+}
+
+/**
+ * 跨全部分组批量彻底移除指定邮箱（同时从 directory.contacts 与 policy.writers / policy.readers 中清除）
+ */
+async function batchRemoveEmailsFromAllGroups(rawEmailsText) {
+  const emails = parseEmailListInput(rawEmailsText);
+  if (!emails.length) {
+    throw new Error('请至少输入 1 个需要删除的邮箱地址');
+  }
+  const removeSet = new Set(emails);
+
+  const dir = await getDirectory();
+  let removedCount = 0;
+  const affectedGroupSet = new Set();
+  const keptContacts = [];
+
+  for (const c of dir.contacts || []) {
+    const em = normalizeEntry(c?.email || '');
+    if (removeSet.has(em)) {
+      removedCount++;
+      for (const g of c.groups || []) {
+        if (g) affectedGroupSet.add(g);
+      }
+    } else {
+      keptContacts.push(c);
+    }
+  }
+
+  const savedDir = await saveDirectory({
+    ...dir,
+    contacts: keptContacts
+  });
+
+  const currentPolicy = await getPolicy();
+  const nextWriters = (currentPolicy.writers || []).filter(item => !removeSet.has(normalizeEntry(item)));
+  const nextReaders = (currentPolicy.readers || []).filter(item => !removeSet.has(normalizeEntry(item)));
+  if (
+    nextWriters.length !== (currentPolicy.writers || []).length ||
+    nextReaders.length !== (currentPolicy.readers || []).length
+  ) {
+    await savePolicy({
+      writers: nextWriters,
+      readers: nextReaders
+    });
+  }
+
+  return {
+    directory: savedDir,
+    removedCount,
+    affectedGroups: [...affectedGroupSet],
+    emails
+  };
+}
+
+/**
+ * 将选中的文件/文件夹资产绑定保存到指定分组的 group.assets 中
+ */
+async function bindAssetsToGroup(
+  groupName,
+  files = [],
+  { createIfMissing = true, defaultRole = 'reader' } = {}
+) {
+  const cleanGroup = String(groupName || '').trim();
+  if (!cleanGroup) {
+    throw new Error('请先选择或输入目标分组名称');
+  }
+
+  const dir = await getDirectory();
+  let grp = (dir.groups || []).find(g => g.name === cleanGroup);
+  if (!grp) {
+    if (!createIfMissing) {
+      throw new Error(`未找到分组「${cleanGroup}」`);
+    }
+    const normRole = normalizePermissionRole(defaultRole, 'reader') || 'reader';
+    grp = {
+      name: cleanGroup,
+      defaultRole: normRole,
+      policyTier: normRole === 'writer' ? 'writer' : 'reader',
+      assets: []
+    };
+    dir.groups = [...(dir.groups || []), grp];
+  }
+
+  const mergedAssets = Array.isArray(grp.assets) ? [...grp.assets] : [];
+  const seenIds = new Set(mergedAssets.map(a => a.fileId));
+  let addedCount = 0;
+
+  for (const item of Array.isArray(files) ? files : [files]) {
+    if (!item) continue;
+    const fid = String(item.fileId || item.id || '').trim();
+    if (!fid || seenIds.has(fid)) continue;
+    seenIds.add(fid);
+    addedCount++;
+    mergedAssets.push({
+      fileId: fid,
+      fileName: String(item.fileName || item.name || '(无名称)').trim(),
+      mimeType: String(item.mimeType || ''),
+      webViewLink: String(
+        item.webViewLink || formatDriveCanonicalLink({ id: fid, mimeType: item.mimeType || '' })
+      )
+    });
+  }
+
+  grp.assets = mergedAssets;
+  const savedDir = await saveDirectory(dir);
+  const savedGroup = (savedDir.groups || []).find(g => g.name === cleanGroup) || grp;
+
+  return {
+    directory: savedDir,
+    group: savedGroup,
+    addedCount,
+    totalAssets: Array.isArray(savedGroup.assets) ? savedGroup.assets.length : 0
+  };
+}
+
+
+// ============================================================================
+// v1.2.0：排除扫描文件夹、宽权限风险评估、12小时断点续检检查点与第三方关联应用 OAuth 守卫引擎
+// ============================================================================
+
+/* ==================== 1. 排除扫描目录与宽权限风险评估引擎 ==================== */
+
+/**
+ * 根据 excludedFolders 配置与文件列表 parents 链，递归推导全部处于排除范围内的文件夹及子项 ID 集合
+ */
+function buildExcludedFileIdSet(files = [], excludedFolders = []) {
+  const cleanExcluded = sanitizeExcludedFoldersList(excludedFolders);
+  if (!cleanExcluded.length) return new Set();
+
+  const excludedSet = new Set();
+  const recursiveRootIds = [];
+
+  for (const ef of cleanExcluded) {
+    excludedSet.add(ef.id);
+    if (ef.includeSubitems !== false) {
+      recursiveRootIds.push(ef.id);
+    }
+  }
+
+  if (recursiveRootIds.length > 0 && Array.isArray(files) && files.length > 0) {
+    const childrenByParent = new Map();
+    for (const f of files) {
+      if (!f || !f.id || !Array.isArray(f.parents)) continue;
+      for (const pid of f.parents) {
+        const cleanPid = String(pid || '').trim();
+        if (!cleanPid) continue;
+        if (!childrenByParent.has(cleanPid)) {
+          childrenByParent.set(cleanPid, []);
+        }
+        childrenByParent.get(cleanPid).push(f.id);
+      }
+    }
+
+    const queue = [...recursiveRootIds];
+    const visited = new Set(recursiveRootIds);
+    let qCursor = 0;
+
+    while (qCursor < queue.length) {
+      const curId = queue[qCursor++];
+      const childIds = childrenByParent.get(curId);
+      if (!childIds) continue;
+      for (const cid of childIds) {
+        excludedSet.add(cid);
+        if (!visited.has(cid)) {
+          visited.add(cid);
+          queue.push(cid);
+        }
+      }
+    }
+  }
+
+  return excludedSet;
+}
+
+/**
+ * 判断单个文件或文件夹是否属于已排除扫描/保护目录范围
+ */
+function isFileInExcludedFolders(file, excludedFolders = [], excludedIdSet = null) {
+  if (!file) return false;
+  const fid = typeof file === 'string' ? file.trim() : String(file.id || '').trim();
+  if (!fid) return false;
+
+  if (excludedIdSet instanceof Set && excludedIdSet.has(fid)) {
+    return true;
+  }
+
+  const cleanExcluded = sanitizeExcludedFoldersList(excludedFolders);
+  if (!cleanExcluded.length) return false;
+
+  const directSet = new Set();
+  const recursiveSet = new Set();
+  for (const ef of cleanExcluded) {
+    directSet.add(ef.id);
+    if (ef.includeSubitems !== false) {
+      recursiveSet.add(ef.id);
+    }
+  }
+
+  if (directSet.has(fid)) return true;
+
+  if (typeof file === 'object') {
+    const candidateAncestors = [];
+    if (Array.isArray(file.parents)) candidateAncestors.push(...file.parents);
+    if (Array.isArray(file._ancestorIds)) candidateAncestors.push(...file._ancestorIds);
+    if (Array.isArray(file.ancestorIds)) candidateAncestors.push(...file.ancestorIds);
+
+    for (const pid of candidateAncestors) {
+      const cleanPid = String(pid || '').trim();
+      if (!cleanPid) continue;
+      if (recursiveSet.has(cleanPid)) return true;
+      if (excludedIdSet instanceof Set && excludedIdSet.has(cleanPid)) {
+        const matchedRule = cleanExcluded.find(ef => ef.id === cleanPid);
+        if (!matchedRule || matchedRule.includeSubitems !== false) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * 添加一个或多个排除扫描的公开/对外文件夹并持久化至 policy.excludedFolders
+ */
+async function addExcludedFolders(entries = []) {
+  const incomingList = Array.isArray(entries) ? entries : entries ? [entries] : [];
+  const cleanIncoming = sanitizeExcludedFoldersList(incomingList);
+  const currentPolicy = await getPolicy();
+  if (!cleanIncoming.length) return currentPolicy;
+
+  const byId = new Map();
+  for (const existing of currentPolicy.excludedFolders || []) {
+    byId.set(existing.id, existing);
+  }
+  for (const inc of cleanIncoming) {
+    const prev = byId.get(inc.id);
+    byId.set(inc.id, {
+      ...prev,
+      ...inc,
+      name:
+        inc.name && !inc.name.startsWith('排除目录 (')
+          ? inc.name
+          : prev?.name || inc.name,
+      note: inc.note !== '' ? inc.note : prev?.note || '',
+      addedAt: prev?.addedAt || inc.addedAt
+    });
+  }
+
+  const nextPolicy = await savePolicy({
+    excludedFolders: [...byId.values()]
+  });
+
+  // 同步从当前缓存快照中移除已被列入排除范围的文件，避免旧列表继续告警
+  try {
+    const rawSnap = await chrome.storage.local.get('scanSnapshot');
+    const snap = rawSnap?.scanSnapshot;
+    if (snap && Array.isArray(snap.files) && snap.files.length > 0) {
+      const exSet = buildExcludedFileIdSet(snap.files, nextPolicy.excludedFolders);
+      if (exSet.size > 0) {
+        const filtered = snap.files.filter(f => !exSet.has(f?.id));
+        if (filtered.length !== snap.files.length) {
+          snap.files = filtered;
+          await saveSnapshot(snap);
+        }
+      }
+    }
+  } catch (_snapErr) {}
+
+  return nextPolicy;
+}
+
+/**
+ * 从 policy.excludedFolders 中移出指定排除文件夹 ID
+ */
+async function removeExcludedFolder(folderId) {
+  const parsed = parseDriveUrlOrId(folderId);
+  const cleanId = parsed.fileId || extractDriveFileId(folderId) || String(folderId || '').trim();
+  const currentPolicy = await getPolicy();
+  if (!cleanId) return currentPolicy;
+
+  const nextExcluded = (currentPolicy.excludedFolders || []).filter(item => item.id !== cleanId);
+  return savePolicy({
+    excludedFolders: nextExcluded
+  });
+}
+
+/**
+ * 宽权限风险评估辅助（供伴随侧边栏首屏高辨识度预警卡与巡检提醒调用）
+ */
+function assessWidePermissionRisk(file, policy = DEFAULT_POLICY, accountEmail = '', forceExcluded = null) {
+  const isExcluded =
+    forceExcluded !== null
+      ? Boolean(forceExcluded)
+      : isFileInExcludedFolders(file, policy?.excludedFolders || []);
+
+  const perms = Array.isArray(file?.permissions) ? file.permissions : [];
+  const ownerEmail = normalizeEntry(
+    file?.ownerAccount || file?.owners?.[0]?.emailAddress || accountEmail || ''
+  );
+  const ownerDomain = extractEmailDomain(ownerEmail);
+  const personalDomains = new Set([
+    'gmail.com',
+    'googlemail.com',
+    'outlook.com',
+    'hotmail.com',
+    'live.com',
+    'qq.com',
+    '163.com',
+    '126.com',
+    'icloud.com',
+    'yahoo.com'
+  ]);
+
+  let hasPublicWriter = false;
+  let hasPublicReader = false;
+  let hasDomainLink = false;
+  let hasNonOwnerCollaborator = false;
+  const externalEmailSet = new Set();
+
+  for (const p of perms) {
+    if (!p || p.role === 'owner') continue;
+    if (p.type === 'anyone') {
+      hasNonOwnerCollaborator = true;
+      if (['writer', 'organizer', 'fileOrganizer'].includes(p.role)) {
+        hasPublicWriter = true;
+      } else {
+        hasPublicReader = true;
+      }
+      continue;
+    }
+    if (p.type === 'domain') {
+      hasNonOwnerCollaborator = true;
+      hasDomainLink = true;
+      continue;
+    }
+    const em = normalizeEntry(p.emailAddress || '');
+    if (em && em !== ownerEmail) {
+      hasNonOwnerCollaborator = true;
+      const dom = extractEmailDomain(em);
+      if (!ownerDomain || personalDomains.has(ownerDomain) || dom !== ownerDomain) {
+        externalEmailSet.add(em);
+      }
+    }
+  }
+
+  const externalCount = externalEmailSet.size;
+  const allowsWritersShare = Boolean(
+    (file?.shared || hasNonOwnerCollaborator) && file?.writersCanShare !== false
+  );
+
+  if (isExcluded) {
+    return {
+      isWide: false,
+      isExcluded: true,
+      severity: 'none',
+      reasons: ['已列入排除扫描目录，豁免宽权限预警与自动关链'],
+      hasPublicWriter,
+      hasPublicReader,
+      hasDomainLink,
+      externalCount,
+      allowsWritersShare,
+      removeCount: 0,
+      downgradeCount: 0
+    };
+  }
+
+  const evalRes = evaluateFile(file || {}, policy || DEFAULT_POLICY, ownerEmail);
+  const reasons = [];
+
+  if (hasPublicWriter) {
+    reasons.push('已开启任何人可编辑的公开链接');
+  } else if (hasPublicReader) {
+    reasons.push('已开启任何人可查看的公开链接');
+  }
+
+  if (hasDomainLink) {
+    reasons.push('已开启全域名范围共享链接');
+  }
+
+  if (evalRes.removeCount > 0) {
+    reasons.push(`含 ${evalRes.removeCount} 项非白名单违规权限`);
+  }
+
+  if (evalRes.downgradeCount > 0) {
+    reasons.push(`含 ${evalRes.downgradeCount} 项越权编辑权限`);
+  }
+
+  if (externalCount >= 3) {
+    reasons.push(`外部协作者较多 (${externalCount} 人)`);
+  }
+
+  if (allowsWritersShare) {
+    reasons.push('允许编辑者继续拉人共享');
+  }
+
+  let severity = 'none';
+  if (
+    hasPublicWriter ||
+    (hasPublicReader && (policy?.publicLinkRule || 'forbid') === 'forbid') ||
+    evalRes.removeCount > 0
+  ) {
+    severity = 'high';
+  } else if (hasPublicReader || hasDomainLink || evalRes.downgradeCount > 0 || externalCount >= 3) {
+    severity = 'medium';
+  } else if (allowsWritersShare) {
+    severity = 'low';
+  }
+
+  return {
+    isWide: severity !== 'none' && reasons.length > 0,
+    isExcluded: false,
+    severity,
+    reasons,
+    hasPublicWriter,
+    hasPublicReader,
+    hasDomainLink,
+    externalCount,
+    allowsWritersShare,
+    removeCount: evalRes.removeCount,
+    downgradeCount: evalRes.downgradeCount
+  };
+}
+
+/* ==================== 2. 12 小时定期巡检与启动断点续检检查点存储 ==================== */
+
+const DEFAULT_AUTO_SCAN_CHECKPOINT = {
+  status: 'idle', // 'idle' | 'running' | 'completed' | 'interrupted'
+  startedAt: '',
+  completedAt: '',
+  lastSuccessAt: '',
+  completedAccountEmails: [],
+  totalAccounts: 0,
+  scanScope: 'owned',
+  lastError: ''
+};
+
+async function getAutoScanCheckpoint() {
+  const data = await chrome.storage.local.get('autoScanCheckpoint');
+  const saved =
+    data?.autoScanCheckpoint && typeof data.autoScanCheckpoint === 'object'
+      ? data.autoScanCheckpoint
+      : {};
+  return {
+    ...DEFAULT_AUTO_SCAN_CHECKPOINT,
+    ...saved,
+    completedAccountEmails: Array.isArray(saved.completedAccountEmails)
+      ? normalizeEmailList(saved.completedAccountEmails)
+      : []
+  };
+}
+
+async function saveAutoScanCheckpoint(partialCp = {}) {
+  const current = await getAutoScanCheckpoint();
+  const safePartial = partialCp && typeof partialCp === 'object' ? partialCp : {};
+  const next = {
+    ...current,
+    ...safePartial,
+    completedAccountEmails:
+      safePartial.completedAccountEmails !== undefined
+        ? normalizeEmailList(safePartial.completedAccountEmails)
+        : current.completedAccountEmails
+  };
+  await safeStorageSet({ autoScanCheckpoint: next });
+  return next;
+}
+
+/* ==================== 3. 第三方关联应用 OAuth 授权页安全守卫 ==================== */
+
+async function getThirdPartyAppAlerts() {
+  const data = await chrome.storage.local.get('thirdPartyAppAlerts');
+  return Array.isArray(data?.thirdPartyAppAlerts) ? data.thirdPartyAppAlerts : [];
+}
+
+async function clearThirdPartyAppAlerts() {
+  await safeStorageSet({ thirdPartyAppAlerts: [] });
+  return [];
+}
+
+async function getThirdPartyAppAlertById(alertId = '') {
+  const cleanId = String(alertId || '').trim();
+  const list = await getThirdPartyAppAlerts();
+  if (!cleanId) return list[0] || null;
+  return list.find(item => item && item.id === cleanId) || null;
+}
+
+async function recordThirdPartyAppAlert(alert = {}) {
+  const existing = await getThirdPartyAppAlerts();
+  const nowMs = Date.now();
+  const nowIso = alert.timestamp || new Date(nowMs).toISOString();
+  const clientId = String(alert.clientId || '').trim();
+  const host = String(alert.host || alert.redirectDomain || '').trim();
+  const redirectDomain = String(alert.redirectDomain || host || '').trim();
+  const appHint = String(alert.appName || alert.appHint || '').trim();
+  const originalUrl = String(alert.originalUrl || alert.url || '').trim();
+  const action = alert.action === 'blocked' ? 'blocked' : 'alerted';
+
+  // 60 秒内同一外部应用的重复页内跳转去重，避免同一次授权流弹出多条重复通知；同时同步刷新最新原始链接与拦截状态
+  const duplicateIdx = existing.findIndex(item => {
+    const itemMs = item?.timestamp ? Date.parse(item.timestamp) : 0;
+    if (!itemMs || nowMs - itemMs > 60000) return false;
+    if (clientId && item.clientId === clientId) return true;
+    const itemHost = item.host || item.redirectDomain || '';
+    if (!clientId && appHint && (item.appName === appHint || item.appHint === appHint) && itemHost === host) {
+      return true;
+    }
+    return false;
+  });
+
+  if (duplicateIdx !== -1) {
+    const prev = existing[duplicateIdx];
+    let touched = false;
+    if (originalUrl && originalUrl !== prev.originalUrl) {
+      prev.originalUrl = originalUrl;
+      prev.url = originalUrl;
+      touched = true;
+    }
+    if (action === 'blocked' && prev.action !== 'blocked') {
+      prev.action = 'blocked';
+      prev.shouldBlock = true;
+      touched = true;
+    }
+    if (Number.isInteger(alert.tabId) && prev.tabId !== alert.tabId) {
+      prev.tabId = alert.tabId;
+      touched = true;
+    }
+    if (touched) {
+      await safeStorageSet({ thirdPartyAppAlerts: existing });
+    }
+    return { recorded: false, entry: prev, alerts: existing };
+  }
+
+  const matchedKeywords = Array.isArray(alert.matchedKeywords)
+    ? alert.matchedKeywords
+    : alert.matchedKeyword
+    ? [String(alert.matchedKeyword)]
+    : [];
+  const requestedScopes = Array.isArray(alert.requestedScopes)
+    ? alert.requestedScopes.map(s => String(s || '').trim()).filter(Boolean)
+    : [];
+  const resolvedAppName =
+    appHint ||
+    host ||
+    redirectDomain ||
+    (clientId ? clientId.slice(0, 24) : '外部第三方应用');
+  const resolvedReason = String(alert.reason || '检测到第三方 OAuth 授权请求');
+
+  const entry = {
+    id: alert.id || `oauth-alert-${nowMs}-${Math.random().toString(36).slice(2, 7)}`,
+    timestamp: nowIso,
+    detectedAt: nowIso,
+    action,
+    shouldBlock: alert.shouldBlock !== undefined ? Boolean(alert.shouldBlock) : action === 'blocked',
+    originalUrl,
+    url: String(alert.url || originalUrl || ''),
+    tabTitle: String(alert.tabTitle || ''),
+    clientId,
+    host,
+    redirectUri: String(alert.redirectUri || ''),
+    redirectDomain,
+    appHint: resolvedAppName,
+    appName: resolvedAppName,
+    matchedKeyword: String(alert.matchedKeyword || matchedKeywords[0] || ''),
+    matchedKeywords,
+    requestedScopes,
+    scopes: String(alert.scopes || requestedScopes.join(' ')),
+    hasDriveScope: Boolean(alert.hasDriveScope),
+    hasSheetsScope: Boolean(alert.hasSheetsScope),
+    reason: resolvedReason,
+    title: `${resolvedAppName} · ${resolvedReason}`,
+    message: `${resolvedAppName} · ${resolvedReason}`,
+    tabId: Number.isInteger(alert.tabId) ? alert.tabId : null
+  };
+
+  const merged = [entry, ...existing].slice(0, 100);
+  await safeStorageSet({ thirdPartyAppAlerts: merged });
+  return { recorded: true, entry, alerts: merged };
+}
+
+const KNOWN_OAUTH_APP_DISPLAY_NAMES = {
+  chatgpt: 'ChatGPT',
+  openai: 'OpenAI',
+  grok: 'Grok',
+  xai: 'xAI',
+  muse: 'Muse',
+  claude: 'Claude',
+  cursor: 'Cursor',
+  notion: 'Notion',
+  zapier: 'Zapier',
+  make: 'Make'
+};
+
+const GOOGLE_FIRST_PARTY_WEB_DOMAINS = new Set([
+  'google.com',
+  'www.google.com',
+  'accounts.google.com',
+  'myaccount.google.com',
+  'drive.google.com',
+  'docs.google.com',
+  'sheets.google.com',
+  'slides.google.com',
+  'forms.google.com',
+  'mail.google.com',
+  'calendar.google.com',
+  'meet.google.com',
+  'keep.google.com',
+  'photos.google.com',
+  'admin.google.com',
+  'console.cloud.google.com',
+  'colab.research.google.com'
+]);
+
+/**
+ * 检测浏览器访问的 Google OAuth 授权页 URL 是否命中禁止关联应用关键词或受禁的 Google 网盘 / Google 表格权限
+ * 兼容旧签名 matchThirdPartyOAuthUrl(urlStr, blockedKeywordsArray, ownClientIds)
+ * 与新对象传参 matchThirdPartyOAuthUrl(urlStr, { blockedKeywords, trustedKeywords, blockDriveScope, blockSheetsScope, ownClientIds })
+ */
+function matchThirdPartyOAuthUrl(
+  urlStr = '',
+  optionsOrKeywords = {},
+  ownClientIds = []
+) {
+  const raw = String(urlStr || '').trim();
+  if (!raw || !raw.includes('accounts.google.com')) {
+    return { matched: false, shouldBlock: false };
+  }
+
+  let outerUrl;
+  try {
+    outerUrl = new URL(raw);
+  } catch (_e) {
+    return { matched: false, shouldBlock: false };
+  }
+
+  if (outerUrl.hostname.toLowerCase() !== 'accounts.google.com') {
+    return { matched: false, shouldBlock: false };
+  }
+
+  // 解析选项与向下兼容旧数组传参
+  let resolvedBlockedKeywords;
+  let resolvedTrustedKeywords = [];
+  let blockDriveScope = true;
+  let blockSheetsScope = true;
+  let resolvedOwnClientIds = Array.isArray(ownClientIds) ? ownClientIds : [];
+
+  if (Array.isArray(optionsOrKeywords) || typeof optionsOrKeywords === 'string') {
+    resolvedBlockedKeywords = sanitizeBlockedKeywordsList(optionsOrKeywords);
+  } else if (optionsOrKeywords && typeof optionsOrKeywords === 'object') {
+    resolvedBlockedKeywords =
+      optionsOrKeywords.blockedKeywords !== undefined
+        ? sanitizeBlockedKeywordsList(optionsOrKeywords.blockedKeywords)
+        : optionsOrKeywords.blockedAppKeywords !== undefined
+        ? sanitizeBlockedKeywordsList(optionsOrKeywords.blockedAppKeywords)
+        : [...DEFAULT_BLOCKED_APP_KEYWORDS];
+    resolvedTrustedKeywords = sanitizeTrustedKeywordsList(
+      optionsOrKeywords.trustedKeywords ?? optionsOrKeywords.trustedOAuthKeywords ?? []
+    );
+    if (optionsOrKeywords.blockDriveScope !== undefined) {
+      blockDriveScope = Boolean(optionsOrKeywords.blockDriveScope);
+    } else if (optionsOrKeywords.blockThirdPartyDriveScope !== undefined) {
+      blockDriveScope = Boolean(optionsOrKeywords.blockThirdPartyDriveScope);
+    }
+    if (optionsOrKeywords.blockSheetsScope !== undefined) {
+      blockSheetsScope = Boolean(optionsOrKeywords.blockSheetsScope);
+    } else if (optionsOrKeywords.blockThirdPartySheetsScope !== undefined) {
+      blockSheetsScope = Boolean(optionsOrKeywords.blockThirdPartySheetsScope);
+    }
+    if (Array.isArray(optionsOrKeywords.ownClientIds)) {
+      resolvedOwnClientIds = optionsOrKeywords.ownClientIds;
+    }
+  } else {
+    resolvedBlockedKeywords = [...DEFAULT_BLOCKED_APP_KEYWORDS];
+  }
+
+  // 若外层为 AccountChooser / ServiceLogin / 二次验证多跳包装页，循环解包内部 continue / followup 授权地址
+  let targetUrl = outerUrl;
+  let continueHost = '';
+  for (let hop = 0; hop < 4; hop++) {
+    let continueParam =
+      targetUrl.searchParams.get('continue') || targetUrl.searchParams.get('followup') || '';
+    if (!continueParam) break;
+    if (/^https?%3a/i.test(continueParam)) {
+      try {
+        continueParam = decodeURIComponent(continueParam);
+      } catch (_ce) {}
+    }
+    try {
+      const inner = new URL(continueParam);
+      const innerHost = inner.hostname.toLowerCase();
+      if (innerHost === 'accounts.google.com') {
+        targetUrl = inner;
+      } else {
+        continueHost = innerHost;
+        break;
+      }
+    } catch (_ie) {
+      break;
+    }
+  }
+
+  // 多层解码完整 URL，确保 Google 多步登录/二次验证包装下的嵌套参数（client_id / scope / redirect_uri / state）均可精准识别
+  let decodedStr = raw;
+  for (let pass = 0; pass < 3; pass++) {
+    try {
+      const safeEncoded = decodedStr.replace(/%(?![0-9a-fA-F]{2})/g, '%25');
+      const nextDecoded = decodeURIComponent(safeEncoded);
+      if (nextDecoded === decodedStr) break;
+      decodedStr = nextDecoded;
+    } catch (_de) {
+      break;
+    }
+  }
+  const decodedFull = `${raw} ${decodedStr}`.toLowerCase();
+
+  const pathLower = targetUrl.pathname.toLowerCase();
+  const isOAuthPath =
+    pathLower.includes('/o/oauth2') ||
+    pathLower.includes('/signin/oauth') ||
+    pathLower.includes('/oauthchooseaccount') ||
+    decodedFull.includes('/o/oauth2') ||
+    decodedFull.includes('/signin/oauth');
+
+  let clientId = (
+    targetUrl.searchParams.get('client_id') ||
+    outerUrl.searchParams.get('client_id') ||
+    ''
+  ).trim();
+  if (!clientId) {
+    const cidMatch = decodedStr.match(/[?&]client_id=([^&#\s]+)/i);
+    if (cidMatch) clientId = cidMatch[1].trim();
+  }
+
+  let redirectUri = (
+    targetUrl.searchParams.get('redirect_uri') ||
+    outerUrl.searchParams.get('redirect_uri') ||
+    ''
+  ).trim();
+  if (!redirectUri) {
+    const rMatch = decodedStr.match(/[?&]redirect_uri=([^&#\s]+)/i);
+    if (rMatch) {
+      try {
+        redirectUri = decodeURIComponent(rMatch[1].trim());
+      } catch (_re0) {
+        redirectUri = rMatch[1].trim();
+      }
+    }
+  }
+
+  let rawScope = (
+    targetUrl.searchParams.get('scope') ||
+    outerUrl.searchParams.get('scope') ||
+    ''
+  ).trim();
+  if (!rawScope) {
+    const sMatch = decodedStr.match(/[?&]scope=([^&#]+)/i);
+    if (sMatch) rawScope = sMatch[1].trim();
+  }
+
+  const stateParam = (
+    targetUrl.searchParams.get('state') ||
+    outerUrl.searchParams.get('state') ||
+    ''
+  ).trim();
+
+  if (!isOAuthPath && !clientId && !redirectUri) {
+    return { matched: false, shouldBlock: false };
+  }
+
+  // 1) 放行本插件自身的客户端 ID 与本地回环 PKCE 授权流（兼容多跳嵌套编码场景）
+  const ownSet = new Set(
+    resolvedOwnClientIds.map(x => String(x || '').trim()).filter(Boolean)
+  );
+  try {
+    if (typeof chrome !== 'undefined' && chrome.runtime?.getManifest) {
+      const mfClientId = chrome.runtime.getManifest()?.oauth2?.client_id || '';
+      if (mfClientId && !mfClientId.includes('替换')) {
+        ownSet.add(mfClientId.trim());
+      }
+    }
+  } catch (_me) {}
+
+  if (clientId && ownSet.has(clientId)) {
+    return { matched: false, shouldBlock: false, reason: 'own_client' };
+  }
+  for (const ownId of ownSet) {
+    const lowOwnId = String(ownId || '').trim().toLowerCase();
+    if (lowOwnId && decodedFull.includes(lowOwnId)) {
+      return { matched: false, shouldBlock: false, reason: 'own_client' };
+    }
+  }
+
+  let redirectDomain = '';
+  if (redirectUri) {
+    try {
+      const rParsed = new URL(redirectUri);
+      redirectDomain = rParsed.hostname.toLowerCase();
+      if (
+        (redirectDomain === 'localhost' || redirectDomain === '127.0.0.1') &&
+        stateParam.startsWith('st_')
+      ) {
+        return { matched: false, shouldBlock: false, reason: 'own_loopback_pkce' };
+      }
+    } catch (_re) {}
+  }
+  if (
+    (decodedFull.includes('http://localhost') || decodedFull.includes('http://127.0.0.1')) &&
+    /[?&]state=st_[a-z0-9_-]+/i.test(decodedStr)
+  ) {
+    return { matched: false, shouldBlock: false, reason: 'own_loopback_pkce' };
+  }
+
+  // 2) 放行用户配置的信任白名单应用关键词或域名
+  const haystack = `${decodedFull} ${redirectUri.toLowerCase()} ${redirectDomain} ${clientId.toLowerCase()}`;
+  if (resolvedTrustedKeywords.length > 0) {
+    const trustedHit = resolvedTrustedKeywords.find(tk => tk && haystack.includes(tk));
+    if (trustedHit) {
+      return {
+        matched: false,
+        shouldBlock: false,
+        reason: 'trusted_keyword',
+        trustedKeyword: trustedHit
+      };
+    }
+  }
+
+  // 3) 精准解析请求的 OAuth Scopes（区分 Google 网盘 Drive 与 Google 表格 Sheets）
+  const scopeSet = new Set();
+  if (rawScope) {
+    for (const token of rawScope.split(/[\s+,]+/)) {
+      const cleanToken = token.trim();
+      if (cleanToken) scopeSet.add(cleanToken);
+    }
+  }
+  const googleAuthMatches = decodedStr.match(/https?:\/\/www\.googleapis\.com\/auth\/[a-zA-Z0-9_.-]+/g) || [];
+  for (const gm of googleAuthMatches) {
+    scopeSet.add(gm);
+  }
+  const requestedScopes = [...scopeSet];
+  const scopeInspectionText = `${requestedScopes.join(' ')} ${rawScope} ${decodedFull}`;
+
+  const hasDriveScope = /auth\/drive(?:\.[a-z0-9_.-]+)?(?![a-z0-9_])/i.test(scopeInspectionText);
+  const hasSheetsScope = /auth\/spreadsheets(?:\.[a-z0-9_.-]+)?(?![a-z0-9_])/i.test(scopeInspectionText);
+
+  const matchedKeywords = resolvedBlockedKeywords.filter(kw => kw && haystack.includes(kw));
+  const matchedKeyword = matchedKeywords[0] || '';
+  const hitBlockedApp = matchedKeywords.length > 0;
+
+  // Google 官方第一方 Web 服务会话登录/重登（未命中用户黑名单应用词时）直接放行，避免误拦自有服务
+  const firstPartyHost = redirectDomain || continueHost;
+  if (!hitBlockedApp && firstPartyHost && GOOGLE_FIRST_PARTY_WEB_DOMAINS.has(firstPartyHost)) {
+    return {
+      matched: false,
+      shouldBlock: false,
+      reason: 'google_first_party',
+      host: firstPartyHost
+    };
+  }
+
+  const hitBlockedDrive = Boolean(blockDriveScope && hasDriveScope);
+  const hitBlockedSheets = Boolean(blockSheetsScope && hasSheetsScope);
+
+  if (!hitBlockedApp && !hitBlockedDrive && !hitBlockedSheets) {
+    return {
+      matched: false,
+      shouldBlock: false,
+      matchedKeyword: '',
+      matchedKeywords: [],
+      hasDriveScope,
+      hasSheetsScope,
+      requestedScopes,
+      appName: '',
+      host: redirectDomain,
+      reason: '',
+      clientId
+    };
+  }
+
+  const serviceHint = (
+    targetUrl.searchParams.get('service') ||
+    targetUrl.searchParams.get('app_name') ||
+    outerUrl.searchParams.get('service') ||
+    ''
+  ).trim();
+
+  const appName = matchedKeyword
+    ? KNOWN_OAUTH_APP_DISPLAY_NAMES[matchedKeyword] || matchedKeyword.toUpperCase()
+    : redirectDomain || serviceHint || (clientId ? clientId.slice(0, 24) : '外部第三方应用');
+
+  const reasons = [];
+  if (hitBlockedApp) {
+    reasons.push(`命中禁止关联应用 (${matchedKeywords.join(', ')})`);
+  }
+  if (hitBlockedDrive && hitBlockedSheets) {
+    reasons.push('申请受禁的 Google 网盘与 Google 表格权限');
+  } else if (hitBlockedDrive) {
+    reasons.push('申请受禁的 Google 网盘 (Drive) 权限');
+  } else if (hitBlockedSheets) {
+    reasons.push('申请受禁的 Google 表格 (Sheets) 权限');
+  }
+
+  return {
+    matched: true,
+    shouldBlock: true,
+    matchedKeyword,
+    matchedKeywords,
+    hasDriveScope,
+    hasSheetsScope,
+    requestedScopes,
+    scopes: requestedScopes.join(' ') || rawScope,
+    appName,
+    appHint: appName,
+    host: redirectDomain,
+    redirectUri,
+    redirectDomain,
+    reason: reasons.join(' · '),
+    clientId
   };
 }

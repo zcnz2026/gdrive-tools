@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <script src="theme-init.js"></script>
+  <meta name="text-scale" content="scale">
+  <title>已拦截禁止第三方 Google 授权 · Drive 权限管理中心</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="icons/icon32.png">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body class="blocked-page-body">
+  <main class="blocked-shell">
+    <section class="blocked-card" role="alert" aria-labelledby="blocked-title">
+      <div class="blocked-header">
+        <div class="blocked-shield" aria-hidden="true">🛑</div>
+        <div>
+          <h1 id="blocked-title" class="blocked-title">已拦截禁止该第三方 Google 授权</h1>
+          <p id="blocked-subtitle" class="blocked-subtitle">
+            Google Drive 权限管理中心已根据您的安全防护规则，主动阻断本次外部应用关联或敏感云盘/表格权限申请，防止云端资产外泄。
+          </p>
+        </div>
+      </div>
+
+      <div id="blocked-reasons-box" class="blocked-reasons">
+        <strong>拦截原因明细：</strong>
+        <ul id="blocked-reasons-list">
+          <li>正在核验被拦截的授权请求详情…</li>
+        </ul>
+      </div>
+
+      <div id="blocked-meta-box" class="blocked-meta">
+        <div><strong>请求应用：</strong><span id="blocked-app-name">外部第三方应用</span></div>
+        <div><strong>涉及受禁权限：</strong><span id="blocked-scopes-summary">待解析</span></div>
+        <div id="blocked-host-row" class="hidden"><strong>回调域名：</strong><span id="blocked-host-text"></span></div>
+        <div id="blocked-client-row" class="hidden"><strong>Client ID：</strong><span id="blocked-client-text"></span></div>
+      </div>
+
+      <div id="blocked-status-msg" class="blocked-meta hidden" role="status" aria-live="polite"></div>
+
+      <div class="blocked-actions">
+        <button id="blocked-close-btn" type="button" class="btn primary">关闭此页面（保持安全）</button>
+        <button id="blocked-connections-btn" type="button" class="btn secondary">查看已关联第三方应用 ↗</button>
+        <button id="blocked-temp-allow-btn" type="button" class="btn ghost">我确认信任，本次临时放行 5 分钟</button>
+      </div>
+    </section>
+  </main>
+  <script src="oauth-blocked.js"></script>
+</body>
+</html>
