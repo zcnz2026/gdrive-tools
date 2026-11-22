@@ -620,23 +620,57 @@ async function compatInspectSingleDriveItem(fileId, { preferredAccount = '' } = 
   };
 }
 
+function compatIsGoogleGroupEmail(email = '', contact = null) {
+  const norm = normalizeEntry(email);
+  if (!norm) return false;
+  if (contact?.memberType === 'group') return true;
+  if (typeof isGoogleGroupEmail === 'function') {
+    return Boolean(isGoogleGroupEmail(norm));
+  }
+  return /@googlegroups\.com$|\bgooglegroups\./i.test(norm);
+}
+
+function compatInferPermissionTargetType(email = '', explicitType = '', directory = spState.directory) {
+  const norm = normalizeEntry(email);
+  const contact = Array.isArray(directory?.contacts)
+    ? directory.contacts.find(c => normalizeEntry(c?.email || '') === norm) || null
+    : null;
+  if (explicitType === 'group' || explicitType === 'user') {
+    return explicitType;
+  }
+  if (contact?.memberType === 'group') {
+    return 'group';
+  }
+  if (typeof inferPermissionTargetType === 'function') {
+    return inferPermissionTargetType(norm, explicitType);
+  }
+  return compatIsGoogleGroupEmail(norm, contact) ? 'group' : 'user';
+}
+
 async function compatGrantPermissionWithTtl({
   accountEmail = '',
   file = null,
   fileId = '',
-  type = 'user',
+  type = 'auto',
   role = 'reader',
   emailAddress = '',
   domain = '',
   expiresAt = '',
   expireAction = 'revoke'
 } = {}) {
+  const resolvedInitialType =
+    type && type !== 'auto'
+      ? type
+      : emailAddress
+        ? compatInferPermissionTargetType(emailAddress, '', spState.directory)
+        : 'user';
+
   if (typeof grantPermissionWithTtl === 'function') {
     return grantPermissionWithTtl({
       accountEmail,
       file,
       fileId,
-      type,
+      type: resolvedInitialType,
       role,
       emailAddress,
       domain,
@@ -646,12 +680,33 @@ async function compatGrantPermissionWithTtl({
   }
   const targetFileId = fileId || file?.id || '';
   const token = await getValidTokenForAccount(accountEmail || file?.ownerAccount || '', true);
-  const createdPermission = await createPermission(token, targetFileId, {
-    type,
-    role,
-    emailAddress: emailAddress || undefined,
-    domain: domain || undefined
-  });
+  let resolvedType = resolvedInitialType;
+  let createdPermission = null;
+  try {
+    createdPermission = await createPermission(token, targetFileId, {
+      type: resolvedType,
+      role,
+      emailAddress: emailAddress || undefined,
+      domain: domain || undefined
+    });
+  } catch (err) {
+    const msg = String(err?.message || err || '');
+    if (
+      emailAddress &&
+      (resolvedType === 'user' || resolvedType === 'group') &&
+      /400|group|not a user|not a group|invalid|shareable/i.test(msg)
+    ) {
+      resolvedType = resolvedType === 'user' ? 'group' : 'user';
+      createdPermission = await createPermission(token, targetFileId, {
+        type: resolvedType,
+        role,
+        emailAddress
+      });
+    } else {
+      throw err;
+    }
+  }
+  resolvedType = createdPermission?.resolvedType || createdPermission?.type || resolvedType;
   let ttlEntry = null;
   if (expiresAt && typeof enqueueTtlPermissions === 'function') {
     const queued = await enqueueTtlPermissions({
@@ -662,10 +717,10 @@ async function compatGrantPermissionWithTtl({
       webViewLink: file ? formatDriveCanonicalLink(file) : '',
       accountEmail: normalizeEntry(accountEmail || file?.ownerAccount || ''),
       permissionId: createdPermission?.id || '',
-      targetType: type,
+      targetType: resolvedType,
       targetEmail: normalizeEntry(emailAddress || ''),
       domain: domain || '',
-      targetLabel: emailAddress || domain || type,
+      targetLabel: emailAddress || domain || resolvedType,
       grantedRole: role,
       expireAction,
       expiresAt,
@@ -676,6 +731,7 @@ async function compatGrantPermissionWithTtl({
   }
   return {
     createdPermission,
+    resolvedType,
     nativeExpirationApplied: false,
     ttlEntry
   };
@@ -1147,11 +1203,26 @@ function renderPermissionsList(trueOwnerEmail, isExcludedFile = false) {
       );
 
       let displayName = permissionLabel(perm, contactLookup);
+      const contact = pEmail ? contactLookup.get(pEmail) || null : null;
       if (perm.type === 'anyone') {
         displayName = '公开链接（知道链接的任何人）';
       } else if (perm.type === 'domain') {
         displayName = `域内共享（@${perm.domain || '未知域'}）`;
+      } else if (contact?.name && !displayName.includes(contact.name)) {
+        displayName = `${contact.name} (${pEmail})`;
       }
+
+      const isGroupPerm = Boolean(
+        perm.type === 'group' || compatIsGoogleGroupEmail(pEmail, contact)
+      );
+      const groupBadgeHtml = isGroupPerm
+        ? `<span class="group-email-badge">👥 群组</span>`
+        : '';
+      const cleanNote = String(contact?.note || '').replaceAll('\u2014', '·').trim();
+      const noteHtml =
+        cleanNote && !displayName.includes(cleanNote)
+          ? `<div class="member-note-text">备注：${escapeHtml(cleanNote)}</div>`
+          : '';
 
       const matchedTtl = findMatchingTtlEntry(perm, spState.ttlEntries);
       const effectiveExpiresAt = matchedTtl?.expiresAt || perm.expirationTime || '';
@@ -1208,7 +1279,9 @@ function renderPermissionsList(trueOwnerEmail, isExcludedFile = false) {
       return `<div class="sp-perm-row ${escapeHtml(rowStatusCls)}">
         <div class="sp-perm-info">
           <span class="sp-perm-name">${escapeHtml(displayName)}</span>
+          ${noteHtml}
           <div class="sp-perm-meta">
+            ${groupBadgeHtml}
             <span class="status-pill ${escapeHtml(compTag.cls)}">${escapeHtml(compTag.text)}</span>
             ${inheritRoleHint}
             ${ttlHtml}
@@ -2110,7 +2183,7 @@ async function handleAddCollaborator() {
   const emailInput = $('sp-add-email');
   const emailAddress = normalizeEntry(emailInput?.value || '');
   if (!emailAddress || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailAddress)) {
-    toast('请输入有效的协作者邮箱地址');
+    toast('请输入有效的个人或 Google 群组邮箱地址');
     emailInput?.focus?.();
     return;
   }
@@ -2125,6 +2198,7 @@ async function handleAddCollaborator() {
     return;
   }
 
+  const inferredType = compatInferPermissionTargetType(emailAddress, '', spState.directory);
   const actingAccount = spState.matchedAccount || file.ownerAccount || '';
   setActionBusy(true);
   try {
@@ -2132,13 +2206,19 @@ async function handleAddCollaborator() {
       accountEmail: actingAccount,
       file,
       fileId: file.id,
-      type: 'user',
+      type: inferredType,
       role,
       emailAddress,
       expiresAt
     });
 
+    const resolvedType =
+      grantRes?.resolvedType || grantRes?.createdPermission?.type || inferredType;
+    const contact = buildContactLookup(spState.directory).get(emailAddress) || null;
+    const targetLabel = contact?.name ? `${contact.name} (${emailAddress})` : emailAddress;
+    const kindPrefix = resolvedType === 'group' ? '群组 ' : '';
     const ttlDesc = expiresAt ? `（限时：${compatFormatTtlRemaining(expiresAt)}）` : '';
+
     await appendAuditLogs({
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       timestamp: new Date().toISOString(),
@@ -2149,17 +2229,17 @@ async function handleAddCollaborator() {
       fileName: file.name || '(无名称)',
       webViewLink: formatDriveCanonicalLink(file),
       permissionId: grantRes?.createdPermission?.id || '',
-      targetType: 'user',
+      targetType: resolvedType,
       targetEmail: emailAddress,
-      targetLabel: emailAddress,
+      targetLabel,
       previousRole: '',
       newRole: role,
       restored: false,
-      message: `伴随栏授予 ${emailAddress}「${roleLabel(role)}」权限${ttlDesc}`
+      message: `伴随栏授予${kindPrefix}${targetLabel}「${roleLabel(role)}」权限${ttlDesc}`
     });
 
     if (emailInput) emailInput.value = '';
-    toast(`已为 ${emailAddress} 开通${roleLabel(role)}权限${ttlDesc}`);
+    toast(`已为${kindPrefix}${targetLabel} 开通${roleLabel(role)}权限${ttlDesc}`);
     await refreshCurrentFile(true);
   } catch (error) {
     toast(`添加协作者失败：${error?.message || String(error)}`);
@@ -2167,6 +2247,8 @@ async function handleAddCollaborator() {
     setActionBusy(false);
   }
 }
+
+const handleAddPerm = handleAddCollaborator;
 
 async function handlePermissionRoleChange(permId, newRole) {
   const file = spState.currentFile;

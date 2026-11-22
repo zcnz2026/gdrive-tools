@@ -184,7 +184,7 @@
           <!-- 单行轻量胶囊过滤栏 -->
           <div class="asset-filter-bar">
             <div class="filter-bar-left">
-              <input id="file-search" type="search" class="input input-xs filter-kw-input" aria-label="搜索文件名、姓名、邮箱或组名" placeholder="搜索文件名、邮箱、组名…">
+              <input id="file-search" type="search" class="input input-xs filter-kw-input" aria-label="搜索文件名、姓名、备注、邮箱或群组" placeholder="搜索文件名、姓名、备注、邮箱或群组…">
               <select id="search-match-mode" class="select select-sm" aria-label="关键词匹配方式">
                 <option value="or">任一 (OR)</option>
                 <option value="and">全部 (AND)</option>
@@ -750,7 +750,7 @@
                   <details class="clean-disclosure inline-picker-disclosure" id="batch-links-email-picker-disclosure">
                     <summary>+ 搜索添加分组 / 邮箱</summary>
                     <div class="disclosure-body picker-popover-body">
-                      <input id="batch-links-email-search" type="search" class="input input-xs full-width" aria-label="搜索分组或成员邮箱" placeholder="搜索分组名、姓名或邮箱（单击即填入 B 列）…">
+                      <input id="batch-links-email-search" type="search" class="input input-xs full-width" aria-label="搜索分组、姓名、备注、邮箱或群组" placeholder="搜索分组、姓名、备注、邮箱或群组（单击即填入 B 列）…">
                       <div id="batch-links-email-picker-list" class="picker-list"></div>
                     </div>
                   </details>
@@ -1087,132 +1087,184 @@
           </div>
         </div>
 
-        <!-- 子面板 1：双栏分组管理、批量增删邮箱与 Google 表格读取 -->
-        <div id="groups-subpanel-dir" class="two-col-workspace">
-          <!-- 左栏：新建分组 + 跨所有分组批量删除邮箱 -->
-          <div class="two-col-col">
-            <div class="pane-section">
-              <div class="block-header">
-                <h2>新建与批量管理分组</h2>
-              </div>
-              <div class="row-flex section-actions">
-                <input id="new-group-name" type="text" class="input grow" aria-label="新分组名称" placeholder="新分组名，如：财务组">
-                <select id="new-group-role" class="select select-sm" aria-label="新分组默认角色">
-                  <option value="writer">默认可编辑</option>
-                  <option value="reader">默认仅查看</option>
-                  <option value="commenter">默认可评论</option>
-                </select>
-                <button id="create-group-btn" type="button" class="btn primary btn-sm">新建组</button>
-              </div>
-
-              <details class="clean-disclosure" id="batch-create-groups-disclosure">
-                <summary>批量建立多个分组与默认权限</summary>
-                <div class="disclosure-body">
-                  <div class="field-group">
-                    <label for="batch-groups-textarea" class="field-label">每行一个分组（支持“组名, 权限”格式）</label>
-                    <textarea id="batch-groups-textarea" class="textarea" rows="3" placeholder="财务组, 可编辑&#10;审计组, 仅查看&#10;外包组, 可评论"></textarea>
-                  </div>
-                  <div class="row-flex section-actions">
-                    <label for="batch-groups-default-role" class="field-label nowrap">未标注权限时</label>
-                    <select id="batch-groups-default-role" class="select select-sm grow">
-                      <option value="reader">默认仅查看</option>
-                      <option value="writer">默认可编辑</option>
-                      <option value="commenter">默认可评论</option>
-                    </select>
-                    <button id="batch-create-groups-btn" type="button" class="btn primary btn-sm">批量创建分组</button>
-                  </div>
+        <!-- 子面板 1：双栏分组管理、批量增删邮箱、Google 表格读取 + 全宽人员备注通讯录 -->
+        <div id="groups-subpanel-dir" class="two-col-col">
+          <div class="two-col-workspace">
+            <!-- 左栏：新建分组 + 跨所有分组批量删除邮箱 -->
+            <div class="two-col-col">
+              <div class="pane-section">
+                <div class="block-header">
+                  <h2>新建与批量管理分组</h2>
                 </div>
-              </details>
+                <div class="row-flex section-actions">
+                  <input id="new-group-name" type="text" class="input grow" aria-label="新分组名称" placeholder="新分组名，如：财务组">
+                  <select id="new-group-role" class="select select-sm" aria-label="新分组默认角色">
+                    <option value="writer">默认可编辑</option>
+                    <option value="reader">默认仅查看</option>
+                    <option value="commenter">默认可评论</option>
+                  </select>
+                  <button id="create-group-btn" type="button" class="btn primary btn-sm">新建组</button>
+                </div>
 
-              <div id="settings-groups-list" class="group-cards-list"></div>
+                <details class="clean-disclosure" id="batch-create-groups-disclosure">
+                  <summary>批量建立多个分组与默认权限</summary>
+                  <div class="disclosure-body">
+                    <div class="field-group">
+                      <label for="batch-groups-textarea" class="field-label">每行一个分组（支持“组名, 权限”格式）</label>
+                      <textarea id="batch-groups-textarea" class="textarea" rows="3" placeholder="财务组, 可编辑&#10;审计组, 仅查看&#10;外包组, 可评论"></textarea>
+                    </div>
+                    <div class="row-flex section-actions">
+                      <label for="batch-groups-default-role" class="field-label nowrap">未标注权限时</label>
+                      <select id="batch-groups-default-role" class="select select-sm grow">
+                        <option value="reader">默认仅查看</option>
+                        <option value="writer">默认可编辑</option>
+                        <option value="commenter">默认可评论</option>
+                      </select>
+                      <button id="batch-create-groups-btn" type="button" class="btn primary btn-sm">批量创建分组</button>
+                    </div>
+                  </div>
+                </details>
+
+                <div id="settings-groups-list" class="group-cards-list"></div>
+              </div>
+
+              <div class="pane-section">
+                <div class="block-header">
+                  <h2>跨全部分组批量删除邮箱</h2>
+                </div>
+                <p class="muted">输入一个或多个个人/群组邮箱，无论其存在于哪个或哪些分组，一次性从所有分组与安全白名单中彻底移除。</p>
+                <div class="field-group">
+                  <label for="group-batch-remove-emails" class="field-label">待移除的邮箱列表（换行、逗号或空格分隔）</label>
+                  <textarea id="group-batch-remove-emails" class="textarea" rows="3" placeholder="former1@example.com, team-old@googlegroups.com"></textarea>
+                </div>
+                <div class="row-flex section-actions">
+                  <button type="button" id="group-batch-remove-btn" class="btn danger btn-sm">从所有分组批量删除</button>
+                </div>
+              </div>
             </div>
 
-            <div class="pane-section">
-              <div class="block-header">
-                <h2>跨全部分组批量删除邮箱</h2>
+            <!-- 右栏：选定分组批量添加邮箱（含姓名、备注与群组邮箱） + Google 表格读取 -->
+            <div class="two-col-col">
+              <div class="pane-section">
+                <div class="block-header">
+                  <h2>选定分组添加个人或群组邮箱</h2>
+                </div>
+                <p class="muted">支持个人/企业邮箱与 Google 群组邮箱（如 @googlegroups.com 或企业群组），可附带姓名与备注方便后续搜索。</p>
+                <div class="grid-2col">
+                  <div class="field-group">
+                    <label for="group-quick-add-select" class="field-label">目标分组</label>
+                    <select id="group-quick-add-select" class="select full-width">
+                      <option value="">请选择目标分组…</option>
+                    </select>
+                  </div>
+                  <div class="field-group">
+                    <label for="group-quick-add-role" class="field-label">在该组内的角色</label>
+                    <select id="group-quick-add-role" class="select full-width">
+                      <option value="reader">仅查看</option>
+                      <option value="commenter">可评论</option>
+                      <option value="writer">可编辑</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div class="row-flex wrap-flex field-group">
+                  <input id="group-quick-add-name" type="text" class="input input-xs grow" aria-label="成员姓名或群组名称" placeholder="姓名（可选，如：张三 / 财务群）">
+                  <input id="group-quick-add-note" type="text" class="input input-xs grow" aria-label="成员职责或部门备注" placeholder="备注（可选，如：华东运营 / 谷歌群组）">
+                  <select id="group-quick-add-type" class="select select-sm" aria-label="成员邮箱类型">
+                    <option value="auto">自动识别 (个人/群组)</option>
+                    <option value="user">个人邮箱</option>
+                    <option value="group">Google 群组邮箱</option>
+                  </select>
+                </div>
+
+                <div class="field-group">
+                  <label for="group-quick-add-emails" class="field-label">邮箱列表（支持每行“邮箱, 姓名, 备注”或批量粘贴多个邮箱）</label>
+                  <textarea id="group-quick-add-emails" class="textarea" rows="3" placeholder="zhangsan@company.com, 张三, 华东财务负责人&#10;finance-team@googlegroups.com, 财务审批群, 谷歌群组"></textarea>
+                </div>
+                <div class="row-flex section-actions">
+                  <button type="button" id="group-quick-add-btn" class="btn primary btn-sm">批量加入该分组</button>
+                </div>
               </div>
-              <p class="muted">输入一个或多个邮箱，无论其存在于哪个或哪些分组，一次性从所有分组与安全白名单中彻底移除。</p>
-              <div class="field-group">
-                <label for="group-batch-remove-emails" class="field-label">待移除的邮箱列表（换行、逗号或空格分隔）</label>
-                <textarea id="group-batch-remove-emails" class="textarea" rows="3" placeholder="former1@example.com, former2@example.com"></textarea>
-              </div>
-              <div class="row-flex section-actions">
-                <button type="button" id="group-batch-remove-btn" class="btn danger btn-sm">从所有分组批量删除</button>
+
+              <div class="pane-section">
+                <div class="block-header">
+                  <h2>Google 表格读取成员与权限</h2>
+                </div>
+                <p class="muted">标准格式：A列邮箱（含群组邮箱） · B列权限 · 可选 C列分组名 · 可选 D列姓名 · 可选 E列备注。</p>
+
+                <div class="row-flex field-group">
+                  <label for="import-target-group-select" class="field-label nowrap">归入分组</label>
+                  <select id="import-target-group-select" class="select select-sm grow">
+                    <option value="">-- 按表格C列组名或暂不归组 --</option>
+                  </select>
+                </div>
+
+                <div class="sub-well">
+                  <div class="field-group">
+                    <label for="drive-sheet-url-input" class="field-label">云端 Google 表格链接或 ID</label>
+                    <input id="drive-sheet-url-input" type="text" class="input full-width" placeholder="粘贴 Google 表格链接或 ID（A列邮箱 · B列权限 · D列姓名 · E列备注）">
+                  </div>
+                  <div class="row-flex section-actions">
+                    <select id="drive-sheet-picker" class="select select-sm grow" aria-label="选择已扫描的云端表格同步名单">
+                      <option value="">或从已扫描的云端 Google 表格选择…</option>
+                    </select>
+                    <button id="fetch-drive-sheet-contacts-btn" type="button" class="btn primary btn-sm">读取表格导入</button>
+                  </div>
+                </div>
+
+                <details class="clean-disclosure">
+                  <summary>通过复制粘贴或本地 CSV 导入</summary>
+                  <div class="disclosure-body">
+                    <textarea id="paste-contacts-textarea" class="textarea" rows="3" aria-label="粘贴人员与权限名单" placeholder="直接从表格复制粘贴（A列邮箱  B列权限  可选C列组名  可选D列姓名  可选E列备注）：&#10;zhangsan@gmail.com	可编辑	财务组	张三	总账会计&#10;team@googlegroups.com	仅查看	审计组	审计群	外部审计邮件组"></textarea>
+                    <div class="toolbar-split-row section-actions">
+                      <label class="btn btn-xs file-label">
+                        <span>上传本地 CSV</span>
+                        <input id="import-contacts-csv" type="file" accept=".csv,.tsv,.txt,text/csv,text/plain">
+                      </label>
+                      <button id="parse-paste-contacts-btn" type="button" class="btn primary btn-sm">解析粘贴并导入</button>
+                    </div>
+                  </div>
+                </details>
               </div>
             </div>
           </div>
 
-          <!-- 右栏：选定分组批量添加邮箱 + Google 表格读取成员与权限 -->
-          <div class="two-col-col">
-            <div class="pane-section">
-              <div class="block-header">
-                <h2>选定分组批量添加邮箱</h2>
+          <!-- 全宽：分组人员通讯录（姓名 · 备注 · 群组搜索管理） -->
+          <div class="pane-section">
+            <div class="block-header">
+              <div>
+                <h2>分组人员通讯录（姓名 · 备注 · 群组搜索管理）</h2>
+                <p class="muted">统一查看与编辑所有已登记成员的姓名、备注说明与个人/Google 群组标识，全局筛选框均可直接按姓名或备注检索。</p>
               </div>
-              <p class="muted">选择已有分组并粘贴多个邮箱，一次性加入该组并自动同步白名单角色。</p>
-              <div class="grid-2col">
-                <div class="field-group">
-                  <label for="group-quick-add-select" class="field-label">目标分组</label>
-                  <select id="group-quick-add-select" class="select full-width">
-                    <option value="">请选择目标分组…</option>
-                  </select>
-                </div>
-                <div class="field-group">
-                  <label for="group-quick-add-role" class="field-label">在该组内的角色</label>
-                  <select id="group-quick-add-role" class="select full-width">
-                    <option value="reader">仅查看</option>
-                    <option value="commenter">可评论</option>
-                    <option value="writer">可编辑</option>
-                  </select>
-                </div>
-              </div>
-              <div class="field-group">
-                <label for="group-quick-add-emails" class="field-label">成员邮箱（支持多个，换行、逗号或空格分隔）</label>
-                <textarea id="group-quick-add-emails" class="textarea" rows="3" placeholder="member1@example.com, member2@example.com"></textarea>
-              </div>
-              <div class="row-flex section-actions">
-                <button type="button" id="group-quick-add-btn" class="btn primary btn-sm">批量加入该分组</button>
-              </div>
+              <span id="dir-member-count" class="meta-inline">共 0 位成员</span>
             </div>
 
-            <div class="pane-section">
-              <div class="block-header">
-                <h2>Google 表格读取成员与权限</h2>
-              </div>
-              <p class="muted">标准格式：A列邮箱 · B列权限（可编辑 / 仅查看 / 可评论）· 可选 C列分组名 · 可选 D列姓名。</p>
+            <div class="row-flex wrap-flex field-group">
+              <input id="dir-member-search" type="search" class="input input-xs grow" aria-label="搜索通讯录姓名、备注、邮箱、群组或部门" placeholder="搜索姓名、备注、邮箱、群组或所属部门…">
+              <select id="dir-member-group-filter" class="select select-sm" aria-label="按所属分组筛选成员">
+                <option value="all">全部所属分组</option>
+              </select>
+              <select id="dir-member-type-filter" class="select select-sm" aria-label="按邮箱类型筛选成员">
+                <option value="all">全部类型</option>
+                <option value="user">个人邮箱</option>
+                <option value="group">群组邮箱</option>
+              </select>
+            </div>
 
-              <div class="row-flex field-group">
-                <label for="import-target-group-select" class="field-label nowrap">归入分组</label>
-                <select id="import-target-group-select" class="select select-sm grow">
-                  <option value="">-- 按表格C列组名或暂不归组 --</option>
-                </select>
-              </div>
-
-              <div class="sub-well">
-                <div class="field-group">
-                  <label for="drive-sheet-url-input" class="field-label">云端 Google 表格链接或 ID</label>
-                  <input id="drive-sheet-url-input" type="text" class="input full-width" placeholder="粘贴 Google 表格链接或 ID（A列邮箱 · B列权限）">
-                </div>
-                <div class="row-flex section-actions">
-                  <select id="drive-sheet-picker" class="select select-sm grow" aria-label="选择已扫描的云端表格同步名单">
-                    <option value="">或从已扫描的云端 Google 表格选择…</option>
-                  </select>
-                  <button id="fetch-drive-sheet-contacts-btn" type="button" class="btn primary btn-sm">读取表格导入</button>
-                </div>
-              </div>
-
-              <details class="clean-disclosure">
-                <summary>通过复制粘贴或本地 CSV 导入</summary>
-                <div class="disclosure-body">
-                  <textarea id="paste-contacts-textarea" class="textarea" rows="3" aria-label="粘贴人员与权限名单" placeholder="直接从表格复制粘贴（A列邮箱  B列权限  可选C列组名  可选D列姓名）：&#10;zhangsan@gmail.com	可编辑	财务组	张三&#10;lisi@gmail.com	仅查看	审计组	李四"></textarea>
-                  <div class="toolbar-split-row section-actions">
-                    <label class="btn btn-xs file-label">
-                      <span>上传本地 CSV</span>
-                      <input id="import-contacts-csv" type="file" accept=".csv,.tsv,.txt,text/csv,text/plain">
-                    </label>
-                    <button id="parse-paste-contacts-btn" type="button" class="btn primary btn-sm">解析粘贴并导入</button>
-                  </div>
-                </div>
-              </details>
+            <div class="mini-table-wrap">
+              <table class="data-table compact-table">
+                <thead>
+                  <tr>
+                    <th>姓名 / 备注</th>
+                    <th>邮箱与类型</th>
+                    <th>所属分组与权限</th>
+                    <th class="col-actions-person">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="dir-members-rows">
+                  <tr><td colspan="4" class="empty">暂无已录入的分组人员或群组邮箱</td></tr>
+                </tbody>
+              </table>
             </div>
           </div>
         </div>
@@ -1283,7 +1335,7 @@
               </div>
 
               <div class="row-flex section-actions">
-                <button type="button" id="bundle-onboard-run-btn" type="button" class="btn primary btn-sm">执行入职一键赋权</button>
+                <button type="button" id="bundle-onboard-run-btn" class="btn primary btn-sm">执行入职一键赋权</button>
               </div>
             </div>
 
@@ -1314,7 +1366,7 @@
               </div>
 
               <div class="row-flex section-actions">
-                <button type="button" id="bundle-transfer-run-btn" type="button" class="btn warning btn-sm">预演并执行转岗切换</button>
+                <button type="button" id="bundle-transfer-run-btn" class="btn warning btn-sm">预演并执行转岗切换</button>
               </div>
             </div>
           </div>
@@ -1401,7 +1453,7 @@
                 <option value="personal">仅公共个人邮箱域</option>
                 <option value="internal">仅内部企业域</option>
               </select>
-              <input id="collab-search" type="search" class="input input-xs filter-kw-input" aria-label="搜索姓名或邮箱" placeholder="搜索姓名、邮箱或域名…">
+              <input id="collab-search" type="search" class="input input-xs filter-kw-input" aria-label="搜索姓名、备注、邮箱、群组或域名" placeholder="搜索姓名、备注、邮箱、群组…">
               <select id="collab-filter" class="select select-sm" aria-label="筛选人员白名单状态">
                 <option value="all">全部状态</option>
                 <option value="in_directory">通讯录成员</option>
@@ -1447,8 +1499,23 @@
         </div>
       </section>
 
-      <!-- ==================== 视图 5：账号与白名单设置 (#view-settings，仅保留清爽 3 块) ==================== -->
+      <!-- ==================== 视图 5：账号与白名单设置 (#view-settings) ==================== -->
       <section id="view-settings" class="stage-view">
+        <!-- 顶部醒目全宽卡片：全量配置设置一键导出与导入 -->
+        <div class="pane-section config-backup-banner">
+          <div class="config-backup-info">
+            <h2>全量配置设置备份与迁移（换机 / 团队同步）</h2>
+            <p class="muted">一键导出或恢复全部本地设置：安全白名单、邮箱分组与人员姓名备注、岗位权限包、排除扫描目录、外部合作方档案、定期巡检与第三方 OAuth 拦截规则、筛选预设及界面主题（绝不包含任何账号授权令牌或密钥）。</p>
+          </div>
+          <div class="config-backup-actions row-flex wrap-flex">
+            <button id="export-all-config-btn" type="button" class="btn primary btn-sm">📦 导出全部配置设置 JSON</button>
+            <label class="btn btn-sm file-label" title="导入全量配置 JSON 或旧版策略备份 JSON">
+              <span>📥 导入全部配置设置</span>
+              <input id="import-all-config-file" type="file" accept="application/json,.json">
+            </label>
+          </div>
+        </div>
+
         <div class="two-col-workspace">
           <div class="two-col-col">
             <!-- 设置块 1：账号与 OAuth JSON 授权 -->
@@ -1492,14 +1559,14 @@
               <h2>安全白名单规则与配置备份</h2>
               <div class="row-flex wrap-flex">
                 <button id="trust-all-current-writers" type="button" class="btn btn-xs">现有协作者转白名单</button>
-                <label class="btn btn-xs file-label">
-                  <span>导入备份</span>
+                <label class="btn btn-xs file-label" title="已升级支持全量配置包与旧版白名单备份导入">
+                  <span>导入配置</span>
                   <input id="json-file" type="file" accept="application/json,.json" multiple>
                 </label>
-                <button id="export-policy-json" type="button" class="btn btn-xs">导出备份</button>
+                <button id="export-policy-json" type="button" class="btn btn-xs" title="已升级支持导出全量配置设置 JSON">导出配置</button>
               </div>
             </div>
-            <p class="muted">定义允许编辑/只读的安全名单，扫描时自动标红非白名单与越权编辑；备份仅导出规则与分组配置，方便换机恢复，不含账号令牌。</p>
+            <p class="muted">定义允许编辑/只读的安全名单（支持个人邮箱、Google 群组邮箱与 @域名），扫描时自动标红非白名单与越权编辑；右上角导入/导出同样支持全量配置包且不含账号令牌。</p>
 
             <div class="allow-columns">
               <div class="allow-col">

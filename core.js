@@ -249,6 +249,90 @@ function parseBatchGroupsText(rawText = '', fallbackRole = 'reader') {
   return [...byName.values()];
 }
 
+const _knownGroupEmailsCache = new Set();
+
+function hydrateKnownGroupEmails(contacts = []) {
+  _knownGroupEmailsCache.clear();
+  for (const c of contacts || []) {
+    const em = normalizeEntry(c?.email || '');
+    if (!em || !em.includes('@')) continue;
+    if (c?.memberType === 'group' || /@googlegroups\.[a-z0-9.-]+$/i.test(em)) {
+      _knownGroupEmailsCache.add(em);
+    }
+  }
+}
+
+/**
+ * 识别邮箱是否为 Google 群组邮箱（@googlegroups.com / @googlegroups.* 或通讯录中标记为 group 的企业群组邮箱）
+ */
+function isGoogleGroupEmail(email = '', contactLookupOrDir = null) {
+  const norm = normalizeEntry(email);
+  if (!norm || !norm.includes('@')) return false;
+  if (/@googlegroups\.[a-z0-9.-]+$/i.test(norm)) return true;
+  if (contactLookupOrDir instanceof Map) {
+    if (contactLookupOrDir.get(norm)?.memberType === 'group') return true;
+  } else if (Array.isArray(contactLookupOrDir?.contacts)) {
+    if (
+      contactLookupOrDir.contacts.some(
+        c => normalizeEntry(c?.email || '') === norm && c?.memberType === 'group'
+      )
+    ) {
+      return true;
+    }
+  }
+  return _knownGroupEmailsCache.has(norm);
+}
+
+function normalizeMemberType(rawType = '', email = '', fallback = 'user') {
+  const normEmail = normalizeEntry(email);
+  if (normEmail && /@googlegroups\.[a-z0-9.-]+$/i.test(normEmail)) {
+    return 'group';
+  }
+  const clean = String(rawType || '').trim().toLowerCase();
+  if (
+    clean === 'group' ||
+    clean === 'googlegroup' ||
+    clean === 'google_group' ||
+    clean === '群组' ||
+    clean === '谷歌群组' ||
+    clean === 'google群组' ||
+    clean === 'google 群组' ||
+    clean === '邮件组' ||
+    clean === '企业群组'
+  ) {
+    return 'group';
+  }
+  if (
+    clean === 'user' ||
+    clean === 'person' ||
+    clean === 'personal' ||
+    clean === '个人' ||
+    clean === '个人邮箱' ||
+    clean === '员工'
+  ) {
+    return 'user';
+  }
+  if (fallback === 'group' || fallback === 'user') {
+    return fallback;
+  }
+  return normEmail && _knownGroupEmailsCache.has(normEmail) ? 'group' : 'user';
+}
+
+/**
+ * 推断目标邮箱对应的 Drive API permission.type ('group' | 'user')
+ */
+function inferPermissionTargetType(email = '', explicitType = '', contactLookupOrDir = null) {
+  const exp = String(explicitType || '').trim().toLowerCase();
+  if (exp === 'anyone' || exp === 'domain') return exp;
+  const normEmail = normalizeEntry(email);
+  if (normEmail && /@googlegroups\.[a-z0-9.-]+$/i.test(normEmail)) {
+    return 'group';
+  }
+  if (exp === 'group') return 'group';
+  if (exp === 'user') return 'user';
+  return isGoogleGroupEmail(normEmail, contactLookupOrDir) ? 'group' : 'user';
+}
+
 async function getDirectory() {
   const data = await chrome.storage.local.get('directory');
   const saved = data.directory;
@@ -256,7 +340,23 @@ async function getDirectory() {
     return JSON.parse(JSON.stringify(DEFAULT_DIRECTORY));
   }
   const groups = Array.isArray(saved.groups) ? saved.groups : DEFAULT_DIRECTORY.groups;
-  const contacts = Array.isArray(saved.contacts) ? saved.contacts : [];
+  const rawContacts = Array.isArray(saved.contacts) ? saved.contacts : [];
+  const contacts = rawContacts
+    .filter(c => c && c.email)
+    .map(c => {
+      const email = normalizeEntry(c.email);
+      return {
+        ...c,
+        email,
+        name: String(c.name || '').trim(),
+        note: String(c.note || '').trim(),
+        memberType: normalizeMemberType(c.memberType, email, 'user'),
+        groups: Array.isArray(c.groups) ? c.groups : [],
+        role: c.role || 'reader',
+        groupRoles: c.groupRoles && typeof c.groupRoles === 'object' ? c.groupRoles : {}
+      };
+    });
+  hydrateKnownGroupEmails(contacts);
   return { groups, contacts };
 }
 
@@ -303,7 +403,9 @@ async function saveDirectory(directory) {
     const incomingGroups = Array.isArray(c.groups)
       ? c.groups.map(x => String(x || '').trim()).filter(Boolean)
       : [];
-    const mergedGroups = [...new Set([...(prev?.groups || []), ...incomingGroups])];
+    const mergedGroups = c._replaceProfile
+      ? [...new Set(incomingGroups)]
+      : [...new Set([...(prev?.groups || []), ...incomingGroups])];
 
     for (const gName of mergedGroups) {
       if (!groupByName.has(gName)) {
@@ -311,14 +413,15 @@ async function saveDirectory(directory) {
         const newGrp = {
           name: gName,
           defaultRole: 'reader',
-          policyTier: autoRole === 'writer' ? 'writer' : 'reader'
+          policyTier: autoRole === 'writer' ? 'writer' : 'reader',
+          assets: []
         };
         groupByName.set(gName, newGrp);
         cleanGroups.push(newGrp);
       }
     }
 
-    const mergedGroupRoles = { ...(prev?.groupRoles || {}) };
+    const mergedGroupRoles = c._replaceProfile ? {} : { ...(prev?.groupRoles || {}) };
     if (c.groupRoles && typeof c.groupRoles === 'object') {
       for (const [gk, gv] of Object.entries(c.groupRoles)) {
         const cleanGk = String(gk || '').trim();
@@ -350,9 +453,23 @@ async function saveDirectory(directory) {
       if (!finalRole) finalRole = 'reader';
     }
 
+    const resolvedName = c._replaceProfile
+      ? String(c.name ?? '').trim()
+      : String(c.name || prev?.name || '').trim();
+    const resolvedNote = c._replaceProfile
+      ? String(c.note ?? '').trim()
+      : String(c.note || prev?.note || '').trim();
+    const resolvedMemberType = normalizeMemberType(
+      c.memberType,
+      email,
+      prev?.memberType || 'user'
+    );
+
     contactMap.set(email, {
       email,
-      name: String(c.name || prev?.name || '').trim(),
+      name: resolvedName,
+      note: resolvedNote,
+      memberType: resolvedMemberType,
       groups: mergedGroups,
       role: finalRole,
       groupRoles: mergedGroupRoles
@@ -363,6 +480,7 @@ async function saveDirectory(directory) {
     groups: cleanGroups,
     contacts: [...contactMap.values()]
   };
+  hydrateKnownGroupEmails(nextDir.contacts);
   await safeStorageSet({ directory: nextDir });
   await syncDirectoryToPolicy(nextDir);
   return nextDir;
@@ -469,10 +587,11 @@ function extractEmailAndInlineNameFromCell(cell = '') {
 }
 
 /**
- * 解析从 Google 表格、CSV 或粘贴文本读取的成员与权限：
- * - 标准优先格式：A列邮箱 (index 0)，B列权限角色，可选 C列分组名，可选 D列姓名；
- *   若 B列非角色词，则兼容旧表识别组名/姓名并回退 fallbackRole。
- * - 兼容旧格式：B列邮箱 (index 1)，A列姓名，自动识别 C/D 列中的角色词与分组名。
+ * 解析从 Google 表格、CSV 或粘贴文本读取的成员、权限、分组、姓名、备注与群组类型：
+ * - 标准优先格式：A列邮箱 (index 0)，B列权限角色，可选 C列分组名，可选 D列姓名，可选 E列备注；
+ * - 快速批量粘贴格式：`zhangsan@company.com`、`张三 <zhangsan@company.com>`、`zhangsan@company.com, 张三, 华东财务负责人`、`zjh@googlegroups.com, 财务群组, 审批邮件组`；
+ * - 单行多邮箱格式：`a@company.com, b@company.com` 自动逐一拆解；
+ * - 兼容旧格式：B列邮箱 (index 1)，A列姓名，自动识别 C/D/E 列中的角色词、分组名与备注。
  */
 function parseTabularContactsText(rawText = '', fallbackGroup = '', fallbackRole = 'reader') {
   const cleanFallbackGroup = fallbackGroup ? String(fallbackGroup).trim() : '';
@@ -487,71 +606,169 @@ function parseTabularContactsText(rawText = '', fallbackGroup = '', fallbackRole
     const cells = splitTabularRowCells(line);
     if (!cells.length) continue;
 
-    let emailIdx = -1;
-    let extracted = null;
+    // 检测同行是否包含多个纯邮箱（如用户一行用逗号或空格粘贴多个邮箱）
+    const cellEmailHits = [];
     for (let i = 0; i < cells.length; i++) {
       const hit = extractEmailAndInlineNameFromCell(cells[i]);
       if (hit) {
-        emailIdx = i;
-        extracted = hit;
-        break;
+        cellEmailHits.push({ index: i, ...hit });
       }
     }
-    if (emailIdx === -1 || !extracted) {
+
+    if (cellEmailHits.length > 1) {
+      for (const hit of cellEmailHits) {
+        results.push({
+          name: String(hit.inlineName || '').trim(),
+          note: '',
+          memberType: normalizeMemberType('', hit.email, 'user'),
+          email: hit.email,
+          group: cleanFallbackGroup,
+          role: defaultRole,
+          hasExplicitRole: false
+        });
+      }
+      continue;
+    }
+
+    if (cellEmailHits.length === 0) {
+      // 检查空格分隔的多邮箱（如 "a@x.com b@x.com"）
+      const spaceTokens = line.split(/\s+/).filter(Boolean);
+      const spaceHits = spaceTokens.map(extractEmailAndInlineNameFromCell).filter(Boolean);
+      if (spaceHits.length >= 1 && spaceHits.length === spaceTokens.length) {
+        for (const hit of spaceHits) {
+          results.push({
+            name: String(hit.inlineName || '').trim(),
+            note: '',
+            memberType: normalizeMemberType('', hit.email, 'user'),
+            email: hit.email,
+            group: cleanFallbackGroup,
+            role: defaultRole,
+            hasExplicitRole: false
+          });
+        }
+      }
       // 表头行或无邮箱行自动跳过
       continue;
     }
 
+    const emailIdx = cellEmailHits[0].index;
+    const extracted = cellEmailHits[0];
     const email = extracted.email;
     let name = extracted.inlineName || '';
+    let note = '';
+    let explicitTypeHint = '';
     let group = cleanFallbackGroup;
     let role = defaultRole;
     let hasExplicitRole = false;
+
+    const isExplicitTypeWord = val => {
+      const low = String(val || '').trim().toLowerCase();
+      return [
+        'group',
+        'user',
+        'googlegroup',
+        '群组',
+        '谷歌群组',
+        'google群组',
+        'google 群组',
+        '个人',
+        '个人邮箱'
+      ].includes(low);
+    };
 
     if (emailIdx === 0) {
       // 标准优先格式：A列是邮箱
       const c1 = cells[1] || '';
       const c2 = cells[2] || '';
       const c3 = cells[3] || '';
+      const c4 = cells[4] || '';
+      const c5 = cells[5] || '';
       const role1 = normalizePermissionRole(c1, '');
       const role2 = !role1 ? normalizePermissionRole(c2, '') : '';
 
       if (role1) {
+        // A=邮箱, B=权限角色, [C=分组, D=姓名, E=备注, F=类型]
         role = role1;
         hasExplicitRole = true;
         if (c2) group = c2;
-        if (c3) name = c3;
+        if (c3) name = c3 || name;
+        if (c4) {
+          if (isExplicitTypeWord(c4) && !c5) {
+            explicitTypeHint = c4;
+          } else {
+            note = c4;
+          }
+        }
+        if (c5 && isExplicitTypeWord(c5)) {
+          explicitTypeHint = c5;
+        }
       } else if (role2) {
+        // A=邮箱, B=姓名/分组, C=权限角色, [D=分组/备注, E=备注]
         role = role2;
         hasExplicitRole = true;
         if (c3) {
-          name = c1;
-          group = c3;
+          name = c1 || name;
+          if (cleanFallbackGroup && !c4) {
+            note = c3;
+          } else {
+            group = c3;
+            if (c4) note = c4;
+          }
         } else if (cleanFallbackGroup) {
-          name = c1;
+          name = c1 || name;
           group = cleanFallbackGroup;
         } else {
           group = c1;
         }
       } else {
-        if (c1 && c2) {
-          name = c1;
-          group = c2;
-        } else if (c1) {
-          if (cleanFallbackGroup) {
-            name = c1;
-          } else if (/组|部|科|中心|团队|项目|group|team|dept/i.test(c1)) {
-            group = c1;
+        // 无显式权限词：兼容 `邮箱, 姓名, 备注`（有 fallbackGroup 时）或 `邮箱, 姓名, 分组, 备注`
+        if (cleanFallbackGroup) {
+          if (extracted.inlineName) {
+            note = [c1, c2, c3].filter(Boolean).join(' · ');
           } else {
-            name = c1;
+            if (c1) name = c1;
+            if (c2) {
+              if (isExplicitTypeWord(c2) && !c3) {
+                explicitTypeHint = c2;
+              } else {
+                note = c2;
+              }
+            }
+            if (c3) {
+              if (isExplicitTypeWord(c3)) {
+                explicitTypeHint = c3;
+              } else {
+                note = note ? `${note} · ${c3}` : c3;
+              }
+            }
+          }
+        } else {
+          if (c1 && c2 && c3) {
+            name = c1 || name;
+            group = c2;
+            note = c3;
+          } else if (c1 && c2) {
+            name = c1 || name;
+            if (/组|部|科|中心|团队|项目|group|team|dept/i.test(c2) && !/邮件组|谷歌群组/.test(c2)) {
+              group = c2;
+            } else {
+              note = c2;
+            }
+          } else if (c1) {
+            if (/组|部|科|中心|团队|项目|group|team|dept/i.test(c1) && !/群组$/.test(c1)) {
+              group = c1;
+            } else {
+              name = c1 || name;
+            }
           }
         }
       }
     } else if (emailIdx === 1) {
-      // 兼容旧格式：A列是姓名，B列是邮箱，C/D列为角色或分组
+      // 兼容旧格式：A列是姓名，B列是邮箱，C/D/E列为角色、分组或备注
       name = cells[0] || name;
       const c2 = cells[2] || '';
       const c3 = cells[3] || '';
+      const c4 = cells[4] || '';
       const role2 = normalizePermissionRole(c2, '');
       const role3 = !role2 ? normalizePermissionRole(c3, '') : '';
 
@@ -559,12 +776,19 @@ function parseTabularContactsText(rawText = '', fallbackGroup = '', fallbackRole
         role = role2;
         hasExplicitRole = true;
         if (c3) group = c3;
+        if (c4) note = c4;
       } else if (role3) {
         role = role3;
         hasExplicitRole = true;
         if (c2) group = c2;
-      } else if (c2) {
-        group = c2;
+        if (c4) note = c4;
+      } else {
+        if (cleanFallbackGroup) {
+          note = [c2, c3, c4].filter(Boolean).join(' · ');
+        } else {
+          if (c2) group = c2;
+          if (c3) note = c3;
+        }
       }
     } else {
       name = cells[0] || name;
@@ -578,12 +802,22 @@ function parseTabularContactsText(rawText = '', fallbackGroup = '', fallbackRole
           hasExplicitRole = true;
         } else if (!group || group === cleanFallbackGroup) {
           group = val;
+        } else if (!note) {
+          note = val;
         }
       }
     }
 
+    const memberType = normalizeMemberType(
+      explicitTypeHint || (/谷歌群组|google\s*群组|邮件组/i.test(`${name} ${note}`) ? 'group' : ''),
+      email,
+      'user'
+    );
+
     results.push({
       name: String(name || '').trim(),
+      note: String(note || '').trim(),
+      memberType,
       email,
       group: String(group || '').trim(),
       role,
@@ -591,6 +825,31 @@ function parseTabularContactsText(rawText = '', fallbackGroup = '', fallbackRole
     });
   }
   return results;
+}
+
+function parseMemberEntriesWithMeta(rawText = '', fallbackGroup = '', fallbackRole = 'reader') {
+  if (Array.isArray(rawText)) {
+    return rawText
+      .map(item => {
+        if (!item) return null;
+        if (typeof item === 'string') {
+          return parseTabularContactsText(item, fallbackGroup, fallbackRole)[0] || null;
+        }
+        const email = normalizeEntry(item.email || '');
+        if (!email || !email.includes('@')) return null;
+        return {
+          email,
+          name: String(item.name || '').trim(),
+          note: String(item.note || '').trim(),
+          memberType: normalizeMemberType(item.memberType, email, 'user'),
+          group: String(item.group || fallbackGroup || '').trim(),
+          role: normalizePermissionRole(item.role, fallbackRole || 'reader') || 'reader',
+          hasExplicitRole: Boolean(item.role)
+        };
+      })
+      .filter(Boolean);
+  }
+  return parseTabularContactsText(String(rawText || ''), fallbackGroup, fallbackRole);
 }
 
 function extractDriveFileId(input = '') {
@@ -637,15 +896,23 @@ function buildContactLookup(directory) {
 function formatCollaboratorDisplay(email, displayName, contactLookup) {
   const norm = normalizeEntry(email);
   const contact = contactLookup ? contactLookup.get(norm) : null;
+  const isGroup = isGoogleGroupEmail(norm, contactLookup);
+  const groupTypePrefix = isGroup ? '[群组] ' : '';
+
   if (contact) {
     const groupPrefix = contact.groups?.length ? `[${contact.groups.join('/')}] ` : '';
-    const namePart = contact.name ? `${contact.name} (${norm})` : norm;
-    return `${groupPrefix}${namePart}`;
+    const resolvedName = String(contact.name || displayName || '').trim();
+    const hasDistinctName = resolvedName && normalizeEntry(resolvedName) !== norm;
+    const noteSuffix = contact.note ? ` · ${contact.note}` : '';
+    const namePart = hasDistinctName
+      ? `${resolvedName}${noteSuffix} (${norm})`
+      : `${norm}${noteSuffix}`;
+    return `${groupTypePrefix}${groupPrefix}${namePart}`;
   }
   if (displayName && normalizeEntry(displayName) !== norm) {
-    return `${displayName} (${norm})`;
+    return `${groupTypePrefix}${displayName} (${norm})`;
   }
-  return norm;
+  return `${groupTypePrefix}${norm}`;
 }
 
 /**
@@ -2679,22 +2946,73 @@ async function updatePermissionRole(token, fileId, permissionId, role) {
   );
 }
 
-async function createPermission(token, fileId, { type = 'user', role = 'reader', emailAddress, domain }) {
-  const params = new URLSearchParams({ supportsAllDrives: 'true' });
-  if (type === 'user' || type === 'group') {
-    params.set('sendNotificationEmail', 'false');
-  }
-  const body = { type, role };
-  if (emailAddress) body.emailAddress = emailAddress;
-  if (domain) body.domain = domain;
-  return driveApi(
-    token,
-    `/files/${encodeURIComponent(fileId)}/permissions?${params}`,
-    {
-      method: 'POST',
-      body: JSON.stringify(body)
+async function createPermission(
+  token,
+  fileId,
+  { type = 'auto', role = 'reader', emailAddress, domain, expirationTime } = {}
+) {
+  const normEmail = emailAddress ? normalizeEntry(emailAddress) : '';
+  const initialType =
+    type === 'anyone' || type === 'domain'
+      ? type
+      : inferPermissionTargetType(normEmail, type || 'auto');
+
+  const sendPermissionPost = async activeType => {
+    const params = new URLSearchParams({ supportsAllDrives: 'true' });
+    if (activeType === 'user' || activeType === 'group') {
+      params.set('sendNotificationEmail', 'false');
     }
-  );
+    const body = { type: activeType, role };
+    if (normEmail) body.emailAddress = normEmail;
+    if (domain) body.domain = domain;
+    if (expirationTime) body.expirationTime = expirationTime;
+
+    const created = await driveApi(
+      token,
+      `/files/${encodeURIComponent(fileId)}/permissions?${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify(body)
+      }
+    );
+    const resolvedType = created?.type || activeType;
+    if (resolvedType === 'group' && normEmail) {
+      _knownGroupEmailsCache.add(normEmail);
+    }
+    return {
+      ...(created && typeof created === 'object' ? created : {}),
+      type: resolvedType,
+      resolvedType
+    };
+  };
+
+  try {
+    return await sendPermissionPost(initialType);
+  } catch (err) {
+    const errMsg = String(err?.message || err || '');
+    // 智能双向自动回退：企业域名 Google 群组（如 finance@company.com）首次以 user 请求返回 400 时自动改用 group 重试，反之亦然
+    if (normEmail && (initialType === 'user' || initialType === 'group')) {
+      const canFallbackToGroup =
+        initialType === 'user' &&
+        /400|group|not a user|invalid|shareable|badrequest|invalidsharingrequest/i.test(errMsg);
+      const canFallbackToUser =
+        initialType === 'group' &&
+        !/^[^@]+@googlegroups\.[a-z0-9.-]+$/i.test(normEmail) &&
+        /400|not a group|user|invalid|shareable|badrequest|invalidsharingrequest/i.test(errMsg);
+
+      if (canFallbackToGroup) {
+        const retried = await sendPermissionPost('group');
+        _knownGroupEmailsCache.add(normEmail);
+        return retried;
+      }
+      if (canFallbackToUser) {
+        const retried = await sendPermissionPost('user');
+        _knownGroupEmailsCache.delete(normEmail);
+        return retried;
+      }
+    }
+    throw err;
+  }
 }
 
 /**
@@ -3146,9 +3464,10 @@ async function executeGroupBatchOnFiles({
         if (op.type === 'create') {
           let created = null;
           let nativeExpirationApplied = false;
+          const preferredType = inferPermissionTargetType(op.email, 'auto');
           if (activeExpiresAt) {
             const grantRes = await grantPermissionCoreApi(token, file, file.id, {
-              type: 'user',
+              type: preferredType,
               role: op.role,
               emailAddress: op.email,
               expiresAt: activeExpiresAt
@@ -3157,16 +3476,18 @@ async function executeGroupBatchOnFiles({
             nativeExpirationApplied = grantRes.nativeExpirationApplied;
           } else {
             created = await createPermission(token, file.id, {
-              type: 'user',
+              type: preferredType,
               role: op.role,
               emailAddress: op.email
             });
           }
+          const resolvedType =
+            created?.resolvedType || created?.type || inferPermissionTargetType(op.email, preferredType);
           const createdId = created?.id || `grp-${Date.now()}-${Math.random()}`;
           file.permissions = file.permissions || [];
           file.permissions.push({
             id: createdId,
-            type: 'user',
+            type: resolvedType,
             role: op.role,
             emailAddress: op.email,
             displayName: op.name
@@ -3179,7 +3500,7 @@ async function executeGroupBatchOnFiles({
               webViewLink: file.webViewLink || '',
               accountEmail: fileOwner,
               permissionId: created?.id || '',
-              targetType: 'user',
+              targetType: resolvedType,
               targetEmail: op.email,
               targetLabel: `[${groupTitle}] ${op.name} (${op.email})`,
               grantedRole: op.role,
@@ -3200,7 +3521,7 @@ async function executeGroupBatchOnFiles({
             fileName: file.name || '(无名称)',
             webViewLink: file.webViewLink || '',
             permissionId: created?.id || '',
-            targetType: 'user',
+            targetType: resolvedType,
             targetEmail: op.email,
             targetLabel: `[${groupTitle}] ${op.name} (${op.email})`,
             previousRole: '',
@@ -3527,9 +3848,10 @@ async function executeDirectEmailsBatchOnFiles({
         if (op.type === 'create') {
           let created = null;
           let nativeExpirationApplied = false;
+          const preferredType = inferPermissionTargetType(op.email, 'auto', contactLookup);
           if (activeExpiresAt) {
             const grantRes = await grantPermissionCoreApi(token, file, file.id, {
-              type: 'user',
+              type: preferredType,
               role: op.role,
               emailAddress: op.email,
               expiresAt: activeExpiresAt
@@ -3538,21 +3860,26 @@ async function executeDirectEmailsBatchOnFiles({
             nativeExpirationApplied = grantRes.nativeExpirationApplied;
           } else {
             created = await createPermission(token, file.id, {
-              type: 'user',
+              type: preferredType,
               role: op.role,
               emailAddress: op.email
             });
           }
+          const resolvedType =
+            created?.resolvedType ||
+            created?.type ||
+            inferPermissionTargetType(op.email, preferredType, contactLookup);
           const createdId = created?.id || `dir-${Date.now()}-${Math.random()}`;
           file.permissions = file.permissions || [];
           const existPerm = file.permissions.find(p => normalizeEntry(p.emailAddress || '') === op.email);
           if (existPerm && existPerm.role !== 'owner') {
             existPerm.id = created?.id || existPerm.id;
+            existPerm.type = resolvedType;
             existPerm.role = op.role;
           } else {
             file.permissions.push({
               id: createdId,
-              type: 'user',
+              type: resolvedType,
               role: op.role,
               emailAddress: op.email,
               displayName: op.name || op.email
@@ -3567,7 +3894,7 @@ async function executeDirectEmailsBatchOnFiles({
               webViewLink: file.webViewLink || '',
               accountEmail: fileOwner,
               permissionId: created?.id || '',
-              targetType: 'user',
+              targetType: resolvedType,
               targetEmail: op.email,
               targetLabel: targetDisplay,
               grantedRole: op.role,
@@ -3588,7 +3915,7 @@ async function executeDirectEmailsBatchOnFiles({
             fileName: file.name || '(无名称)',
             webViewLink: file.webViewLink || '',
             permissionId: created?.id || '',
-            targetType: 'user',
+            targetType: resolvedType,
             targetEmail: op.email,
             targetLabel: targetDisplay,
             previousRole: '',
@@ -5014,13 +5341,14 @@ async function executeBatchLinksPermissions({
         if (task.type === 'grant') {
           let created = null;
           let nativeExpirationApplied = false;
+          const preferredType = inferPermissionTargetType(task.email, 'auto');
           if (taskExpiresAt) {
             const grantRes = await grantPermissionCoreApi(
               meta.token,
               meta.localFile || { mimeType: meta.mimeType },
               task.fileId,
               {
-                type: 'user',
+                type: preferredType,
                 role: task.role,
                 emailAddress: task.email,
                 expiresAt: taskExpiresAt
@@ -5030,11 +5358,13 @@ async function executeBatchLinksPermissions({
             nativeExpirationApplied = grantRes.nativeExpirationApplied;
           } else {
             created = await createPermission(meta.token, task.fileId, {
-              type: 'user',
+              type: preferredType,
               role: task.role,
               emailAddress: task.email
             });
           }
+          const resolvedType =
+            created?.resolvedType || created?.type || inferPermissionTargetType(task.email, preferredType);
 
           if (meta.localFile) {
             meta.localFile.permissions = meta.localFile.permissions || [];
@@ -5042,11 +5372,12 @@ async function executeBatchLinksPermissions({
               p => normalizeEntry(p.emailAddress || '') === task.email
             );
             if (existPerm) {
+              existPerm.type = resolvedType;
               existPerm.role = task.role;
             } else {
               meta.localFile.permissions.push({
                 id: created?.id || `link-${Date.now()}-${Math.random()}`,
-                type: 'user',
+                type: resolvedType,
                 role: task.role,
                 emailAddress: task.email
               });
@@ -5061,7 +5392,7 @@ async function executeBatchLinksPermissions({
               webViewLink: meta.webViewLink,
               accountEmail: meta.accountEmail,
               permissionId: created?.id || '',
-              targetType: 'user',
+              targetType: resolvedType,
               targetEmail: task.email,
               targetLabel: task.email,
               grantedRole: task.role,
@@ -5083,7 +5414,7 @@ async function executeBatchLinksPermissions({
             fileName: meta.fileName,
             webViewLink: meta.webViewLink,
             permissionId: created?.id || '',
-            targetType: 'user',
+            targetType: resolvedType,
             targetEmail: task.email,
             targetLabel: task.email,
             previousRole: '',
@@ -5095,6 +5426,7 @@ async function executeBatchLinksPermissions({
           });
         } else if (task.type === 'revoke') {
           let permId = task.permissionId;
+          let revokedTargetType = inferPermissionTargetType(task.email, 'auto');
           if (!permId) {
             const data = await driveApi(
               meta.token,
@@ -5104,6 +5436,7 @@ async function executeBatchLinksPermissions({
               p => p.role !== 'owner' && normalizeEntry(p.emailAddress || '') === task.email
             );
             permId = matched?.id || '';
+            if (matched?.type) revokedTargetType = matched.type;
           }
           if (permId) {
             await deletePermission(meta.token, task.fileId, permId);
@@ -5122,7 +5455,7 @@ async function executeBatchLinksPermissions({
             fileName: meta.fileName,
             webViewLink: meta.webViewLink,
             permissionId: permId,
-            targetType: 'user',
+            targetType: revokedTargetType,
             targetEmail: task.email,
             targetLabel: task.email,
             previousRole: task.previousRole || '',
@@ -9376,12 +9709,18 @@ async function grantPermissionCoreApi(
   token,
   file,
   fileId,
-  { type = 'user', role = 'reader', emailAddress = '', domain = '', expiresAt = '' } = {}
+  { type = 'auto', role = 'reader', emailAddress = '', domain = '', expiresAt = '' } = {}
 ) {
   const targetFileId = fileId || file?.id || '';
   if (!targetFileId) {
     throw new Error('缺少目标文件 ID');
   }
+
+  const normEmail = emailAddress ? normalizeEntry(emailAddress) : '';
+  const effectiveType =
+    type === 'anyone' || type === 'domain'
+      ? type
+      : inferPermissionTargetType(normEmail, type || 'auto');
 
   const expMs = expiresAt ? Date.parse(String(expiresAt)) : NaN;
   const now = Date.now();
@@ -9391,35 +9730,27 @@ async function grantPermissionCoreApi(
     Number.isFinite(expMs) &&
     expMs > now &&
     expMs - now <= maxNativeSpanMs &&
-    (type === 'user' || type === 'group') &&
+    effectiveType === 'user' &&
     !isFolder;
 
   if (canTryNative) {
-    const params = new URLSearchParams({
-      supportsAllDrives: 'true',
-      sendNotificationEmail: 'false'
-    });
-    const body = {
-      type,
-      role,
-      expirationTime: new Date(expMs).toISOString()
-    };
-    if (emailAddress) body.emailAddress = emailAddress;
-    if (domain) body.domain = domain;
-
     try {
-      const createdPermission = await driveApi(
-        token,
-        `/files/${encodeURIComponent(targetFileId)}/permissions?${params}`,
-        {
-          method: 'POST',
-          body: JSON.stringify(body)
-        }
-      );
-      return { createdPermission, nativeExpirationApplied: true };
+      const createdPermission = await createPermission(token, targetFileId, {
+        type: effectiveType,
+        role,
+        emailAddress: normEmail || undefined,
+        domain: domain || undefined,
+        expirationTime: new Date(expMs).toISOString()
+      });
+      const resolvedType = createdPermission?.resolvedType || createdPermission?.type || effectiveType;
+      return {
+        createdPermission,
+        nativeExpirationApplied: resolvedType === 'user',
+        resolvedType
+      };
     } catch (err) {
       const msg = String(err?.message || err || '');
-      // Drive API 对个人版账号、文件夹或特定共享云端硬盘不支持 expirationTime 时返回 400/403，自动回退普通创建
+      // Drive API 对个人版账号、群组、文件夹或特定共享云端硬盘不支持 expirationTime 时返回 400/403，自动回退普通创建并由扩展本地 TTL 队列接管回收
       if (!/400|403|expiration|cannotSetExpiration|not supported|invalid/i.test(msg)) {
         throw err;
       }
@@ -9427,12 +9758,13 @@ async function grantPermissionCoreApi(
   }
 
   const createdPermission = await createPermission(token, targetFileId, {
-    type,
+    type: effectiveType,
     role,
-    emailAddress: emailAddress || undefined,
+    emailAddress: normEmail || undefined,
     domain: domain || undefined
   });
-  return { createdPermission, nativeExpirationApplied: false };
+  const resolvedType = createdPermission?.resolvedType || createdPermission?.type || effectiveType;
+  return { createdPermission, nativeExpirationApplied: false, resolvedType };
 }
 
 /**
@@ -9443,7 +9775,7 @@ async function grantPermissionWithTtl({
   accountEmail = '',
   file = null,
   fileId = '',
-  type = 'user',
+  type = 'auto',
   role = 'reader',
   emailAddress = '',
   domain = '',
@@ -9465,18 +9797,24 @@ async function grantPermissionWithTtl({
       ? new Date(Date.parse(String(expiresAt))).toISOString()
       : '';
 
-  const { createdPermission, nativeExpirationApplied } = await grantPermissionCoreApi(
+  const normEmail = normalizeEntry(emailAddress);
+  const { createdPermission, nativeExpirationApplied, resolvedType } = await grantPermissionCoreApi(
     activeToken,
     file,
     resolvedFileId,
     {
       type,
       role,
-      emailAddress: normalizeEntry(emailAddress),
+      emailAddress: normEmail,
       domain,
       expiresAt: validExpiresAt
     }
   );
+  const finalTargetType =
+    resolvedType ||
+    createdPermission?.resolvedType ||
+    createdPermission?.type ||
+    (type === 'anyone' || type === 'domain' ? type : inferPermissionTargetType(normEmail, type || 'auto'));
 
   let ttlEntry = null;
   if (validExpiresAt) {
@@ -9487,12 +9825,16 @@ async function grantPermissionWithTtl({
       webViewLink: file ? formatDriveCanonicalLink(file) : `https://drive.google.com/open?id=${resolvedFileId}`,
       accountEmail: resolvedAccount,
       permissionId: createdPermission?.id || '',
-      targetType: type,
-      targetEmail: normalizeEntry(emailAddress),
+      targetType: finalTargetType,
+      targetEmail: normEmail,
       domain,
       targetLabel:
-        normalizeEntry(emailAddress) ||
-        (type === 'anyone' ? '公开链接 (任何人)' : domain ? `域内共享 (${domain})` : '协作者'),
+        normEmail ||
+        (finalTargetType === 'anyone'
+          ? '公开链接 (任何人)'
+          : domain
+          ? `域内共享 (${domain})`
+          : '协作者'),
       grantedRole: role,
       expireAction,
       expiresAt: validExpiresAt,
@@ -9504,7 +9846,8 @@ async function grantPermissionWithTtl({
   return {
     createdPermission,
     nativeExpirationApplied,
-    ttlEntry
+    ttlEntry,
+    resolvedType: finalTargetType
   };
 }
 
@@ -11178,15 +11521,18 @@ async function grantImportRangeSourceAccess({ targetOwnerEmail, sourceIds = [], 
         if (alreadyHasAccess) {
           skippedCount++;
         } else {
+          const preferredType = inferPermissionTargetType(cleanOwner, 'auto');
           const created = await createPermission(manageToken, srcId, {
-            type: 'user',
+            type: preferredType,
             role: 'reader',
             emailAddress: cleanOwner
           });
+          const resolvedType =
+            created?.resolvedType || created?.type || inferPermissionTargetType(cleanOwner, preferredType);
           grantedCount++;
           grantedByFileId.set(srcId, {
             id: created?.id || `ir-${Date.now()}-${Math.random()}`,
-            type: 'user',
+            type: resolvedType,
             role: 'reader',
             emailAddress: cleanOwner
           });
@@ -11200,7 +11546,7 @@ async function grantImportRangeSourceAccess({ targetOwnerEmail, sourceIds = [], 
             fileName: srcMeta.name || `源表格 (${srcId.slice(0, 8)}…)`,
             webViewLink: formatDriveCanonicalLink(srcMeta),
             permissionId: created?.id || '',
-            targetType: 'user',
+            targetType: resolvedType,
             targetEmail: cleanOwner,
             targetLabel: cleanOwner,
             previousRole: '',
@@ -11531,7 +11877,7 @@ async function runRoleBundleOperations({
                   webViewLink: ctx.webViewLink,
                   accountEmail: ctx.accountEmail,
                   permissionId: existing.id,
-                  targetType: 'user',
+                  targetType: existing.type || inferPermissionTargetType(email, 'auto'),
                   targetEmail: email,
                   targetLabel: email,
                   grantedRole: desiredRole,
@@ -11552,7 +11898,7 @@ async function runRoleBundleOperations({
                 fileName: ctx.fileName,
                 webViewLink: ctx.webViewLink,
                 permissionId: existing.id,
-                targetType: 'user',
+                targetType: existing.type || inferPermissionTargetType(email, 'auto'),
                 targetEmail: email,
                 targetLabel: email,
                 previousRole: prevRole,
@@ -11566,13 +11912,14 @@ async function runRoleBundleOperations({
           } else {
             let created = null;
             let nativeExpirationApplied = false;
+            const preferredType = inferPermissionTargetType(email, 'auto');
             if (validExpiresAt) {
               const grantRes = await grantPermissionCoreApi(
                 ctx.token,
                 { mimeType: ctx.mimeType },
                 ctx.fileId,
                 {
-                  type: 'user',
+                  type: preferredType,
                   role: desiredRole,
                   emailAddress: email,
                   expiresAt: validExpiresAt
@@ -11582,14 +11929,16 @@ async function runRoleBundleOperations({
               nativeExpirationApplied = grantRes.nativeExpirationApplied;
             } else {
               created = await createPermission(ctx.token, ctx.fileId, {
-                type: 'user',
+                type: preferredType,
                 role: desiredRole,
                 emailAddress: email
               });
             }
+            const resolvedType =
+              created?.resolvedType || created?.type || inferPermissionTargetType(email, preferredType);
             const newPermObj = {
               id: created?.id || `bdl-${Date.now()}-${Math.random()}`,
-              type: 'user',
+              type: resolvedType,
               role: desiredRole,
               emailAddress: email
             };
@@ -11607,7 +11956,7 @@ async function runRoleBundleOperations({
                 webViewLink: ctx.webViewLink,
                 accountEmail: ctx.accountEmail,
                 permissionId: created?.id || '',
-                targetType: 'user',
+                targetType: resolvedType,
                 targetEmail: email,
                 targetLabel: email,
                 grantedRole: desiredRole,
@@ -11628,7 +11977,7 @@ async function runRoleBundleOperations({
               fileName: ctx.fileName,
               webViewLink: ctx.webViewLink,
               permissionId: created?.id || '',
-              targetType: 'user',
+              targetType: resolvedType,
               targetEmail: email,
               targetLabel: email,
               previousRole: '',
@@ -11660,7 +12009,7 @@ async function runRoleBundleOperations({
               fileName: ctx.fileName,
               webViewLink: ctx.webViewLink,
               permissionId: existing.id,
-              targetType: 'user',
+              targetType: existing.type || inferPermissionTargetType(email, 'auto'),
               targetEmail: email,
               targetLabel: email,
               previousRole: existing.role,
@@ -13140,21 +13489,41 @@ async function executeBatchImportRangeAuth({
 /* ==================== 分组批量增删邮箱与资产绑定分组引擎 ==================== */
 
 /**
- * 批量解析多个邮箱并加入指定分组（保留成员原有其他分组，更新该组个人角色并同步白名单）
+ * 批量解析多个邮箱（支持附带姓名、备注与群组类型）并加入指定分组
  */
-async function batchAddEmailsToGroup(groupName, rawEmailsText, role = '') {
+async function batchAddEmailsToGroup(
+  groupName,
+  rawEmailsText,
+  role = '',
+  { defaultName = '', defaultNote = '', memberType = '' } = {}
+) {
   const cleanGroup = String(groupName || '').trim();
   if (!cleanGroup) {
     throw new Error('请先选择或输入目标分组名称');
-  }
-  const emails = parseEmailListInput(rawEmailsText);
-  if (!emails.length) {
-    throw new Error('请至少输入 1 个有效的邮箱地址');
   }
 
   const dir = await getDirectory();
   let targetGrp = (dir.groups || []).find(g => g.name === cleanGroup);
   const explicitRole = role ? normalizePermissionRole(role, '') : '';
+  const fallbackRoleForParse =
+    explicitRole || normalizePermissionRole(targetGrp?.defaultRole, 'reader') || 'reader';
+
+  let parsedEntries = parseMemberEntriesWithMeta(rawEmailsText, cleanGroup, fallbackRoleForParse);
+  if (!parsedEntries.length) {
+    const fallbackEmails = parseEmailListInput(rawEmailsText);
+    parsedEntries = fallbackEmails.map(em => ({
+      email: em,
+      name: '',
+      note: '',
+      memberType: normalizeMemberType('', em, 'user'),
+      group: cleanGroup,
+      role: fallbackRoleForParse,
+      hasExplicitRole: Boolean(explicitRole)
+    }));
+  }
+  if (!parsedEntries.length) {
+    throw new Error('请至少输入 1 个有效的个人、公司或 Google 群组邮箱地址');
+  }
 
   if (!targetGrp) {
     const defRole = explicitRole || 'reader';
@@ -13167,7 +13536,13 @@ async function batchAddEmailsToGroup(groupName, rawEmailsText, role = '') {
     dir.groups = [...(dir.groups || []), targetGrp];
   }
 
-  const assignedRole = explicitRole || normalizePermissionRole(targetGrp.defaultRole, 'reader') || 'reader';
+  const cleanDefaultName = String(defaultName || '').trim();
+  const cleanDefaultNote = String(defaultNote || '').trim();
+  const explicitTypeOverride =
+    memberType && String(memberType).trim().toLowerCase() !== 'auto'
+      ? normalizeMemberType(memberType, '', '')
+      : '';
+
   const contactByEmail = new Map();
   for (const c of dir.contacts || []) {
     const em = normalizeEntry(c?.email || '');
@@ -13176,9 +13551,30 @@ async function batchAddEmailsToGroup(groupName, rawEmailsText, role = '') {
 
   let addedCount = 0;
   let updatedCount = 0;
+  const processedEmails = [];
+  const seenBatchEmails = new Set();
 
-  for (const em of emails) {
+  for (const item of parsedEntries) {
+    const em = normalizeEntry(item.email || '');
+    if (!em || !em.includes('@')) continue;
+    if (!seenBatchEmails.has(em)) {
+      seenBatchEmails.add(em);
+      processedEmails.push(em);
+    }
+
+    const assignedRole = item.hasExplicitRole
+      ? normalizePermissionRole(item.role, fallbackRoleForParse) || fallbackRoleForParse
+      : fallbackRoleForParse;
+    const incomingName =
+      item.name || (parsedEntries.length === 1 ? cleanDefaultName : cleanDefaultName);
+    const incomingNote = item.note || cleanDefaultNote;
     const existing = contactByEmail.get(em);
+    const resolvedMemberType = normalizeMemberType(
+      explicitTypeOverride || item.memberType,
+      em,
+      existing?.memberType || 'user'
+    );
+
     if (existing) {
       const prevGroups = Array.isArray(existing.groups) ? existing.groups : [];
       const alreadyIn = prevGroups.includes(cleanGroup);
@@ -13187,7 +13583,14 @@ async function batchAddEmailsToGroup(groupName, rawEmailsText, role = '') {
         ...(existing.groupRoles || {}),
         [cleanGroup]: assignedRole
       };
-      if (!existing.role || permissionRoleRank(assignedRole) > permissionRoleRank(existing.role) || existing.groups.length === 1) {
+      if (incomingName) existing.name = incomingName;
+      if (incomingNote) existing.note = incomingNote;
+      existing.memberType = resolvedMemberType;
+      if (
+        !existing.role ||
+        permissionRoleRank(assignedRole) > permissionRoleRank(existing.role) ||
+        existing.groups.length === 1
+      ) {
         existing.role = assignedRole;
       }
       if (alreadyIn) {
@@ -13198,7 +13601,9 @@ async function batchAddEmailsToGroup(groupName, rawEmailsText, role = '') {
     } else {
       const newContact = {
         email: em,
-        name: '',
+        name: incomingName,
+        note: incomingNote,
+        memberType: resolvedMemberType,
         groups: [cleanGroup],
         role: assignedRole,
         groupRoles: { [cleanGroup]: assignedRole },
@@ -13215,7 +13620,231 @@ async function batchAddEmailsToGroup(groupName, rawEmailsText, role = '') {
     directory: savedDir,
     addedCount,
     updatedCount,
-    emails
+    emails: processedEmails,
+    entries: parsedEntries
+  };
+}
+
+/**
+ * 编辑更新单个通讯录成员的姓名、备注、邮箱类型（user/group）、默认角色与所属分组
+ */
+async function updateContactProfile(
+  email,
+  { name, note, memberType, role, groups, groupRoles } = {}
+) {
+  const normEmail = normalizeEntry(email || '');
+  if (!normEmail || !normEmail.includes('@')) {
+    throw new Error('缺少有效的成员邮箱地址');
+  }
+
+  const dir = await getDirectory();
+  let target = (dir.contacts || []).find(c => normalizeEntry(c?.email || '') === normEmail);
+  if (!target) {
+    target = {
+      email: normEmail,
+      name: '',
+      note: '',
+      memberType: normalizeMemberType(memberType, normEmail, 'user'),
+      groups: [],
+      role: 'reader',
+      groupRoles: {}
+    };
+    dir.contacts = [...(dir.contacts || []), target];
+  }
+
+  if (name !== undefined) {
+    target.name = String(name || '').trim();
+  }
+  if (note !== undefined) {
+    target.note = String(note || '').trim();
+  }
+  if (memberType !== undefined) {
+    const cleanType =
+      String(memberType || '').trim().toLowerCase() === 'auto' ? '' : memberType;
+    target.memberType = normalizeMemberType(cleanType, normEmail, target.memberType || 'user');
+  } else {
+    target.memberType = normalizeMemberType(target.memberType, normEmail, 'user');
+  }
+
+  if (Array.isArray(groups)) {
+    target.groups = [...new Set(groups.map(x => String(x || '').trim()).filter(Boolean))];
+  }
+
+  if (groupRoles && typeof groupRoles === 'object') {
+    const nextGroupRoles = {};
+    for (const [gk, gv] of Object.entries(groupRoles)) {
+      const cleanGk = String(gk || '').trim();
+      const cleanGv = normalizePermissionRole(gv, '');
+      if (cleanGk && cleanGv) {
+        nextGroupRoles[cleanGk] = cleanGv;
+      }
+    }
+    target.groupRoles = nextGroupRoles;
+  }
+
+  const roleOrGroupsTouched =
+    role !== undefined || groupRoles !== undefined || Array.isArray(groups);
+
+  if (role !== undefined && String(role).trim() !== '') {
+    const normRole = normalizePermissionRole(role, 'reader') || 'reader';
+    target.role = normRole;
+    if (!groupRoles && Array.isArray(target.groups) && target.groups.length > 0) {
+      const updatedMap = { ...(target.groupRoles || {}) };
+      for (const gName of target.groups) {
+        updatedMap[gName] = normRole;
+      }
+      target.groupRoles = updatedMap;
+    }
+  }
+
+  // 若显式将成员角色或组内角色从可编辑降为仅查看/可评论，先从 policy.writers 移出以便 syncDirectoryToPolicy 准确降级至 policy.readers
+  if (roleOrGroupsTouched) {
+    const groupByName = new Map();
+    for (const g of dir.groups || []) {
+      if (g?.name) groupByName.set(g.name, g);
+    }
+    const activeGroups = (target.groups || []).filter(
+      gName => groupByName.get(gName)?.policyTier !== 'none'
+    );
+    let nextEffectiveRole = '';
+    if ((target.groups || []).length > 0) {
+      let bestRank = 0;
+      for (const gName of activeGroups) {
+        const grp = groupByName.get(gName);
+        const r = getEffectiveMemberRoleInGroup(target, gName, grp);
+        const rank = PERMISSION_ROLE_RANKS[r] || 0;
+        if (rank > bestRank) {
+          bestRank = rank;
+          nextEffectiveRole = r;
+        }
+      }
+    } else {
+      nextEffectiveRole = normalizePermissionRole(target.role, 'reader') || 'reader';
+    }
+
+    if (nextEffectiveRole !== 'writer') {
+      const currentPolicy = await getPolicy();
+      const hadWriter = (currentPolicy.writers || []).some(x => normalizeEntry(x) === normEmail);
+      if (hadWriter) {
+        const nextWriters = (currentPolicy.writers || []).filter(
+          x => normalizeEntry(x) !== normEmail
+        );
+        const nextReaders =
+          nextEffectiveRole === 'reader' || nextEffectiveRole === 'commenter'
+            ? normalizeEmailList([...(currentPolicy.readers || []), normEmail])
+            : (currentPolicy.readers || []).filter(x => normalizeEntry(x) !== normEmail);
+        await safeStorageSet({
+          policy: {
+            ...currentPolicy,
+            writers: nextWriters,
+            readers: nextReaders
+          }
+        });
+      }
+    }
+  }
+
+  target._replaceProfile = true;
+  const savedDir = await saveDirectory(dir);
+  const updatedContact =
+    (savedDir.contacts || []).find(c => normalizeEntry(c?.email || '') === normEmail) || null;
+
+  return {
+    directory: savedDir,
+    contact: updatedContact
+  };
+}
+
+/**
+ * 将成员从指定分组中移出：
+ * - 传入具体 groupName 时仅移除该分组归属（允许 groups: [] 保留为「暂未归组」，完整保留姓名与备注）；
+ * - 未传 groupName 或传 'all' / '*' 时，从通讯录与白名单彻底移除该成员。
+ */
+async function removeContactFromGroup(email, groupName = '') {
+  const normEmail = normalizeEntry(email || '');
+  if (!normEmail || !normEmail.includes('@')) {
+    throw new Error('缺少有效的成员邮箱地址');
+  }
+  const cleanGroup = String(groupName || '').trim();
+  const removeAll = !cleanGroup || cleanGroup === 'all' || cleanGroup === '*';
+
+  const dir = await getDirectory();
+  const groupByName = new Map();
+  for (const g of dir.groups || []) {
+    if (g?.name) groupByName.set(g.name, g);
+  }
+
+  let completelyRemoved = false;
+  let shouldDemoteFromWriters = false;
+  const nextContacts = [];
+
+  for (const c of dir.contacts || []) {
+    const em = normalizeEntry(c?.email || '');
+    if (em !== normEmail) {
+      nextContacts.push(c);
+      continue;
+    }
+    if (removeAll) {
+      completelyRemoved = true;
+      continue;
+    }
+    const remainingGroups = (c.groups || []).filter(g => g !== cleanGroup);
+    const nextGroupRoles = { ...(c.groupRoles || {}) };
+    delete nextGroupRoles[cleanGroup];
+
+    let updatedRole = c.role || 'reader';
+    if (remainingGroups.length > 0) {
+      let bestRank = 0;
+      let bestRole = '';
+      for (const gName of remainingGroups) {
+        const grp = groupByName.get(gName);
+        const candidate = nextGroupRoles[gName] || grp?.defaultRole || 'reader';
+        const rank = PERMISSION_ROLE_RANKS[candidate] || 0;
+        if (rank > bestRank) {
+          bestRank = rank;
+          bestRole = candidate;
+        }
+      }
+      if (bestRole) updatedRole = bestRole;
+    }
+    if (updatedRole !== 'writer') {
+      shouldDemoteFromWriters = true;
+    }
+
+    nextContacts.push({
+      ...c,
+      groups: remainingGroups,
+      role: updatedRole,
+      groupRoles: nextGroupRoles,
+      _replaceProfile: true
+    });
+  }
+
+  if (completelyRemoved || shouldDemoteFromWriters) {
+    const currentPolicy = await getPolicy();
+    const nextWriters = (currentPolicy.writers || []).filter(x => normalizeEntry(x) !== normEmail);
+    const nextReaders = completelyRemoved
+      ? (currentPolicy.readers || []).filter(x => normalizeEntry(x) !== normEmail)
+      : currentPolicy.readers || [];
+    await safeStorageSet({
+      policy: {
+        ...currentPolicy,
+        writers: nextWriters,
+        readers: nextReaders
+      }
+    });
+  }
+
+  const savedDir = await saveDirectory({
+    ...dir,
+    contacts: nextContacts
+  });
+
+  return {
+    directory: savedDir,
+    removedEmail: normEmail,
+    groupName: cleanGroup,
+    completelyRemoved
   };
 }
 
@@ -14134,5 +14763,440 @@ function matchThirdPartyOAuthUrl(
     redirectDomain,
     reason: reasons.join(' · '),
     clientId
+  };
+}
+
+
+// ============================================================================
+// v1.2.2：全量扩展配置导出与导入引擎（换机/团队同步 · 严格剥离全部令牌与密钥）
+// ============================================================================
+
+const FULL_CONFIG_SCHEMA_V2 = 'gdrive_tools_full_config_v2';
+
+function sanitizeFilterPresetsList(rawPresets = []) {
+  const list = Array.isArray(rawPresets) ? rawPresets : [];
+  const cleaned = [];
+  const seenKeys = new Set();
+
+  for (const raw of list) {
+    if (!raw || typeof raw !== 'object') continue;
+    const name = String(raw.name || '').trim();
+    if (!name) continue;
+    const id = String(raw.id || `preset_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`).trim();
+    const dedupeKey = id || name.toLowerCase();
+    if (seenKeys.has(dedupeKey)) continue;
+    seenKeys.add(dedupeKey);
+
+    const statusFilter = String(raw.statusFilter || raw.filter || 'all');
+    const pattern = String(raw.pattern || raw.sortMode || 'default');
+
+    cleaned.push({
+      id,
+      name,
+      search: String(raw.search || ''),
+      matchMode: String(raw.matchMode || 'or').trim() || 'or',
+      excludeSearch: String(raw.excludeSearch || ''),
+      types: Array.isArray(raw.types)
+        ? raw.types.map(t => String(t || '').trim()).filter(Boolean)
+        : undefined,
+      groupFilter: String(raw.groupFilter || 'all'),
+      statusFilter,
+      pattern,
+      hidePrivate: Boolean(raw.hidePrivate),
+      filter: String(raw.filter || statusFilter || 'all'),
+      typeFilter: String(raw.typeFilter || 'all'),
+      sortMode: String(raw.sortMode || pattern || 'default'),
+      createdAt: String(raw.createdAt || new Date().toISOString())
+    });
+  }
+
+  return cleaned;
+}
+
+/**
+ * 聚合导出全部本地业务配置设置（白名单、排除目录、定时巡检、OAuth拦截规则、通讯录分组与姓名备注、岗位包、合作方档案、筛选预设、主题）
+ * 严格排除任何 OAuth 客户端密钥、服务账号私钥或已授权账号令牌
+ */
+async function exportAllExtensionConfig({ theme = '' } = {}) {
+  const [policy, directory, roleBundles, partnerProfiles, filterPresets] = await Promise.all([
+    getPolicy(),
+    getDirectory(),
+    getRoleBundles(),
+    getPartnerProfiles(),
+    getFilterPresets()
+  ]);
+
+  let resolvedTheme = String(theme || '').trim();
+  if (!resolvedTheme) {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        resolvedTheme = String(localStorage.getItem('color-scheme') || '').trim();
+      }
+    } catch (_te) {}
+  }
+  if (!['light', 'dark', 'system'].includes(resolvedTheme)) {
+    resolvedTheme = '';
+  }
+
+  const safeContacts = (directory?.contacts || []).map(c => ({
+    email: normalizeEntry(c?.email || ''),
+    name: String(c?.name || '').trim(),
+    note: String(c?.note || '').trim(),
+    memberType: normalizeMemberType(c?.memberType, c?.email || '', 'user'),
+    groups: Array.isArray(c?.groups) ? c.groups.map(g => String(g || '').trim()).filter(Boolean) : [],
+    role: normalizePermissionRole(c?.role, 'reader') || 'reader',
+    groupRoles: c?.groupRoles && typeof c.groupRoles === 'object' ? { ...c.groupRoles } : {}
+  }));
+
+  const safeGroups = (directory?.groups || []).map(g => ({
+    name: String(g?.name || '').trim(),
+    defaultRole: normalizePermissionRole(g?.defaultRole, 'reader') || 'reader',
+    policyTier: ['writer', 'reader', 'none'].includes(g?.policyTier)
+      ? g.policyTier
+      : g?.defaultRole === 'writer'
+        ? 'writer'
+        : 'reader',
+    assets: Array.isArray(g?.assets)
+      ? g.assets.map(a => ({
+          fileId: String(a?.fileId || a?.id || '').trim(),
+          fileName: String(a?.fileName || a?.name || '(无名称)').trim(),
+          mimeType: String(a?.mimeType || ''),
+          webViewLink: String(a?.webViewLink || '')
+        }))
+      : []
+  }));
+
+  return {
+    schema: FULL_CONFIG_SCHEMA_V2,
+    version: '1.2.2',
+    exportedAt: new Date().toISOString(),
+    policy: {
+      writers: normalizeEmailList(policy.writers || []),
+      readers: normalizeEmailList(policy.readers || []),
+      publicLinkRule: ['forbid', 'reader_only', 'allow'].includes(policy.publicLinkRule)
+        ? policy.publicLinkRule
+        : 'forbid',
+      scheduleEnabled: Boolean(policy.scheduleEnabled),
+      scheduleMinutes: Number(policy.scheduleMinutes) || 720,
+      scanOnBrowserStartup: policy.scanOnBrowserStartup !== false,
+      autoEnforce: Boolean(policy.autoEnforce),
+      excludedFolders: sanitizeExcludedFoldersList(policy.excludedFolders || []),
+      thirdPartyOAuthGuardEnabled: policy.thirdPartyOAuthGuardEnabled !== false,
+      oauthGuardMode: policy.oauthGuardMode === 'alert' ? 'alert' : 'block',
+      blockThirdPartyDriveScope: policy.blockThirdPartyDriveScope !== false,
+      blockThirdPartySheetsScope: policy.blockThirdPartySheetsScope !== false,
+      blockedAppKeywords: sanitizeBlockedKeywordsList(policy.blockedAppKeywords || []),
+      trustedOAuthKeywords: sanitizeTrustedKeywordsList(policy.trustedOAuthKeywords || [])
+    },
+    directory: {
+      groups: safeGroups,
+      contacts: safeContacts
+    },
+    roleBundles: Array.isArray(roleBundles) ? roleBundles : [],
+    partnerProfiles: Array.isArray(partnerProfiles) ? partnerProfiles : [],
+    filterPresets: sanitizeFilterPresetsList(filterPresets),
+    uiPreferences: {
+      theme: resolvedTheme
+    }
+  };
+}
+
+/**
+ * 一键导入恢复全量扩展配置（兼容新版 gdrive_tools_full_config_v2 与旧版白名单/分组 JSON，支持 merge / replace 模式）
+ * 严格拦截废弃免授权凭证与原始 OAuth 密钥文件
+ */
+async function importAllExtensionConfig(rawObj, { mode = 'merge' } = {}) {
+  let parsed = rawObj;
+  if (typeof rawObj === 'string') {
+    try {
+      parsed = JSON.parse(rawObj);
+    } catch (_je) {
+      throw new Error('配置文件不是合法的 JSON 格式，请检查文件内容');
+    }
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('无效的配置 JSON 对象');
+  }
+
+  if (isDeprecatedAuthPassportJson(parsed)) {
+    throw new Error(DEPRECATED_PASSPORT_ERROR_MSG);
+  }
+
+  if (
+    parsed.installed ||
+    parsed.web ||
+    (parsed.type === 'service_account' && parsed.private_key) ||
+    (parsed.client_id && parsed.client_secret)
+  ) {
+    throw new Error(
+      '检测到您选择的是 Google OAuth 客户端密钥文件，请前往左侧账号区使用「导入 OAuth 客户端 JSON」按钮导入'
+    );
+  }
+
+  const isReplace = String(mode || 'merge').toLowerCase() === 'replace';
+  const [curPolicy, curDir, curBundles, curPartners, curPresets] = await Promise.all([
+    getPolicy(),
+    getDirectory(),
+    getRoleBundles(),
+    getPartnerProfiles(),
+    getFilterPresets()
+  ]);
+
+  // 1. 恢复 Policy（兼容顶层旧格式与嵌套 policy 对象）
+  const rawPolicySrc =
+    parsed.policy && typeof parsed.policy === 'object' && !Array.isArray(parsed.policy)
+      ? parsed.policy
+      : parsed;
+
+  const incomingWriters = Array.isArray(rawPolicySrc.writers)
+    ? normalizeEmailList(rawPolicySrc.writers)
+    : [];
+  const incomingReaders = Array.isArray(rawPolicySrc.readers)
+    ? normalizeEmailList(rawPolicySrc.readers)
+    : [];
+  const mergedWriters = isReplace
+    ? incomingWriters
+    : normalizeEmailList([...(curPolicy.writers || []), ...incomingWriters]);
+  const mergedWriterSet = new Set(mergedWriters);
+  const mergedReaders = (
+    isReplace
+      ? incomingReaders
+      : normalizeEmailList([...(curPolicy.readers || []), ...incomingReaders])
+  ).filter(em => !mergedWriterSet.has(em));
+
+  const incomingExcluded = Array.isArray(rawPolicySrc.excludedFolders)
+    ? sanitizeExcludedFoldersList(rawPolicySrc.excludedFolders)
+    : [];
+  let mergedExcludedFolders;
+  if (isReplace) {
+    mergedExcludedFolders = incomingExcluded;
+  } else {
+    const exMap = new Map();
+    for (const item of curPolicy.excludedFolders || []) exMap.set(item.id, item);
+    for (const item of incomingExcluded) exMap.set(item.id, { ...exMap.get(item.id), ...item });
+    mergedExcludedFolders = [...exMap.values()];
+  }
+
+  const nextBlockedKeywords =
+    rawPolicySrc.blockedAppKeywords !== undefined
+      ? sanitizeBlockedKeywordsList(rawPolicySrc.blockedAppKeywords)
+      : curPolicy.blockedAppKeywords;
+
+  const nextTrustedKeywords =
+    rawPolicySrc.trustedOAuthKeywords !== undefined
+      ? isReplace
+        ? sanitizeTrustedKeywordsList(rawPolicySrc.trustedOAuthKeywords)
+        : sanitizeTrustedKeywordsList([
+            ...(curPolicy.trustedOAuthKeywords || []),
+            ...sanitizeTrustedKeywordsList(rawPolicySrc.trustedOAuthKeywords)
+          ])
+      : curPolicy.trustedOAuthKeywords;
+
+  const policyPatch = {
+    writers: mergedWriters,
+    readers: mergedReaders,
+    publicLinkRule:
+      rawPolicySrc.publicLinkRule !== undefined ? rawPolicySrc.publicLinkRule : curPolicy.publicLinkRule,
+    scheduleEnabled:
+      rawPolicySrc.scheduleEnabled !== undefined
+        ? Boolean(rawPolicySrc.scheduleEnabled)
+        : curPolicy.scheduleEnabled,
+    scheduleMinutes:
+      rawPolicySrc.scheduleMinutes !== undefined
+        ? Number(rawPolicySrc.scheduleMinutes)
+        : curPolicy.scheduleMinutes,
+    scanOnBrowserStartup:
+      rawPolicySrc.scanOnBrowserStartup !== undefined
+        ? Boolean(rawPolicySrc.scanOnBrowserStartup)
+        : curPolicy.scanOnBrowserStartup,
+    autoEnforce:
+      rawPolicySrc.autoEnforce !== undefined ? Boolean(rawPolicySrc.autoEnforce) : curPolicy.autoEnforce,
+    excludedFolders: mergedExcludedFolders,
+    thirdPartyOAuthGuardEnabled:
+      rawPolicySrc.thirdPartyOAuthGuardEnabled !== undefined
+        ? Boolean(rawPolicySrc.thirdPartyOAuthGuardEnabled)
+        : curPolicy.thirdPartyOAuthGuardEnabled,
+    oauthGuardMode:
+      rawPolicySrc.oauthGuardMode !== undefined ? rawPolicySrc.oauthGuardMode : curPolicy.oauthGuardMode,
+    blockThirdPartyDriveScope:
+      rawPolicySrc.blockThirdPartyDriveScope !== undefined
+        ? Boolean(rawPolicySrc.blockThirdPartyDriveScope)
+        : curPolicy.blockThirdPartyDriveScope,
+    blockThirdPartySheetsScope:
+      rawPolicySrc.blockThirdPartySheetsScope !== undefined
+        ? Boolean(rawPolicySrc.blockThirdPartySheetsScope)
+        : curPolicy.blockThirdPartySheetsScope,
+    blockedAppKeywords: nextBlockedKeywords,
+    trustedOAuthKeywords: nextTrustedKeywords
+  };
+
+  await savePolicy(policyPatch);
+
+  // 2. 恢复 Directory（分组 + 绑定资产 + 成员姓名/备注/群组类型）
+  const rawDirSrc =
+    parsed.directory && typeof parsed.directory === 'object' && !Array.isArray(parsed.directory)
+      ? parsed.directory
+      : Array.isArray(parsed.groups) || Array.isArray(parsed.contacts)
+      ? { groups: parsed.groups || [], contacts: parsed.contacts || [] }
+      : null;
+
+  let finalDirectory = curDir;
+  if (rawDirSrc) {
+    if (isReplace) {
+      finalDirectory = await saveDirectory(rawDirSrc);
+    } else {
+      const grpMap = new Map();
+      for (const g of curDir.groups || []) {
+        if (g?.name) grpMap.set(g.name, { ...g, assets: Array.isArray(g.assets) ? [...g.assets] : [] });
+      }
+      for (const incG of rawDirSrc.groups || []) {
+        const gName = String(incG?.name || '').trim();
+        if (!gName) continue;
+        const prevG = grpMap.get(gName);
+        if (prevG) {
+          const assetMap = new Map();
+          for (const a of prevG.assets || []) {
+            const fid = String(a?.fileId || a?.id || '').trim();
+            if (fid) assetMap.set(fid, a);
+          }
+          for (const a of incG.assets || []) {
+            const fid = String(a?.fileId || a?.id || '').trim();
+            if (fid) assetMap.set(fid, { ...assetMap.get(fid), ...a, fileId: fid });
+          }
+          grpMap.set(gName, {
+            ...prevG,
+            ...incG,
+            name: gName,
+            assets: [...assetMap.values()]
+          });
+        } else {
+          grpMap.set(gName, incG);
+        }
+      }
+      finalDirectory = await saveDirectory({
+        groups: [...grpMap.values()],
+        contacts: [...(curDir.contacts || []), ...(rawDirSrc.contacts || [])]
+      });
+    }
+  }
+
+  // 3. 恢复岗位权限包 Role Bundles
+  let finalRoleBundles = curBundles;
+  if (Array.isArray(parsed.roleBundles)) {
+    if (isReplace) {
+      finalRoleBundles = await saveRoleBundles(parsed.roleBundles);
+    } else {
+      const bundleByNameOrId = new Map();
+      for (const b of curBundles || []) {
+        const key = String(b?.id || b?.name || '').trim();
+        if (key) bundleByNameOrId.set(key, b);
+      }
+      for (const incB of parsed.roleBundles) {
+        if (!incB || !incB.name) continue;
+        const matchExisting = [...bundleByNameOrId.values()].find(
+          x => x.id === incB.id || x.name === incB.name
+        );
+        const key = matchExisting ? String(matchExisting.id || matchExisting.name) : String(incB.id || incB.name);
+        bundleByNameOrId.set(key, {
+          ...matchExisting,
+          ...incB,
+          id: matchExisting?.id || incB.id
+        });
+      }
+      finalRoleBundles = await saveRoleBundles([...bundleByNameOrId.values()]);
+    }
+  }
+
+  // 4. 恢复外部合作方档案 Partner Profiles
+  let finalPartnerProfiles = curPartners;
+  if (Array.isArray(parsed.partnerProfiles)) {
+    if (isReplace) {
+      finalPartnerProfiles = await savePartnerProfiles(parsed.partnerProfiles);
+    } else {
+      const partnerMap = new Map();
+      for (const p of curPartners || []) {
+        const key = String(p?.id || p?.name || '').trim();
+        if (key) partnerMap.set(key, p);
+      }
+      for (const incP of parsed.partnerProfiles) {
+        if (!incP || !incP.name) continue;
+        const matchExisting = [...partnerMap.values()].find(
+          x => x.id === incP.id || x.name === incP.name
+        );
+        const key = matchExisting ? String(matchExisting.id || matchExisting.name) : String(incP.id || incP.name);
+        partnerMap.set(key, {
+          ...matchExisting,
+          ...incP,
+          id: matchExisting?.id || incP.id
+        });
+      }
+      finalPartnerProfiles = await savePartnerProfiles([...partnerMap.values()]);
+    }
+  }
+
+  // 5. 恢复筛选预设 Filter Presets
+  let finalFilterPresets = curPresets;
+  if (Array.isArray(parsed.filterPresets)) {
+    const cleanIncomingPresets = sanitizeFilterPresetsList(parsed.filterPresets);
+    if (isReplace) {
+      finalFilterPresets = await saveFilterPresets(cleanIncomingPresets);
+    } else {
+      const presetMap = new Map();
+      for (const pr of sanitizeFilterPresetsList(curPresets)) {
+        presetMap.set(pr.name.toLowerCase(), pr);
+      }
+      for (const incPr of cleanIncomingPresets) {
+        const prevPr = presetMap.get(incPr.name.toLowerCase());
+        presetMap.set(incPr.name.toLowerCase(), {
+          ...prevPr,
+          ...incPr,
+          id: prevPr?.id || incPr.id
+        });
+      }
+      finalFilterPresets = await saveFilterPresets([...presetMap.values()]);
+    }
+  }
+
+  // 6. 恢复界面偏好（浅色/深色主题）
+  const rawTheme = String(parsed.uiPreferences?.theme || parsed.theme || '').trim();
+  const resolvedTheme = ['light', 'dark', 'system'].includes(rawTheme) ? rawTheme : '';
+  if (resolvedTheme) {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        if (resolvedTheme === 'light' || resolvedTheme === 'dark') {
+          localStorage.setItem('color-scheme', resolvedTheme);
+        } else if (resolvedTheme === 'system') {
+          localStorage.removeItem('color-scheme');
+        }
+      }
+    } catch (_te) {}
+  }
+
+  const finalPolicy = await getPolicy();
+  const summary = {
+    schema: String(parsed.schema || 'legacy_policy_json'),
+    mode: isReplace ? 'replace' : 'merge',
+    writersCount: finalPolicy.writers.length,
+    readersCount: finalPolicy.readers.length,
+    excludedFoldersCount: finalPolicy.excludedFolders.length,
+    blockedKeywordsCount: finalPolicy.blockedAppKeywords.length,
+    trustedKeywordsCount: finalPolicy.trustedOAuthKeywords.length,
+    groupsCount: finalDirectory.groups.length,
+    contactsCount: finalDirectory.contacts.length,
+    roleBundlesCount: finalRoleBundles.length,
+    partnerProfilesCount: finalPartnerProfiles.length,
+    filterPresetsCount: finalFilterPresets.length,
+    theme: resolvedTheme
+  };
+
+  return {
+    policy: finalPolicy,
+    directory: finalDirectory,
+    roleBundles: finalRoleBundles,
+    partnerProfiles: finalPartnerProfiles,
+    filterPresets: finalFilterPresets,
+    uiPreferences: { theme: resolvedTheme },
+    summary
   };
 }

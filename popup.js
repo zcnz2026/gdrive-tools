@@ -38,6 +38,7 @@ const state = {
   pickedExcludedFolderIds: new Set(),
   autoScanCheckpoint: null,
   thirdPartyAppAlerts: [],
+  editingContactEmail: '',
   expandedPermFileIds: new Set(),
   inspectedFileId: '',
   rightPaneCollapsed: false,
@@ -836,6 +837,26 @@ function extractEmailsFromText(rawText = '') {
   return [...new Set(matches.map(e => normalizeEntry(e)).filter(Boolean))];
 }
 
+function isGroupEmailCompat(email = '', memberType = '', permType = '') {
+  if (permType === 'group' || memberType === 'group') return true;
+  if (typeof isGoogleGroupEmail === 'function') {
+    return Boolean(isGoogleGroupEmail(email));
+  }
+  return /@googlegroups\./i.test(String(email || '').trim());
+}
+
+function inferTargetTypeCompat(email = '', explicitType = '') {
+  if (typeof inferPermissionTargetType === 'function') {
+    return inferPermissionTargetType(email, explicitType);
+  }
+  if (explicitType === 'group' || explicitType === 'user') return explicitType;
+  return isGroupEmailCompat(email) ? 'group' : 'user';
+}
+
+function renderGroupEmailBadgeHtml(isGroup) {
+  return isGroup ? '<span class="group-email-badge badge">👥 群组</span>' : '';
+}
+
 function groupRoleDisplayLabel(role = 'reader') {
   if (role === 'writer') return '可编辑';
   if (role === 'commenter') return '可评论';
@@ -882,15 +903,20 @@ async function handleOAuthFilesUpload(fileList) {
         Array.isArray(parsed) ||
         (parsed &&
           typeof parsed === 'object' &&
-          (parsed.policy ||
+          (parsed.schema === 'gdrive_tools_full_config_v2' ||
+            parsed.policy ||
             parsed.directory ||
             Array.isArray(parsed.writers) ||
             Array.isArray(parsed.readers) ||
             Array.isArray(parsed.allowList) ||
             Array.isArray(parsed.groups) ||
-            Array.isArray(parsed.contacts)))
+            Array.isArray(parsed.contacts) ||
+            Array.isArray(parsed.roleBundles) ||
+            Array.isArray(parsed.partnerProfiles) ||
+            Array.isArray(parsed.filterPresets) ||
+            Array.isArray(parsed.excludedFolders)))
       ) {
-        await importAllowlistFromObject(parsed);
+        await importFullConfigFromObject(parsed);
         allowlistImported = true;
       } else {
         rejectedCount++;
@@ -1111,6 +1137,8 @@ function getFilteredFiles() {
             dom,
             dom ? `@${dom}` : '',
             (contact?.name || '').toLowerCase(),
+            (contact?.note || '').toLowerCase(),
+            isGroupEmailCompat(em, contact?.memberType, p.type) ? '群组 group' : '',
             ...(contact?.groups || []).map(g => g.toLowerCase())
           ].join(' ');
         })
@@ -2049,14 +2077,20 @@ function renderBatchLinksEmailPicker() {
     return (
       p.email.includes(q) ||
       (p.name || '').toLowerCase().includes(q) ||
+      (p.note || '').toLowerCase().includes(q) ||
+      (p.isGroup && (q.includes('群组') || q === 'group')) ||
       (p.groups || []).some(g => g.toLowerCase().includes(q))
     );
   });
   for (const p of people.slice(0, 60)) {
     const grpText = p.groups?.length ? ` (${p.groups.join('、')})` : '';
+    const typeBadgeHtml = p.isGroup
+      ? renderGroupEmailBadgeHtml(true)
+      : '<span class="badge">邮箱</span>';
+    const noteHtml = p.note ? `<span class="member-note-text muted"> · ${escapeHtml(p.note)}</span>` : '';
     chunks.push(`<button type="button" class="picker-item picker-item-btn" data-action="batch-pick-single-email" data-email="${escapeHtml(p.email)}">
-      <span class="badge">邮箱</span>
-      <span class="picker-item-name">${escapeHtml(p.name ? `${p.name} · ${p.email}` : p.email)}${escapeHtml(grpText)}</span>
+      ${typeBadgeHtml}
+      <span class="picker-item-name">${escapeHtml(p.name ? `${p.name} · ${p.email}` : p.email)}${escapeHtml(grpText)}${noteHtml}</span>
     </button>`);
   }
 
@@ -2209,7 +2243,14 @@ function renderFileInspector() {
   listNode.innerHTML = perms
     .map(p => {
       const ev = evaluatePermission(p, state.policy, ownerEmail);
-      const isOwner = p.role === 'owner' || normalizeEntry(p.emailAddress || '') === normalizeEntry(ownerEmail);
+      const permEmail = normalizeEntry(p.emailAddress || '');
+      const contact = permEmail ? contactLookup.get(permEmail) : null;
+      const isGroupPerm = isGroupEmailCompat(permEmail, contact?.memberType, p.type);
+      const groupBadgeHtml = renderGroupEmailBadgeHtml(isGroupPerm);
+      const noteHtml = contact?.note
+        ? `<div class="member-note-text muted">备注：${escapeHtml(contact.note)}</div>`
+        : '';
+      const isOwner = p.role === 'owner' || permEmail === normalizeEntry(ownerEmail);
       const inherited = permIsInherited(p);
       let labelText = permissionLabel(p, contactLookup);
       if (p.type === 'anyone') labelText = '公开链接 (知道链接的任何人)';
@@ -2235,8 +2276,9 @@ function renderFileInspector() {
       if (inherited) {
         return `<div class="inspector-perm-row">
           <div class="inspector-perm-info" title="${escapeHtml(labelText)}">
-            <span>${escapeHtml(labelText)}</span>
-            <span class="muted"> (${escapeHtml(roleLabel(p.role))} · 继承自上级目录)</span>${ttlBadgeHtml}
+            <div><span>${escapeHtml(labelText)}</span> ${groupBadgeHtml}
+            <span class="muted"> (${escapeHtml(roleLabel(p.role))} · 继承自上级目录)</span>${ttlBadgeHtml}</div>
+            ${noteHtml}
           </div>
           <span class="badge">继承</span>
         </div>`;
@@ -2252,8 +2294,9 @@ function renderFileInspector() {
 
       return `<div class="inspector-perm-row ${escapeHtml(ev.status)}">
         <div class="inspector-perm-info" title="${escapeHtml(labelText)} (${escapeHtml(ev.reason)})">
-          <strong>${escapeHtml(labelText)}</strong>
-          ${ev.status !== 'compliant' ? `<span class="muted"> · ${escapeHtml(ev.reason)}</span>` : ''}${ttlBadgeHtml}
+          <div><strong>${escapeHtml(labelText)}</strong> ${groupBadgeHtml}
+          ${ev.status !== 'compliant' ? `<span class="muted"> · ${escapeHtml(ev.reason)}</span>` : ''}${ttlBadgeHtml}</div>
+          ${noteHtml}
         </div>
         <div class="row-flex">
           ${roleSelectHtml}
@@ -2924,6 +2967,22 @@ function renderGroupSelectorsAndBatchBar() {
     ].join('');
   }
 
+  // 7.5 #dir-member-group-filter（分组人员通讯录按分组筛选下拉）
+  const dirGrpFilter = $('dir-member-group-filter');
+  if (dirGrpFilter) {
+    const prevDirGrp = dirGrpFilter.value || 'all';
+    dirGrpFilter.innerHTML = [
+      `<option value="all">全部所属分组 (${groups.length})</option>`,
+      `<option value="__ungrouped__">暂未归组</option>`,
+      ...groups.map(
+        g => `<option value="${escapeHtml(g.name)}">${escapeHtml(g.name)} (${groupCountMap.get(g.name) || 0}人)</option>`
+      )
+    ].join('');
+    if ([...dirGrpFilter.options].some(o => o.value === prevDirGrp)) {
+      dirGrpFilter.value = prevDirGrp;
+    }
+  }
+
   // 8. 批量授权选择器（旧下拉 + 新可搜索单点浮层）
   renderBatchLinksFolderPicker();
   renderBatchLinksAssetPicker();
@@ -2939,9 +2998,13 @@ function buildMergedPersonList() {
   for (const c of state.directory.contacts || []) {
     const email = normalizeEntry(c.email);
     if (!email) continue;
+    const isGroup = isGroupEmailCompat(email, c.memberType, '');
     map.set(email, {
       email,
       name: c.name || '',
+      note: c.note || '',
+      memberType: isGroup ? 'group' : 'user',
+      isGroup,
       groups: [...(c.groups || [])],
       contactRole: c.role || '',
       groupRoles: c.groupRoles && typeof c.groupRoles === 'object' ? { ...c.groupRoles } : {},
@@ -2963,9 +3026,13 @@ function buildMergedPersonList() {
 
       if (!map.has(email)) {
         const contact = contactLookup.get(email);
+        const isGroup = isGroupEmailCompat(email, contact?.memberType, p.type);
         map.set(email, {
           email,
           name: contact?.name || p.displayName || '',
+          note: contact?.note || '',
+          memberType: isGroup ? 'group' : 'user',
+          isGroup,
           groups: contact?.groups ? [...contact.groups] : [],
           contactRole: contact?.role || '',
           groupRoles: contact?.groupRoles && typeof contact.groupRoles === 'object' ? { ...contact.groupRoles } : {},
@@ -2977,6 +3044,10 @@ function buildMergedPersonList() {
         });
       }
       const item = map.get(email);
+      if (p.type === 'group') {
+        item.isGroup = true;
+        item.memberType = 'group';
+      }
       if (!seenInFile.has(email)) {
         seenInFile.add(email);
         item.fileCount++;
@@ -3016,6 +3087,7 @@ function renderCollaboratorsDomainView(query = '') {
   const tbody = $('collab-domain-rows');
   if (!tbody) return;
   const catFilter = $('collab-domain-category-filter')?.value || 'all';
+  const contactLookup = buildContactLookup(state.directory);
   const domains = buildDomainAuditSummary(
     getScopedFilesByAccount(),
     state.directory,
@@ -3027,7 +3099,15 @@ function renderCollaboratorsDomainView(query = '') {
     const cleanQ = query.replace(/^@/, '');
     return (
       d.domain.includes(cleanQ) ||
-      (d.users || []).some(u => u.email.includes(query) || (u.name || '').toLowerCase().includes(query))
+      (d.users || []).some(u => {
+        const em = normalizeEntry(u.email || '');
+        const c = em ? contactLookup.get(em) : null;
+        return (
+          u.email.includes(query) ||
+          (u.name || '').toLowerCase().includes(query) ||
+          (c?.note || '').toLowerCase().includes(query)
+        );
+      })
     );
   });
 
@@ -3122,6 +3202,8 @@ function renderCollaboratorsTab() {
       return (
         p.email.includes(query) ||
         p.name.toLowerCase().includes(query) ||
+        (p.note || '').toLowerCase().includes(query) ||
+        (p.isGroup && (query.includes('群组') || query === 'group')) ||
         p.groups.some(g => g.toLowerCase().includes(query))
       );
     })
@@ -3139,6 +3221,9 @@ function renderCollaboratorsTab() {
       let tierBadge = `<span class="status-pill danger">非白名单</span>`;
       if (p.inWriters) tierBadge = `<span class="status-pill ok">允许编辑</span>`;
       else if (p.inReaders) tierBadge = `<span class="status-pill warning">仅限查看</span>`;
+
+      const groupBadgeHtml = renderGroupEmailBadgeHtml(p.isGroup);
+      const noteHtml = p.note ? `<div class="member-note-text muted">${escapeHtml(p.note)}</div>` : '';
 
       const currentGrpTags = p.groups
         .map(g => {
@@ -3161,8 +3246,9 @@ function renderCollaboratorsTab() {
 
       return `<tr>
         <td>
-          <div><strong>${escapeHtml(p.name || '未填姓名')}</strong></div>
+          <div class="row-flex wrap-flex"><strong>${escapeHtml(p.name || '未填姓名')}</strong> ${groupBadgeHtml}</div>
           <div class="muted">${escapeHtml(p.email)}</div>
+          ${noteHtml}
         </td>
         <td>
           <div>${tierBadge}</div>
@@ -4596,6 +4682,10 @@ function handleIrClearTable() {
 async function handleGroupQuickAddEmails() {
   const grpName = ($('group-quick-add-select')?.value || '').trim();
   const role = ($('group-quick-add-role')?.value || '').trim();
+  const defaultName = ($('group-quick-add-name')?.value || '').trim();
+  const defaultNote = ($('group-quick-add-note')?.value || '').trim();
+  const rawTypeVal = ($('group-quick-add-type')?.value || 'auto').trim();
+  const memberType = rawTypeVal === 'group' || rawTypeVal === 'user' ? rawTypeVal : '';
   const rawEmails = ($('group-quick-add-emails')?.value || '').trim();
   if (!grpName) {
     toast('请先选择要加入的目标邮箱分组');
@@ -4603,7 +4693,7 @@ async function handleGroupQuickAddEmails() {
     return;
   }
   if (!rawEmails) {
-    toast('请输入要批量加入的邮箱（每行或逗号分隔）');
+    toast('请输入要批量加入的个人或群组邮箱（每行或逗号分隔）');
     $('group-quick-add-emails')?.focus?.();
     return;
   }
@@ -4611,21 +4701,55 @@ async function handleGroupQuickAddEmails() {
     let addedCount = 0;
     let updatedCount = 0;
     if (typeof batchAddEmailsToGroup === 'function') {
-      const res = await batchAddEmailsToGroup(grpName, rawEmails, role);
+      const res = await batchAddEmailsToGroup(grpName, rawEmails, role, {
+        defaultName,
+        defaultNote,
+        memberType
+      });
       state.directory = res?.directory || (await getDirectory());
       addedCount = res?.addedCount || 0;
       updatedCount = res?.updatedCount || 0;
     } else {
-      const emails = extractEmailsFromText(rawEmails);
-      if (!emails.length) {
+      const parsedItems = [];
+      const seenEmails = new Set();
+      const lines = rawEmails.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      for (const line of lines) {
+        const lineEmails = extractEmailsFromText(line);
+        if (lineEmails.length === 1 && /[,，\t;；]/.test(line)) {
+          const parts = line.split(/[,，\t;；]+/).map(s => s.trim()).filter(Boolean);
+          const em = lineEmails[0];
+          const nonEmailParts = parts.filter(p => normalizeEntry(p) !== em && !p.includes(em));
+          if (!seenEmails.has(em)) {
+            seenEmails.add(em);
+            parsedItems.push({
+              email: em,
+              name: nonEmailParts[0] || defaultName,
+              note: nonEmailParts[1] || defaultNote
+            });
+          }
+        } else {
+          for (const em of lineEmails) {
+            if (!seenEmails.has(em)) {
+              seenEmails.add(em);
+              parsedItems.push({ email: em, name: defaultName, note: defaultNote });
+            }
+          }
+        }
+      }
+      if (!parsedItems.length) {
         toast('未识别到有效邮箱地址');
         return;
       }
       const contacts = [...(state.directory.contacts || [])];
-      for (const em of emails) {
+      for (const item of parsedItems) {
+        const em = item.email;
+        const resolvedMemberType = inferTargetTypeCompat(em, memberType);
         const exist = contacts.find(c => normalizeEntry(c.email) === em);
         if (exist) {
           exist.groups = [...new Set([...(exist.groups || []), grpName])];
+          if (item.name) exist.name = item.name;
+          if (item.note) exist.note = item.note;
+          if (memberType || !exist.memberType) exist.memberType = resolvedMemberType;
           if (role) {
             exist.groupRoles = exist.groupRoles && typeof exist.groupRoles === 'object' ? { ...exist.groupRoles } : {};
             exist.groupRoles[grpName] = role;
@@ -4634,7 +4758,10 @@ async function handleGroupQuickAddEmails() {
         } else {
           contacts.push({
             email: em,
-            name: '',
+            name: item.name || '',
+            note: item.note || '',
+            memberType: resolvedMemberType,
+            role: role || 'reader',
             groups: [grpName],
             groupRoles: role ? { [grpName]: role } : {}
           });
@@ -4645,10 +4772,253 @@ async function handleGroupQuickAddEmails() {
     }
     state.policy = await getPolicy();
     if ($('group-quick-add-emails')) $('group-quick-add-emails').value = '';
+    if ($('group-quick-add-name')) $('group-quick-add-name').value = '';
+    if ($('group-quick-add-note')) $('group-quick-add-note').value = '';
+    if ($('group-quick-add-type')) $('group-quick-add-type').value = 'auto';
     renderAll();
     toast(`已向分组「${grpName}」批量加入：新增 ${addedCount} 人 · 更新 ${updatedCount} 人`);
   } catch (error) {
     toast(`批量加入分组失败：${error?.message || error}`);
+  }
+}
+
+function renderDirectoryMembersTable() {
+  const tbody = $('dir-members-rows');
+  const countEl = $('dir-member-count');
+  if (!tbody) return;
+
+  const allContacts = Array.isArray(state.directory?.contacts) ? state.directory.contacts : [];
+  const allGroups = Array.isArray(state.directory?.groups) ? state.directory.groups : [];
+  const query = ($('dir-member-search')?.value || '').trim().toLowerCase();
+  const groupFilter = $('dir-member-group-filter')?.value || 'all';
+  const typeFilter = $('dir-member-type-filter')?.value || 'all';
+
+  const filtered = allContacts
+    .filter(c => {
+      const email = normalizeEntry(c?.email || '');
+      if (!email) return false;
+      const isGroup = isGroupEmailCompat(email, c?.memberType, '');
+      const groups = Array.isArray(c?.groups) ? c.groups : [];
+      if (typeFilter === 'group' && !isGroup) return false;
+      if (typeFilter === 'user' && isGroup) return false;
+      if (groupFilter === '__ungrouped__' && groups.length > 0) return false;
+      if (groupFilter !== 'all' && groupFilter !== '__ungrouped__' && !groups.includes(groupFilter)) {
+        return false;
+      }
+      if (!query) return true;
+      return (
+        email.includes(query) ||
+        (c.name || '').toLowerCase().includes(query) ||
+        (c.note || '').toLowerCase().includes(query) ||
+        groups.some(g => g.toLowerCase().includes(query)) ||
+        (isGroup && (query.includes('群组') || query === 'group')) ||
+        (!isGroup && (query.includes('个人') || query === 'user'))
+      );
+    })
+    .sort((a, b) =>
+      String(a.name || a.email || '').localeCompare(String(b.name || b.email || ''), 'zh-CN')
+    );
+
+  if (countEl) {
+    const isFiltered = Boolean(query || groupFilter !== 'all' || typeFilter !== 'all');
+    countEl.textContent = isFiltered
+      ? `显示 ${filtered.length} / ${allContacts.length} 位成员`
+      : `共 ${allContacts.length} 位成员`;
+  }
+
+  if (!filtered.length) {
+    tbody.innerHTML = `<tr><td colspan="4" class="empty">${
+      allContacts.length
+        ? '未找到匹配的成员，请尝试调整搜索词或筛选条件'
+        : '暂无已录入的分组人员或群组邮箱'
+    }</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = filtered
+    .map(c => {
+      const email = normalizeEntry(c.email);
+      const isGroup = isGroupEmailCompat(email, c.memberType, '');
+      const groups = Array.isArray(c.groups) ? c.groups : [];
+      const curRole =
+        c.role === 'writer' ? 'writer' : c.role === 'commenter' ? 'commenter' : 'reader';
+      const isEditing = state.editingContactEmail === email;
+
+      const groupTagsHtml = groups
+        .map(g => {
+          const memberGrpRole = c.groupRoles?.[g] || c.role || '';
+          const roleHint = memberGrpRole ? `·${groupRoleDisplayLabel(memberGrpRole)}` : '';
+          return `<span class="badge">
+            ${escapeHtml(g)}${escapeHtml(roleHint)}
+            <button type="button" class="btn-text btn-text-danger" data-action="dir-member-remove-group" data-email="${escapeHtml(email)}" data-group="${escapeHtml(g)}" title="从该分组移出">×</button>
+          </span>`;
+        })
+        .join('');
+
+      if (isEditing) {
+        const editGroupTagsHtml = groups
+          .map(g => {
+            const memberGrpRole = c.groupRoles?.[g] || c.role || '';
+            const roleHint = memberGrpRole ? `·${groupRoleDisplayLabel(memberGrpRole)}` : '';
+            return `<span class="badge">${escapeHtml(g)}${escapeHtml(roleHint)}</span>`;
+          })
+          .join('');
+        return `<tr class="member-edit-row" data-email="${escapeHtml(email)}">
+          <td>
+            <div class="member-edit-fields">
+              <input type="text" class="input input-xs full-width" data-field="name" value="${escapeHtml(c.name || '')}" aria-label="编辑成员姓名" placeholder="成员姓名或群组名称">
+              <input type="text" class="input input-xs full-width" data-field="note" value="${escapeHtml(c.note || '')}" aria-label="编辑成员备注" placeholder="备注说明（部门、职责等）">
+            </div>
+          </td>
+          <td>
+            <div><strong>${escapeHtml(email)}</strong></div>
+            <select class="select select-sm" data-field="memberType" aria-label="编辑邮箱类型">
+              <option value="user" ${!isGroup ? 'selected' : ''}>个人邮箱</option>
+              <option value="group" ${isGroup ? 'selected' : ''}>Google 群组邮箱</option>
+            </select>
+          </td>
+          <td>
+            <div class="row-flex wrap-flex">${editGroupTagsHtml || '<span class="muted">暂未归组</span>'}</div>
+            <select class="select select-sm" data-field="role" aria-label="编辑默认权限角色">
+              <option value="writer" ${curRole === 'writer' ? 'selected' : ''}>默认可编辑</option>
+              <option value="commenter" ${curRole === 'commenter' ? 'selected' : ''}>默认可评论</option>
+              <option value="reader" ${curRole === 'reader' ? 'selected' : ''}>默认仅查看</option>
+            </select>
+          </td>
+          <td>
+            <div class="row-actions">
+              <button type="button" class="btn primary btn-xs" data-action="dir-member-save" data-email="${escapeHtml(email)}">保存</button>
+              <button type="button" class="btn btn-xs" data-action="dir-member-cancel">取消</button>
+            </div>
+          </td>
+        </tr>`;
+      }
+
+      const unjoinedGroups = allGroups.filter(g => !groups.includes(g.name));
+      const addGrpSelect = unjoinedGroups.length
+        ? `<select class="perm-select" data-action="add-person-group" data-email="${escapeHtml(email)}" data-name="${escapeHtml(c.name || '')}" aria-label="将成员归入新分组">
+            <option value="">+归入组…</option>
+            ${unjoinedGroups.map(g => `<option value="${escapeHtml(g.name)}">${escapeHtml(g.name)}</option>`).join('')}
+          </select>`
+        : '';
+
+      const typeBadgeHtml = isGroup
+        ? renderGroupEmailBadgeHtml(true)
+        : '<span class="badge">个人邮箱</span>';
+
+      return `<tr>
+        <td>
+          <div><strong>${escapeHtml(c.name || '未填姓名')}</strong></div>
+          ${
+            c.note
+              ? `<div class="member-note-text muted">${escapeHtml(c.note)}</div>`
+              : '<div class="muted">暂无备注</div>'
+          }
+        </td>
+        <td>
+          <div>${escapeHtml(email)}</div>
+          <div>${typeBadgeHtml}</div>
+        </td>
+        <td>
+          <div class="row-flex wrap-flex">${groupTagsHtml}${addGrpSelect}</div>
+          <div class="muted">默认权限：${escapeHtml(groupRoleDisplayLabel(curRole))}</div>
+        </td>
+        <td>
+          <div class="row-actions">
+            <button type="button" class="btn btn-xs" data-action="dir-member-edit" data-email="${escapeHtml(email)}">编辑</button>
+            <button type="button" class="btn danger btn-xs" data-action="dir-member-delete" data-email="${escapeHtml(email)}">移出</button>
+          </div>
+        </td>
+      </tr>`;
+    })
+    .join('');
+}
+
+async function handleDirMemberSave(rowEl, email) {
+  const normEmail = normalizeEntry(email || rowEl?.dataset?.email || '');
+  if (!normEmail || !rowEl) return;
+  const name = (rowEl.querySelector('[data-field="name"]')?.value || '').trim();
+  const note = (rowEl.querySelector('[data-field="note"]')?.value || '').trim();
+  const memberType = rowEl.querySelector('[data-field="memberType"]')?.value === 'group' ? 'group' : 'user';
+  const roleVal = rowEl.querySelector('[data-field="role"]')?.value || 'reader';
+  const role = roleVal === 'writer' || roleVal === 'commenter' ? roleVal : 'reader';
+
+  try {
+    if (typeof updateContactProfile === 'function') {
+      const res = await updateContactProfile(normEmail, { name, note, memberType, role });
+      state.directory = res?.directory || (Array.isArray(res?.contacts) ? res : await getDirectory());
+    } else {
+      const contacts = (state.directory.contacts || []).map(c => {
+        if (normalizeEntry(c.email) !== normEmail) return c;
+        return { ...c, name, note, memberType, role };
+      });
+      state.directory = await saveDirectory({ groups: state.directory.groups, contacts });
+    }
+    state.policy = await getPolicy();
+    state.editingContactEmail = '';
+    renderAll();
+    toast(`已更新成员「${name || normEmail}」资料`);
+  } catch (error) {
+    toast(`保存成员资料失败：${error?.message || error}`);
+  }
+}
+
+async function handleDirMemberRemoveGroup(email, grpName) {
+  const normEmail = normalizeEntry(email || '');
+  const cleanGrp = String(grpName || '').trim();
+  if (!normEmail || !cleanGrp) return;
+  try {
+    if (typeof removeContactFromGroup === 'function') {
+      const res = await removeContactFromGroup(normEmail, cleanGrp);
+      state.directory = res?.directory || (Array.isArray(res?.contacts) ? res : await getDirectory());
+    } else {
+      const contacts = (state.directory.contacts || []).map(c => {
+        if (normalizeEntry(c.email) !== normEmail) return c;
+        const nextGroupRoles =
+          c.groupRoles && typeof c.groupRoles === 'object' ? { ...c.groupRoles } : {};
+        delete nextGroupRoles[cleanGrp];
+        return {
+          ...c,
+          groups: (c.groups || []).filter(g => g !== cleanGrp),
+          groupRoles: nextGroupRoles
+        };
+      });
+      state.directory = await saveDirectory({ groups: state.directory.groups, contacts });
+    }
+    state.policy = await getPolicy();
+    renderAll();
+    toast(`已将 ${normEmail} 从「${cleanGrp}」分组移除`);
+  } catch (error) {
+    toast(`移出分组失败：${error?.message || error}`);
+  }
+}
+
+async function handleDirMemberDelete(email) {
+  const normEmail = normalizeEntry(email || '');
+  if (!normEmail) return;
+  const contact = (state.directory.contacts || []).find(c => normalizeEntry(c.email) === normEmail);
+  const label = contact?.name ? `${contact.name} (${normEmail})` : normEmail;
+  if (!confirm(`确认将「${label}」从通讯录及所有分组、安全白名单中移出？\n（仅删除本地通讯录与白名单配置，不影响 Drive 现有文件权限）`)) {
+    return;
+  }
+  try {
+    if (typeof batchRemoveEmailsFromAllGroups === 'function') {
+      const res = await batchRemoveEmailsFromAllGroups(normEmail);
+      state.directory = res?.directory || (await getDirectory());
+    } else {
+      const keptContacts = (state.directory.contacts || []).filter(c => normalizeEntry(c.email) !== normEmail);
+      state.directory = await saveDirectory({ groups: state.directory.groups, contacts: keptContacts });
+      await syncPolicyAndSchedule({
+        writers: (state.policy.writers || []).filter(w => normalizeEntry(w) !== normEmail),
+        readers: (state.policy.readers || []).filter(r => normalizeEntry(r) !== normEmail)
+      });
+    }
+    state.policy = await getPolicy();
+    if (state.editingContactEmail === normEmail) state.editingContactEmail = '';
+    renderAll();
+    toast(`已将 ${label} 移出通讯录与白名单`);
+  } catch (error) {
+    toast(`移出成员失败：${error?.message || error}`);
   }
 }
 
@@ -5685,6 +6055,7 @@ function renderAll() {
   syncQuickExcludeButtons();
   renderSavedPresetsBar();
   renderGroupSelectorsAndBatchBar();
+  renderDirectoryMembersTable();
   renderFilesTab();
   renderExcludedFoldersView();
   renderCollaboratorsTab();
@@ -6962,8 +7333,56 @@ function exportTransferCsv() {
   URL.revokeObjectURL(url);
 }
 
-async function importAllowlistFromObject(parsed) {
+async function importFullConfigFromObject(parsed) {
   if (!parsed) return;
+  if (isDisallowedPassportPayload(parsed)) {
+    throw new Error('已移除免授权通行证导入功能，请仅导入配置备份或标准 Google OAuth 客户端 JSON');
+  }
+
+  if (typeof importAllExtensionConfig === 'function') {
+    const res = await importAllExtensionConfig(parsed, { mode: 'merge' });
+    state.policy = res?.policy || (await getPolicy());
+    state.directory = res?.directory || (await getDirectory());
+    state.roleBundles = Array.isArray(res?.roleBundles) ? res.roleBundles : await getRoleBundles();
+    state.partnerProfiles = Array.isArray(res?.partnerProfiles)
+      ? res.partnerProfiles
+      : await getPartnerProfiles();
+    state.filterPresets = Array.isArray(res?.filterPresets)
+      ? res.filterPresets
+      : await getFilterPresets();
+
+    const importedTheme = res?.uiPreferences?.theme;
+    if (importedTheme === 'light' || importedTheme === 'dark' || importedTheme === 'system') {
+      setExplicitColorScheme(importedTheme);
+    }
+    try {
+      await chrome.runtime.sendMessage({ type: 'SYNC_SCHEDULE' });
+    } catch (_e) {}
+    pruneExcludedSelectionAndInspector();
+    renderAll();
+
+    const s = res?.summary || {};
+    const gCnt = s.groupsCount ?? s.groups ?? state.directory?.groups?.length ?? 0;
+    const cCnt = s.contactsCount ?? s.contacts ?? state.directory?.contacts?.length ?? 0;
+    const exCnt = s.excludedFoldersCount ?? s.excludedFolders ?? state.policy?.excludedFolders?.length ?? 0;
+    const bCnt = s.roleBundlesCount ?? s.roleBundles ?? state.roleBundles?.length ?? 0;
+    const pCnt = s.partnerProfilesCount ?? s.partnerProfiles ?? state.partnerProfiles?.length ?? 0;
+    const prCnt = s.filterPresetsCount ?? s.filterPresets ?? state.filterPresets?.length ?? 0;
+    const detailParts = [];
+    if (gCnt) detailParts.push(`${gCnt} 分组`);
+    if (cCnt) detailParts.push(`${cCnt} 成员`);
+    if (exCnt) detailParts.push(`${exCnt} 排除目录`);
+    if (bCnt) detailParts.push(`${bCnt} 岗位包`);
+    if (pCnt) detailParts.push(`${pCnt} 合作方`);
+    if (prCnt) detailParts.push(`${prCnt} 预设`);
+    toast(
+      detailParts.length
+        ? `已导入全部配置：${detailParts.join(' · ')}（含白名单与 OAuth 守卫规则）`
+        : '已成功导入全量配置并同步生效'
+    );
+    return;
+  }
+
   if (Array.isArray(parsed)) {
     state.policy = await savePolicy({
       writers: [...state.policy.writers, ...parsed.map(normalizeEntry)]
@@ -6979,6 +7398,7 @@ async function importAllowlistFromObject(parsed) {
     if (Array.isArray(policySrc.readers)) nextReaders.push(...policySrc.readers.map(normalizeEntry));
 
     state.policy = await savePolicy({
+      ...policySrc,
       writers: nextWriters,
       readers: nextReaders,
       publicLinkRule: policySrc.publicLinkRule || state.policy.publicLinkRule
@@ -6991,13 +7411,21 @@ async function importAllowlistFromObject(parsed) {
       });
     }
   }
+  try {
+    await chrome.runtime.sendMessage({ type: 'SYNC_SCHEDULE' });
+  } catch (_e) {}
+  pruneExcludedSelectionAndInspector();
   renderAll();
-  toast('已成功导入白名单/分组配置');
+  toast('已成功导入配置并同步生效');
+}
+
+async function importAllowlistFromObject(parsed) {
+  return importFullConfigFromObject(parsed);
 }
 
 async function importParsedContacts(rows, targetGroupOverride = '') {
   if (!rows || !rows.length) {
-    toast('未识别到有效邮箱（支持 A列邮箱 · B列权限 · 可选C列分组 · D列姓名）');
+    toast('未识别到有效邮箱（支持 A列邮箱 · B列权限 · 可选C列分组 · D列姓名 · E列备注）');
     return;
   }
 
@@ -7042,8 +7470,11 @@ async function importParsedContacts(rows, targetGroupOverride = '') {
     }
 
     const existing = byEmail.get(email);
+    const resolvedMemberType = inferTargetTypeCompat(email, r.memberType || existing?.memberType || '');
     if (existing) {
       if (r.name && !existing.name) existing.name = r.name;
+      if (r.note && !existing.note) existing.note = r.note;
+      if (r.memberType || !existing.memberType) existing.memberType = resolvedMemberType;
       existing.role = resolvedRole;
       existing.groups = existing.groups || [];
       if (grpName && !existing.groups.includes(grpName)) {
@@ -7058,6 +7489,8 @@ async function importParsedContacts(rows, targetGroupOverride = '') {
       const created = {
         email,
         name: r.name || '',
+        note: r.note || '',
+        memberType: resolvedMemberType,
         role: resolvedRole,
         groups: grpName ? [grpName] : [],
         groupRoles: grpName ? { [grpName]: resolvedRole } : {}
@@ -7814,11 +8247,14 @@ async function handleAddSinglePermPrompt(fileId) {
 
   try {
     const token = await resolveTokenForFile(file, true);
-    const created = await createPermission(token, file.id, { type: 'user', role, emailAddress: email });
+    const contact = buildContactLookup(state.directory).get(email);
+    const targetType = inferTargetTypeCompat(email, contact?.memberType || '');
+    const created = await createPermission(token, file.id, { type: targetType, role, emailAddress: email });
+    const resolvedType = created?.resolvedType || created?.type || targetType;
     file.permissions = file.permissions || [];
     file.permissions.push({
       id: created?.id || `perm-${Date.now()}`,
-      type: 'user',
+      type: resolvedType,
       role,
       emailAddress: email
     });
@@ -7832,7 +8268,7 @@ async function handleAddSinglePermPrompt(fileId) {
       fileId: file.id,
       fileName: file.name,
       permissionId: created?.id || '',
-      targetType: 'user',
+      targetType: resolvedType,
       targetEmail: email,
       targetLabel: email,
       newRole: role,
@@ -7857,7 +8293,7 @@ async function handleInspectorAddPerm() {
   const role = roleSelect?.value || 'reader';
 
   if (!email || !email.includes('@')) {
-    toast('请输入有效的协作者邮箱地址');
+    toast('请输入有效的个人或 Google 群组邮箱地址');
     emailInput?.focus?.();
     return;
   }
@@ -7873,9 +8309,12 @@ async function handleInspectorAddPerm() {
   try {
     const prevLogCount = state.logs.length;
     const token = await resolveTokenForFile(file, true);
+    const contact = buildContactLookup(state.directory).get(email);
+    const targetType = inferTargetTypeCompat(email, contact?.memberType || '');
     let created = null;
     let grantRes = null;
     let activeFile = file;
+    let resolvedType = targetType;
 
     state.localTtlMutatingCount += 1;
     state.localTtlMutationEpoch += 1;
@@ -7886,7 +8325,7 @@ async function handleInspectorAddPerm() {
           accountEmail: file.ownerAccount || '',
           file,
           fileId: file.id,
-          type: 'user',
+          type: targetType,
           role,
           emailAddress: email,
           expiresAt: ttlSel.expiresAt,
@@ -7894,8 +8333,9 @@ async function handleInspectorAddPerm() {
         });
         created = grantRes?.createdPermission || grantRes;
       } else {
-        created = await createPermission(token, file.id, { type: 'user', role, emailAddress: email });
+        created = await createPermission(token, file.id, { type: targetType, role, emailAddress: email });
       }
+      resolvedType = created?.resolvedType || grantRes?.resolvedType || created?.type || targetType;
 
       activeFile = state.files.find(f => f.id === file.id) || file;
       activeFile.permissions = activeFile.permissions || [];
@@ -7905,6 +8345,7 @@ async function handleInspectorAddPerm() {
       );
       if (existingPerm) {
         existingPerm.id = created?.id || existingPerm.id;
+        existingPerm.type = resolvedType;
         existingPerm.role = role;
         if (ttlSel.expiresAt) {
           existingPerm.expirationTime = created?.expirationTime || ttlSel.expiresAt;
@@ -7912,7 +8353,7 @@ async function handleInspectorAddPerm() {
       } else {
         activeFile.permissions.push({
           id: createdPermId,
-          type: 'user',
+          type: resolvedType,
           role,
           emailAddress: email,
           ...(ttlSel.expiresAt ? { expirationTime: created?.expirationTime || ttlSel.expiresAt } : {})
@@ -7939,7 +8380,7 @@ async function handleInspectorAddPerm() {
         fileId: activeFile.id,
         fileName: activeFile.name,
         permissionId: created?.id || '',
-        targetType: 'user',
+        targetType: resolvedType,
         targetEmail: email,
         targetLabel: email,
         newRole: role,
@@ -7954,7 +8395,8 @@ async function handleInspectorAddPerm() {
     await refreshTtlQueueState();
     renderAll();
     const ttlToastSuffix = ttlSel.expiresAt ? ` · ${ttlSel.label}` : '';
-    toast(`已为《${activeFile.name}》添加 ${email} (${roleLabel(role)}${ttlToastSuffix})`);
+    const groupTagSuffix = resolvedType === 'group' ? ' [群组]' : '';
+    toast(`已为《${activeFile.name}》添加 ${email}${groupTagSuffix} (${roleLabel(role)}${ttlToastSuffix})`);
   } catch (error) {
     toast(`添加失败：${error.message}`);
   }
@@ -8217,27 +8659,34 @@ async function handleDirectEmailsBatch(mode = 'grant', retryQueue = null, inheri
               try {
                 const token = await resolveTokenForFile(f, i === 0);
                 if (isGrant) {
+                  const targetType = inferTargetTypeCompat(t.email);
                   if (typeof grantPermissionWithTtl === 'function') {
                     const gRes = await grantPermissionWithTtl({
                       token,
                       accountEmail: f.ownerAccount || '',
                       file: f,
                       fileId: f.id,
-                      type: 'user',
+                      type: targetType,
                       role,
                       emailAddress: t.email,
                       expiresAt: ttlSel.expiresAt,
                       expireAction: 'revoke'
                     });
                     const created = gRes?.createdPermission || gRes;
+                    const resolvedType = created?.resolvedType || gRes?.resolvedType || created?.type || targetType;
                     f.permissions = f.permissions || [];
                     const ex = f.permissions.find(p => normalizeEntry(p.emailAddress || '') === t.email);
-                    if (ex) ex.role = role;
-                    else f.permissions.push({ id: created?.id || `perm-${Date.now()}`, type: 'user', role, emailAddress: t.email });
+                    if (ex) {
+                      ex.role = role;
+                      ex.type = resolvedType;
+                    } else {
+                      f.permissions.push({ id: created?.id || `perm-${Date.now()}`, type: resolvedType, role, emailAddress: t.email });
+                    }
                   } else {
-                    const created = await createPermission(token, f.id, { type: 'user', role, emailAddress: t.email });
+                    const created = await createPermission(token, f.id, { type: targetType, role, emailAddress: t.email });
+                    const resolvedType = created?.resolvedType || created?.type || targetType;
                     f.permissions = f.permissions || [];
-                    f.permissions.push({ id: created?.id || `perm-${Date.now()}`, type: 'user', role, emailAddress: t.email });
+                    f.permissions.push({ id: created?.id || `perm-${Date.now()}`, type: resolvedType, role, emailAddress: t.email });
                   }
                 } else {
                   const targetPerm = (f.permissions || []).find(
@@ -8931,24 +9380,49 @@ function exportCsv() {
   URL.revokeObjectURL(url);
 }
 
+async function exportFullConfigJson() {
+  try {
+    const theme = getStoredColorScheme() || 'system';
+    let payload;
+    if (typeof exportAllExtensionConfig === 'function') {
+      payload = await exportAllExtensionConfig({ theme });
+    } else {
+      payload = {
+        schema: 'gdrive_tools_full_config_v2',
+        version: '1.2.2',
+        exportedAt: new Date().toISOString(),
+        policy: state.policy,
+        directory: state.directory,
+        roleBundles: state.roleBundles || [],
+        partnerProfiles: state.partnerProfiles || [],
+        filterPresets: state.filterPresets || [],
+        uiPreferences: { theme }
+      };
+    }
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `gdrive-tools-full-config-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    const gCnt = payload?.directory?.groups?.length || 0;
+    const cCnt = payload?.directory?.contacts?.length || 0;
+    const exCnt = payload?.policy?.excludedFolders?.length || 0;
+    const bCnt = payload?.roleBundles?.length || 0;
+    const pCnt = payload?.partnerProfiles?.length || 0;
+    toast(
+      `已导出全量配置 JSON：${gCnt} 分组 · ${cCnt} 成员 · ${exCnt} 排除目录 · ${bCnt} 岗位包 · ${pCnt} 合作方（不含账号令牌）`
+    );
+  } catch (error) {
+    toast(`导出全量配置失败：${error?.message || error}`);
+  }
+}
+
 function exportPolicyAndDirectoryJson() {
-  const payload = {
-    writers: state.policy.writers,
-    readers: state.policy.readers,
-    publicLinkRule: state.policy.publicLinkRule,
-    scheduleEnabled: state.policy.scheduleEnabled,
-    scheduleMinutes: state.policy.scheduleMinutes,
-    autoEnforce: state.policy.autoEnforce,
-    groups: state.directory.groups,
-    contacts: state.directory.contacts
-  };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'drive-policy-and-groups.json';
-  a.click();
-  URL.revokeObjectURL(url);
+  exportFullConfigJson();
 }
 
 async function syncPolicyAndSchedule(partial) {
@@ -10497,14 +10971,72 @@ async function init() {
     const existing = contacts.find(c => normalizeEntry(c.email) === email);
     if (existing) {
       existing.groups = [...new Set([...(existing.groups || []), grp])];
+      if (!existing.memberType) {
+        existing.memberType = inferTargetTypeCompat(email);
+      }
     } else {
-      contacts.push({ email, name, groups: [grp] });
+      contacts.push({ email, name, note: '', memberType: inferTargetTypeCompat(email), groups: [grp] });
     }
     state.directory = await saveDirectory({ groups: state.directory.groups, contacts });
     state.policy = await getPolicy();
     renderAll();
     toast(`已将 ${name || email} 归入「${grp}」`);
   };
+
+  // 分组人员通讯录（姓名 · 备注 · 群组搜索管理）筛选与行内编辑委派
+  $('dir-member-search')?.addEventListener('input', renderDirectoryMembersTable);
+  $('dir-member-group-filter')?.addEventListener('change', renderDirectoryMembersTable);
+  $('dir-member-type-filter')?.addEventListener('change', renderDirectoryMembersTable);
+
+  $('dir-members-rows')?.addEventListener('click', async e => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const action = btn.dataset.action;
+    if (action === 'dir-member-edit') {
+      const targetEmail = normalizeEntry(btn.dataset.email || '');
+      if (!targetEmail) return;
+      state.editingContactEmail = targetEmail;
+      renderDirectoryMembersTable();
+      const row = $('dir-members-rows')?.querySelector('tr.member-edit-row');
+      row?.querySelector('[data-field="name"]')?.focus?.();
+    } else if (action === 'dir-member-cancel') {
+      state.editingContactEmail = '';
+      renderDirectoryMembersTable();
+    } else if (action === 'dir-member-save') {
+      const row = btn.closest('tr.member-edit-row');
+      await handleDirMemberSave(row, btn.dataset.email || row?.dataset?.email || '');
+    } else if (action === 'dir-member-remove-group') {
+      await handleDirMemberRemoveGroup(btn.dataset.email || '', btn.dataset.group || '');
+    } else if (action === 'dir-member-delete') {
+      await handleDirMemberDelete(btn.dataset.email || '');
+    }
+  });
+
+  let lastDirMemberCompositionEndAt = null;
+  $('dir-members-rows')?.addEventListener('compositionend', e => {
+    lastDirMemberCompositionEndAt = e.timeStamp;
+  });
+
+  $('dir-members-rows')?.addEventListener('keydown', async e => {
+    const row = e.target.closest('tr.member-edit-row');
+    if (!row) return;
+    if (e.isComposing || e.keyCode === 229) return;
+    if (
+      lastDirMemberCompositionEndAt !== null &&
+      typeof e.timeStamp === 'number' &&
+      Math.abs(e.timeStamp - lastDirMemberCompositionEndAt) < 50
+    ) {
+      return;
+    }
+    if (e.key === 'Enter' && e.target.tagName === 'INPUT') {
+      e.preventDefault();
+      await handleDirMemberSave(row, row.dataset.email || '');
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      state.editingContactEmail = '';
+      renderDirectoryMembersTable();
+    }
+  });
 
   const handleCollabViewClick = async e => {
     const btn = e.target.closest('[data-action]');
@@ -10972,11 +11504,17 @@ async function init() {
     toast('已将当前扫描到的所有协作者加入对应白名单');
   });
 
-  $('json-file').addEventListener('change', async e => {
+  $('json-file')?.addEventListener('change', async e => {
     await handleOAuthFilesUpload(e.target.files || []);
     e.target.value = '';
   });
-  $('export-policy-json').addEventListener('click', exportPolicyAndDirectoryJson);
+  $('export-policy-json')?.addEventListener('click', exportPolicyAndDirectoryJson);
+
+  $('export-all-config-btn')?.addEventListener('click', exportFullConfigJson);
+  $('import-all-config-file')?.addEventListener('change', async e => {
+    await handleOAuthFilesUpload(e.target.files || []);
+    e.target.value = '';
+  });
 
   const handleSettingsViewClick = async e => {
     const btn = e.target.closest('[data-action]');
