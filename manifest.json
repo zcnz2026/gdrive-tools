@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Google Drive 权限扫描器",
-  "version": "1.2.2",
-  "description": "现代单焦点 Google Drive 权限治理与安全加固中心，支持全量配置导入导出、Google 群组与人员姓名备注搜索、第三方 OAuth 主动拦截及排除目录保护。",
+  "version": "1.2.3",
+  "description": "现代单焦点 Google Drive 权限治理与安全加固中心，支持大文件夹深层所有权转移与隐身游离文件找回、凭证一键清理、全量配置备份及第三方 OAuth 主动拦截。",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAut3ylHEd/Zvx86M9mkopdgHLtwhzyZMQzkyakSNh5hGo4jJHrkiSqVwEiLnjZyRwSYmcvonau9SpE9dcs/YX7wRC/i00AK04FBmPiud0kdcv+9sfHA/JQsWR2w6wCe82XwimfE9+mIrF9JbK8lDP9PRfhpQt7BtNR1ksQIQzcHjh0Vf+7o30zoI6hxyouVDtFXapjTufQEj+JN4k7N8iWMeoce96EjMVgM4WjbERJp940QgNeNmKGdWLMDDc8SG/am6z1VeXFLa//K6f9EMROuem7cDGaAsaoWlGINCQ82gwQEnM+puMa5MG58qYlh2T8ELc6H9n+n2ysyQeBwq7GQIDAQAB",
   "icons": {
     "16": "icons/icon16.png",

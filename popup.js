@@ -509,42 +509,71 @@ function renderAccountsUI() {
 
   const switcher = $('account-switcher');
   const prevVal = state.activeAccount || 'all';
-  switcher.innerHTML =
-    `<option value="all">全部已授权账号 (${state.accounts.length})</option>` +
-    state.accounts.map(a => `<option value="${escapeHtml(a.email)}">账号: ${escapeHtml(a.email)}</option>`).join('');
-  if ([...switcher.options].some(o => o.value === prevVal)) {
-    switcher.value = prevVal;
-  } else {
-    state.activeAccount = 'all';
+  if (switcher) {
+    switcher.innerHTML =
+      `<option value="all">全部已授权账号 (${state.accounts.length})</option>` +
+      state.accounts.map(a => `<option value="${escapeHtml(a.email)}">账号: ${escapeHtml(a.email)}</option>`).join('');
+    if ([...switcher.options].some(o => o.value === prevVal)) {
+      switcher.value = prevVal;
+    } else {
+      state.activeAccount = 'all';
+    }
   }
 
-  $('oauth-clients-info').textContent = `已存凭证: ${state.oauthClients.length} · 已授权账号: ${state.accounts.length}`;
+  const railRemoveBtn = $('rail-remove-current-account-btn');
+  if (railRemoveBtn) {
+    const activeNorm = normalizeEntry(state.activeAccount || '');
+    const hasSpecificAccount =
+      Boolean(activeNorm && activeNorm !== 'all') &&
+      state.accounts.some(a => normalizeEntry(a.email) === activeNorm);
+    railRemoveBtn.classList.toggle('hidden', !hasSpecificAccount);
+    railRemoveBtn.disabled = !hasSpecificAccount;
+    if (hasSpecificAccount) {
+      railRemoveBtn.title = `移除当前选中的授权账号：${state.activeAccount}`;
+    }
+  }
+
+  const clearAllAuthBtn = $('clear-all-auth-btn');
+  if (clearAllAuthBtn) {
+    clearAllAuthBtn.disabled = state.oauthClients.length === 0 && state.accounts.length === 0;
+  }
+
+  const rescueTopBtn = $('rescue-orphan-files-btn');
+  if (rescueTopBtn) {
+    rescueTopBtn.disabled = state.accounts.length === 0;
+  }
+
+  if ($('oauth-clients-info')) {
+    $('oauth-clients-info').textContent = `已存凭证: ${state.oauthClients.length} · 已授权账号: ${state.accounts.length}`;
+  }
 
   const listNode = $('accounts-list');
+  if (!listNode) return;
   if (!state.accounts.length && !state.oauthClients.length) {
     listNode.innerHTML = '<span class="muted">尚未导入 JSON 凭证或授权账号</span>';
     setStatus('待授权', false);
-    $('scan').disabled = true;
+    if ($('scan')) $('scan').disabled = true;
     return;
   }
 
   if (state.accounts.length > 0) {
     setStatus(`已授权 ${state.accounts.length} 个账号`, true);
-    $('scan').disabled = false;
+    if ($('scan')) $('scan').disabled = false;
   } else {
     setStatus(`已导入 ${state.oauthClients.length} 个凭证 (待授权)`, false);
-    $('scan').disabled = false;
+    if ($('scan')) $('scan').disabled = false;
   }
 
   const clientRowsHtml = state.oauthClients
     .map((c, idx) => {
-      const uid = c.uid || c.client_id;
-      const name = c.fileName || `凭证 #${idx + 1}`;
+      const uid = c.uid || c.client_id || c.client_email || c.fileName || `idx_${idx}`;
+      const name = c.fileName || c.client_email || `凭证 #${idx + 1}`;
       const isSa = c.client_type === 'service_account' || Boolean(c.client_email && c.private_key);
       const typeIcon = isSa ? '服务账号' : 'OAuth 客户端';
-      const boundList = Array.isArray(c.boundEmails) && c.boundEmails.length
-        ? c.boundEmails.join(', ')
-        : c.boundEmail || '';
+      const boundList =
+        Array.isArray(c.boundEmails) && c.boundEmails.length
+          ? c.boundEmails.join(', ')
+          : c.boundEmail || (isSa ? c.client_email || '' : '');
       const bound = boundList ? `已授权: ${boundList}` : '未授权';
       const statusCls = boundList ? 'ok' : 'warning';
       const btnText = isSa
@@ -552,34 +581,256 @@ function renderAccountsUI() {
         : boundList
         ? '再登录其他邮箱 / 重授'
         : '弹出浏览器登录';
-      return `<div class="allow-item">
-        <span class="inspector-perm-info" title="${escapeHtml(c.client_id)}">
-          <strong>${escapeHtml(name)}</strong>
-          <span class="badge">${typeIcon}</span>
-          <span class="status-pill ${statusCls}">${escapeHtml(bound)}</span>
-        </span>
-        <span class="row-flex">
-          <button type="button" class="btn btn-xs primary" data-action="auth-oauth-client" data-uid="${escapeHtml(uid)}" title="使用此 JSON 凭证弹出浏览器选择任意 Google 邮箱登录（同一个桌面 OAuth 凭证可连续登录多个浏览器邮箱）">${btnText}</button>
-          <button type="button" class="btn-text btn-text-danger" data-action="remove-oauth-client" data-uid="${escapeHtml(uid)}" title="删除此 JSON 凭证">×</button>
-        </span>
+      return `<div class="credential-card-row">
+        <div class="credential-info inspector-perm-info" title="${escapeHtml(c.client_id || c.client_email || name)}">
+          <div class="row-flex wrap-flex">
+            <strong class="credential-title">${escapeHtml(name)}</strong>
+            <span class="badge">${typeIcon}</span>
+            <span class="status-pill ${statusCls}">${escapeHtml(bound)}</span>
+          </div>
+        </div>
+        <div class="credential-actions row-flex wrap-flex">
+          <button type="button" class="btn btn-xs primary" data-action="auth-oauth-client" data-uid="${escapeHtml(uid)}" data-idx="${idx}" title="使用此 JSON 凭证弹出浏览器选择任意 Google 邮箱登录（同一个桌面 OAuth 凭证可连续登录多个浏览器邮箱）">${btnText}</button>
+          <button type="button" class="btn danger btn-xs" data-action="remove-oauth-client" data-uid="${escapeHtml(uid)}" data-idx="${idx}" title="彻底移除此 JSON 授权文件及关联授权账号">🗑️ 移除授权文件</button>
+        </div>
       </div>`;
     })
     .join('');
 
-  const accountPillsHtml = state.accounts.length
-    ? `<div class="accounts-pills">` +
-      state.accounts
-        .map(
-          acc => `<span class="account-pill">
-            <span>${escapeHtml(acc.email)}</span>
-            <button type="button" class="remove-acc" data-action="remove-account" data-email="${escapeHtml(acc.email)}" title="移除此账号">×</button>
-          </span>`
-        )
-        .join('') +
-      `</div>`
+  const accountRowsHtml = state.accounts.length
+    ? state.accounts
+        .map(acc => {
+          const isSa = Boolean(acc.isServiceAccount);
+          const roleTag = isSa ? '服务账号' : 'OAuth 账号';
+          return `<div class="account-manage-row">
+            <div class="account-manage-info row-flex wrap-flex">
+              <strong class="account-email-text">${escapeHtml(acc.email)}</strong>
+              <span class="badge">${roleTag}</span>
+            </div>
+            <div class="account-manage-actions">
+              <button type="button" class="btn danger btn-xs" data-action="remove-account" data-email="${escapeHtml(acc.email)}" title="移除此已授权账号">移除账号</button>
+            </div>
+          </div>`;
+        })
+        .join('')
     : '';
 
-  listNode.innerHTML = clientRowsHtml + accountPillsHtml;
+  listNode.innerHTML = clientRowsHtml + accountRowsHtml;
+}
+
+async function syncStateAfterAuthChange({ skipSnapshot = false } = {}) {
+  const [nextClients, nextAccounts, nextTransferState] = await Promise.all([
+    getOAuthClients(),
+    getAuthorizedAccounts(),
+    getOwnershipTransferState()
+  ]);
+  state.oauthClients = nextClients;
+  state.accounts = nextAccounts;
+  state.transferState = nextTransferState;
+
+  const validEmailSet = new Set(nextAccounts.map(a => normalizeEntry(a.email)).filter(Boolean));
+  const activeNorm = normalizeEntry(state.activeAccount || '');
+  if (activeNorm && activeNorm !== 'all' && !validEmailSet.has(activeNorm)) {
+    state.activeAccount = 'all';
+    state.selectedFileIds.clear();
+  }
+
+  if (!skipSnapshot) {
+    if (nextAccounts.length === 0) {
+      applySnapshotToState({ files: [], newFileIds: [], lastScanAt: '', permDiffs: {} });
+      state.selectedFileIds.clear();
+      state.inspectedFileId = '';
+      if ($('progress')) $('progress').textContent = '尚未扫描';
+    } else {
+      const snap = await getSnapshot();
+      const rawFiles = Array.isArray(snap?.files) ? snap.files : [];
+      const filteredFiles = rawFiles.filter(f => {
+        const acc = normalizeEntry(f?.ownerAccount || f?.scannedByAccount || '');
+        return !acc || validEmailSet.has(acc);
+      });
+      applySnapshotToState({ ...snap, files: filteredFiles });
+      const liveIds = new Set(state.files.map(f => f.id));
+      for (const id of [...state.selectedFileIds]) {
+        if (!liveIds.has(id)) state.selectedFileIds.delete(id);
+      }
+      if (state.inspectedFileId && !liveIds.has(state.inspectedFileId)) {
+        state.inspectedFileId = '';
+      }
+    }
+  }
+
+  if (nextAccounts.length === 0 && nextClients.length === 0) {
+    state.onboardingDismissed = false;
+  }
+
+  if ($('transfer-target-email-input')) {
+    const nextTgt = normalizeEntry(state.transferState?.targetEmail || '');
+    if (!nextTgt) $('transfer-target-email-input').value = '';
+  }
+}
+
+async function handleRemoveOAuthClientAction(uid = '', idxStr = '') {
+  const cleanUid = String(uid || '').trim();
+  const parsedIdx = idxStr !== '' && idxStr !== undefined ? Number(idxStr) : -1;
+  let targetClient = state.oauthClients.find(
+    c =>
+      (c.uid && c.uid === cleanUid) ||
+      (c.client_id && c.client_id === cleanUid) ||
+      (c.client_email && c.client_email === cleanUid) ||
+      (c.fileName && c.fileName === cleanUid)
+  );
+  if (!targetClient && Number.isInteger(parsedIdx) && parsedIdx >= 0 && parsedIdx < state.oauthClients.length) {
+    targetClient = state.oauthClients[parsedIdx];
+  }
+  const clientLabel = targetClient?.fileName || targetClient?.client_email || targetClient?.client_id || cleanUid || '该授权文件';
+  if (!confirm(`确认彻底移除授权文件「${clientLabel}」及其关联的已授权账号？\n（仅移除本地授权凭证，不会删除白名单、分组及云盘文件）`)) {
+    return;
+  }
+
+  try {
+    const removalKey =
+      targetClient?.uid || targetClient?.client_id || targetClient?.client_email || targetClient?.fileName || cleanUid;
+    let removedEmails = [];
+
+    if (typeof removeOAuthClientAndAccounts === 'function') {
+      const res = await removeOAuthClientAndAccounts(removalKey, {
+        removeBoundAccounts: true,
+        index: parsedIdx
+      });
+      removedEmails = Array.isArray(res?.removedAccountEmails) ? res.removedAccountEmails : [];
+    } else if (typeof removeOAuthClient === 'function') {
+      const res = await removeOAuthClient(removalKey, { removeBoundAccounts: true });
+      if (res && !Array.isArray(res) && Array.isArray(res.removedAccountEmails)) {
+        removedEmails = res.removedAccountEmails;
+      } else if (targetClient) {
+        const boundSet = new Set(
+          [
+            ...(Array.isArray(targetClient.boundEmails) ? targetClient.boundEmails : []),
+            targetClient.boundEmail || '',
+            targetClient.client_email || ''
+          ]
+            .map(normalizeEntry)
+            .filter(Boolean)
+        );
+        for (const acc of state.accounts || []) {
+          const accEmail = normalizeEntry(acc.email);
+          const hitByClientId = Boolean(targetClient.client_id && acc.clientId === targetClient.client_id);
+          const hitByUid = Boolean(targetClient.uid && acc.clientUid === targetClient.uid);
+          if (boundSet.has(accEmail) || hitByClientId || hitByUid) {
+            await removeAuthorizedAccount(accEmail);
+            removedEmails.push(accEmail);
+          }
+        }
+      }
+    }
+
+    // 兜底：若历史无 uid 条目仍残留于 oauthClients，按索引精确剔除并持久化
+    let latestClients = await getOAuthClients();
+    if (
+      targetClient &&
+      latestClients.length === state.oauthClients.length &&
+      Number.isInteger(parsedIdx) &&
+      parsedIdx >= 0 &&
+      parsedIdx < latestClients.length
+    ) {
+      latestClients = latestClients.filter((_, i) => i !== parsedIdx);
+      if (typeof safeStorageSet === 'function') {
+        await safeStorageSet({ oauthClients: latestClients });
+      } else if (typeof chrome !== 'undefined' && chrome.storage?.local?.set) {
+        await chrome.storage.local.set({ oauthClients: latestClients });
+      }
+    }
+
+    await syncStateAfterAuthChange();
+    renderAll();
+    const extraAccMsg = removedEmails.length ? `，并同步清理关联账号 ${removedEmails.length} 个` : '';
+    toast(`已彻底移除授权文件「${clientLabel}」${extraAccMsg}`);
+  } catch (error) {
+    toast(`移除授权文件失败：${error?.message || error}`);
+  }
+}
+
+async function handleRemoveAuthorizedAccountAction(email = '') {
+  const normEmail = normalizeEntry(email || '');
+  if (!normEmail || normEmail === 'all') {
+    toast('请先选择要移除的具体授权账号');
+    return;
+  }
+  const exists = (state.accounts || []).some(a => normalizeEntry(a.email) === normEmail);
+  if (!exists) {
+    toast(`账号 ${normEmail} 不在当前已授权列表中`);
+    return;
+  }
+  if (!confirm(`确认彻底移除已授权账号「${normEmail}」？\n（仅清除本地令牌与授权记录，不影响云盘文件）`)) {
+    return;
+  }
+
+  try {
+    await removeAuthorizedAccount(normEmail, { removeServiceAccountClient: true });
+    await syncStateAfterAuthChange();
+
+    let transferTouched = false;
+    if (normalizeEntry(state.transferState.sourceEmail || '') === normEmail) {
+      state.transferState.sourceEmail = '';
+      transferTouched = true;
+    }
+    if (normalizeEntry(state.transferState.targetEmail || '') === normEmail) {
+      state.transferState.targetEmail = '';
+      if ($('transfer-target-email-input')) $('transfer-target-email-input').value = '';
+      transferTouched = true;
+    }
+    if (transferTouched) {
+      state.transferState = await saveOwnershipTransferState(state.transferState);
+    }
+
+    renderAll();
+    toast(`已彻底移除已授权账号 ${normEmail}`);
+  } catch (error) {
+    toast(`移除授权账号失败：${error?.message || error}`);
+  }
+}
+
+async function handleClearAllAuthCredentialsAction() {
+  if (!state.oauthClients.length && !state.accounts.length) {
+    toast('当前没有已保存的授权凭证或账号');
+    return;
+  }
+  if (
+    !confirm(
+      `确认一键清空全部 ${state.oauthClients.length} 个 JSON 授权文件与 ${state.accounts.length} 个已授权账号？\n（仅清除本地授权凭证，不会删除白名单、邮箱分组和云盘文件）`
+    )
+  ) {
+    return;
+  }
+
+  try {
+    if (typeof clearAllAuthCredentials === 'function') {
+      await clearAllAuthCredentials();
+    } else {
+      const clearedPayload = {
+        oauthClients: [],
+        authorizedAccounts: [],
+        scanSnapshot: { files: [], newFileIds: [], lastScanAt: '', permDiffs: {} }
+      };
+      if (typeof safeStorageSet === 'function') {
+        await safeStorageSet(clearedPayload);
+      } else if (typeof chrome !== 'undefined' && chrome.storage?.local?.set) {
+        await chrome.storage.local.set(clearedPayload);
+      }
+      state.transferState.sourceEmail = '';
+      state.transferState.targetEmail = '';
+      await saveOwnershipTransferState(state.transferState);
+    }
+
+    await syncStateAfterAuthChange();
+    state.activeAccount = 'all';
+    state.selectedFileIds.clear();
+    if ($('transfer-target-email-input')) $('transfer-target-email-input').value = '';
+    renderAll();
+    toast('已清空全部 JSON 授权文件与已授权账号');
+  } catch (error) {
+    toast(`清空授权凭证失败：${error?.message || error}`);
+  }
 }
 
 function applySnapshotToState(snapshot = {}) {
@@ -6124,6 +6375,10 @@ function renderTransferAccountSelectors() {
   if (!srcSelect || !tgtSelect) return;
 
   const accounts = state.accounts || [];
+  const accountEmailSet = new Set(accounts.map(a => normalizeEntry(a.email)).filter(Boolean));
+  if (state.transferState.sourceEmail && !accountEmailSet.has(normalizeEntry(state.transferState.sourceEmail))) {
+    state.transferState.sourceEmail = '';
+  }
   if (!state.transferState.sourceEmail && accounts.length > 0) {
     state.transferState.sourceEmail = normalizeEntry(accounts[0].email);
   }
@@ -6158,6 +6413,15 @@ function renderTransferAccountSelectors() {
 
   if (tgtInput && document.activeElement !== tgtInput) {
     tgtInput.value = curTgt;
+  }
+
+  const removeSrcBtn = $('transfer-remove-source-btn');
+  if (removeSrcBtn) {
+    removeSrcBtn.disabled = !curSrc || !accountEmailSet.has(curSrc);
+  }
+  const removeTgtBtn = $('transfer-remove-target-btn');
+  if (removeTgtBtn) {
+    removeTgtBtn.disabled = !curTgt || !accountEmailSet.has(curTgt);
   }
 
   const autoChk = $('transfer-auto-accept-chk');
@@ -6555,30 +6819,45 @@ async function handleTransferRunLoop(retryFailedOnly = false, onlyRootFolderId =
     }
   }
 
-  // 若用户在下拉框选中了某个顶层大文件夹（即使点击的是常规开始按钮），自动将该顶层大文件夹的所有条目排到最前面优先插队转移！
-  if (!onlyRootFolderId && selectedRootFilter && selectedRootFilter !== 'all') {
-    const prio = [];
-    const rest = [];
-    for (const idx of todoIndices) {
-      if ((items[idx].rootFolderId || '__root_loose__') === selectedRootFilter) prio.push(idx);
-      else rest.push(idx);
+  const getItemFolderDepth = it => {
+    if (typeof it?.folderDepth === 'number' && Number.isFinite(it.folderDepth)) return it.folderDepth;
+    if (typeof it?.depth === 'number' && Number.isFinite(it.depth)) return it.depth;
+    if (typeof it?.levelNumber === 'number' && Number.isFinite(it.levelNumber)) return Math.max(0, it.levelNumber - 1);
+    const fp = String(it?.folderPath || '');
+    return fp ? fp.split('/').length : 0;
+  };
+
+  // 严格保证所有文件夹按 folderDepth 由浅到深排在全部普通文件之前处理；
+  // 若用户选中了特定顶层大目录，将其排在最前且组内仍严格遵循文件夹先于文件、深度由浅到深！
+  todoIndices.sort((idxA, idxB) => {
+    const a = items[idxA];
+    const b = items[idxB];
+    if (!onlyRootFolderId && selectedRootFilter && selectedRootFilter !== 'all') {
+      const aPrio = (a.rootFolderId || '__root_loose__') === selectedRootFilter ? 0 : 1;
+      const bPrio = (b.rootFolderId || '__root_loose__') === selectedRootFilter ? 0 : 1;
+      if (aPrio !== bPrio) return aPrio - bPrio;
     }
-    todoIndices = [...prio, ...rest];
-  }
+    const aIsFolder = a.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+    const bIsFolder = b.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+    if (aIsFolder !== bIsFolder) return aIsFolder - bIsFolder;
+    const depthDiff = getItemFolderDepth(a) - getItemFolderDepth(b);
+    if (depthDiff !== 0) return depthDiff;
+    return idxA - idxB;
+  });
 
   if (!todoIndices.length) {
     toast('当前筛选范围内没有待处理的条目（已全部处理完毕，或可点击「🔄 刷新左右归属对比」核验）');
     return;
   }
 
-  const concurrency = Math.max(1, Math.min(16, Number($('transfer-concurrency-select')?.value) || 8));
+  const concurrency = Math.max(1, Math.min(16, Number($('transfer-concurrency-select')?.value) || 4));
 
   state.transferRunning = true;
   state.transferPauseRequested = false;
   renderTransferWorkspace();
 
   await appendTransferLog(
-    `🚀 启动 ${concurrency} 线程并发转移（含 AIMD 智能平滑控速）：来源 [${sourceEmail}] ➔ 接收 [${targetEmail}]，本次待处理 ${todoIndices.length} / 总计 ${items.length} 项`,
+    `🚀 启动 ${concurrency} 线程并发转移（文件夹按深度由浅到深优先 · 含 AIMD 智能平滑控速）：来源 [${sourceEmail}] ➔ 接收 [${targetEmail}]，本次待处理 ${todoIndices.length} / 总计 ${items.length} 项`,
     true
   );
 
@@ -6592,11 +6871,10 @@ async function handleTransferRunLoop(retryFailedOnly = false, onlyRootFolderId =
   let saveInFlight = false;
   let personalGmailAcceptProbeFailures = 0;
   let skipTargetApiAccept = false;
-  let cachedTargetPermId = items.find(it => it.targetPermissionId)?.targetPermissionId || '';
   const isPersonalGmailTarget = /@(gmail|googlemail)\.com$/i.test(targetEmail);
 
   try {
-    // 【阶段 0：顶层大文件夹剪枝预热 + 开局自动挂入接收方『我的云端硬盘』根目录（全量检查 items 以防子文件单独发送 POST 触发 Google 垃圾内容误判）】
+    // 【阶段 0：顶层大文件夹剪枝预热 + 开局自动挂入接收方『我的云端硬盘』根目录】
     const topFoldersToPrep = items.filter(
       it => it.isTopLevelFolder && (!it.targetPermissionId || (targetToken && !it._mountedToTargetRoot))
     );
@@ -6609,18 +6887,13 @@ async function handleTransferRunLoop(retryFailedOnly = false, onlyRootFolderId =
         targetEmail,
         onLog: msg => appendTransferLog(msg, false)
       });
-      if (prepRes.permId && !cachedTargetPermId) {
-        cachedTargetPermId = prepRes.permId;
-      }
       if (prepRes.grantedCount > 0) {
-        // 等待 1.2 秒让 Google Drive 后端完成对所有子目录和子文件的继承权限传播，使后续万级子文件 100% 走 1 步 PATCH
         await new Promise(r => setTimeout(r, 1200));
       }
     }
 
     const workerCount = Math.min(concurrency, todoIndices.length);
     const workers = Array.from({ length: workerCount }, async (_, workerId) => {
-      // 错峰启动各工作线程（间隔 65ms），形成平滑流水线，避免 12 线程同一毫秒并发冲撞 Google API 触发 403 限速等待
       if (workerId > 0) {
         await new Promise(r => setTimeout(r, workerId * 65));
       }
@@ -6636,6 +6909,8 @@ async function handleTransferRunLoop(retryFailedOnly = false, onlyRootFolderId =
         const item = items[idx];
 
         try {
+          // 严禁把顶层文件夹的继承 permId 强塞给未确认直属权限的子文件，仅传当前条目自身已确认的 targetPermissionId
+          const ownConfirmedPermId = item.targetPermissionId || '';
           const res = await transferSingleItemOwnership({
             sourceToken,
             targetToken,
@@ -6643,11 +6918,8 @@ async function handleTransferRunLoop(retryFailedOnly = false, onlyRootFolderId =
             targetEmail,
             autoAccept,
             skipTargetApiAccept,
-            knownTargetPermId: cachedTargetPermId
+            knownTargetPermId: ownConfirmedPermId
           });
-          if (res.targetPermissionId && !cachedTargetPermId) {
-            cachedTargetPermId = res.targetPermissionId;
-          }
           item.stage = res.stage;
           item.currentOwner = res.currentOwner || item.currentOwner;
           item.targetPermissionId = res.targetPermissionId || item.targetPermissionId;
@@ -6699,11 +6971,15 @@ async function handleTransferRunLoop(retryFailedOnly = false, onlyRootFolderId =
         // 后台异步保存断点，绝不阻塞工作线程网络并发
         if (processedInRun % 40 === 0 && !saveInFlight) {
           saveInFlight = true;
-          saveOwnershipTransferState(state.transferState)
-            .catch(() => {})
-            .finally(() => {
+          (async () => {
+            try {
+              await saveOwnershipTransferState(state.transferState);
+            } catch (_e) {
+              // ignore periodic checkpoint error
+            } finally {
               saveInFlight = false;
-            });
+            }
+          })();
         }
       }
     });
@@ -6717,15 +6993,31 @@ async function handleTransferRunLoop(retryFailedOnly = false, onlyRootFolderId =
       );
       toast('已暂停转移并保存当前断点进度');
     } else {
+      const hasCompletedItems = successInRun > 0 || items.some(it => it.stage === 'completed');
+      let autoRescueMsg = '';
+      if (targetToken && hasCompletedItems) {
+        autoRescueMsg = await runAutoRescueAfterTransfer({
+          accountEmail: targetEmail,
+          targetToken,
+          sourceToken,
+          transferItems: items,
+          concurrency
+        });
+      }
+
       await appendTransferLog(
-        `🏁 ${workerCount} 线程并发转移执行完毕：处理 ${processedInRun} 项（直接完成接管 ${successInRun} 项 · 已发邀请待确认 ${pendingInRun} 项 · 失败 ${failInRun} 项）。${
+        `🏁 ${workerCount} 线程并发转移执行完毕：处理 ${processedInRun} 项（直接完成接管 ${successInRun} 项 · 已发邀请待确认 ${pendingInRun} 项 · 失败 ${failInRun} 项）。${autoRescueMsg}${
           pendingInRun > 0
-            ? '提示：对处于「待接收(Pending)」的个人号文件，可点击右侧「🌐 网页全选接受兜底 (Ctrl+A)」在网页汇总页全选后一键全部接受！'
+            ? ' 提示：对处于「待接收(Pending)」的个人号文件，可点击右侧「打开网页待接受汇总页兜底」全选接受，完成后可点击「📂 找回看不见的文件」一键归位显示！'
             : ''
         }`,
         true
       );
-      toast(`多线程处理完成：已接管 ${successInRun} 项，待确认 ${pendingInRun} 项，失败 ${failInRun} 项`);
+      toast(
+        `多线程处理完成：已接管 ${successInRun} 项，待确认 ${pendingInRun} 项，失败 ${failInRun} 项${
+          autoRescueMsg ? '（已自动归位防隐身）' : ''
+        }`
+      );
     }
   } finally {
     state.transferRunning = false;
@@ -6735,7 +7027,56 @@ async function handleTransferRunLoop(retryFailedOnly = false, onlyRootFolderId =
   }
 }
 
+async function runAutoRescueAfterTransfer({
+  accountEmail = '',
+  targetToken = '',
+  sourceToken = '',
+  transferItems = [],
+  concurrency = 4
+} = {}) {
+  if (!targetToken) return '';
+  try {
+    $('progress').textContent = `📂 正在自动归位接收号 [${accountEmail || '接收方'}] 新转入的文件夹与隐藏游离文件…`;
+    if (typeof rescueInvisibleOrphanFiles === 'function') {
+      const r = await rescueInvisibleOrphanFiles({
+        accountEmail,
+        targetToken,
+        sourceToken,
+        transferItems,
+        archiveFolderName: '📁 找回的隐藏游离文件',
+        concurrency: Math.min(6, Math.max(2, concurrency)),
+        onProgress(p) {
+          if (p?.message) $('progress').textContent = p.message;
+        }
+      });
+      const foldersMounted = r?.orphanFoldersMounted || 0;
+      const filesArchived = r?.orphanFilesArchived || 0;
+      const restoredOrig = r?.restoredToOrigParent || 0;
+      if (foldersMounted + filesArchived + restoredOrig > 0) {
+        return ` 📂 自动归位完成：挂入根目录 ${foldersMounted} 个文件夹 · 还原原目录 ${restoredOrig} 项 · 归档游离文件 ${filesArchived} 个至「${r.archiveFolderName || '📁 找回的隐藏游离文件'}」。`;
+      }
+      return ' 📂 已自动核验接收方『我的云端硬盘』目录树，无游离隐身文件。';
+    }
+    if (typeof mountTransferredItemsToMyDriveRoot === 'function') {
+      const m = await mountTransferredItemsToMyDriveRoot({
+        targetToken,
+        sourceToken,
+        transferItems,
+        concurrency: Math.min(6, Math.max(2, concurrency)),
+        onProgress(p) {
+          if (p?.message) $('progress').textContent = p.message;
+        }
+      });
+      return ` 📂 自动归位完成：挂入根目录 ${m?.mountedFolders || 0} 文件夹 / ${m?.mountedFiles || 0} 文件，归位子项 ${m?.repairedChildCount || 0} 个。`;
+    }
+  } catch (err) {
+    await appendTransferLog(`⚠️ 转移后自动归位检测遇到提示：${err?.message || err}（可随时手动点「📂 找回看不见的文件」）`, false);
+  }
+  return '';
+}
+
 async function handleTransferAcceptAll() {
+  const sourceEmail = normalizeEntry($('transfer-source-select')?.value || state.transferState.sourceEmail || '');
   const targetEmail = normalizeEntry($('transfer-target-email-input')?.value || $('transfer-target-select')?.value || state.transferState.targetEmail || '');
   if (!targetEmail) {
     toast('请先在右侧选择或输入「接收邮箱」');
@@ -6743,11 +7084,17 @@ async function handleTransferAcceptAll() {
   }
 
   let targetToken = '';
+  let sourceToken = '';
   try {
     targetToken = await getValidTokenForAccount(targetEmail, true);
   } catch (err) {
-    toast(`接收邮箱 (${targetEmail}) 尚未在插件内授权，请先点击「+授权接收号」或使用「🌐 网页全选接受兜底」`);
+    toast(`接收邮箱 (${targetEmail}) 尚未在插件内授权，请先点击「+授权接收号」或使用「打开网页待接受汇总页兜底」`);
     return;
+  }
+  if (sourceEmail) {
+    try {
+      sourceToken = await getValidTokenForAccount(sourceEmail, false);
+    } catch (_e) {}
   }
 
   const items = state.transferState.items || [];
@@ -6757,7 +7104,7 @@ async function handleTransferAcceptAll() {
     return;
   }
 
-  const concurrency = Math.max(1, Math.min(16, Number($('transfer-concurrency-select')?.value) || 8));
+  const concurrency = Math.max(1, Math.min(16, Number($('transfer-concurrency-select')?.value) || 4));
   const workerCount = Math.min(concurrency, candidates.length);
 
   const btn = $('transfer-accept-all-btn');
@@ -6809,19 +7156,172 @@ async function handleTransferAcceptAll() {
 
     await Promise.all(workers);
 
+    let autoRescueMsg = '';
+    if (acceptedCount > 0 || items.some(it => it.stage === 'completed')) {
+      autoRescueMsg = await runAutoRescueAfterTransfer({
+        accountEmail: targetEmail,
+        targetToken,
+        sourceToken,
+        transferItems: items,
+        concurrency
+      });
+    }
+
     await appendTransferLog(
-      `📥 接收方 ${workerCount} 线程批量接受执行完毕：API 直接接管成功 ${acceptedCount} 项，仍待网页确认 ${stillPendingCount} 项。${
+      `📥 接收方 ${workerCount} 线程批量接受执行完毕：API 直接接管成功 ${acceptedCount} 项，仍待网页确认 ${stillPendingCount} 项。${autoRescueMsg}${
         stillPendingCount > 0
-          ? '若 Google 个人号拦截了 API 自动接受，请点击右侧「🌐 网页全选接受兜底」，在打开的页面按 Ctrl+A 全选 -> 右键 -> 接受所有权，即可一次性全部完成！'
+          ? ' 若 Google 个人号拦截了 API 自动接受，请点击右侧「打开网页待接受汇总页兜底」，在打开的页面按 Ctrl+A 全选 -> 右键 -> 接受所有权，即可一次性全部完成！'
           : ''
       }`,
       true
     );
-    toast(`多线程接收完成：已接管 ${acceptedCount} 项，待网页确认 ${stillPendingCount} 项`);
+    toast(
+      `多线程接收完成：已接管 ${acceptedCount} 项，待网页确认 ${stillPendingCount} 项${
+        autoRescueMsg ? '（已自动归位防隐身）' : ''
+      }`
+    );
   } finally {
     if (btn) btn.disabled = false;
     state.transferState = await saveOwnershipTransferState(state.transferState);
     renderTransferWorkspace();
+  }
+}
+
+async function handleRescueInvisibleOrphanFiles({ mode = 'topbar' } = {}) {
+  const topBtn = $('rescue-orphan-files-btn');
+  const tfBtn = $('transfer-rescue-orphans-btn');
+  const concurrency = Math.max(1, Math.min(8, Number($('transfer-concurrency-select')?.value) || 4));
+
+  const targetAccounts = [];
+  let sourceToken = '';
+  const transferItems = state.transferState?.items || [];
+
+  if (mode === 'transfer') {
+    const sourceEmail = normalizeEntry($('transfer-source-select')?.value || state.transferState.sourceEmail || '');
+    const targetEmail = normalizeEntry(
+      $('transfer-target-email-input')?.value || $('transfer-target-select')?.value || state.transferState.targetEmail || ''
+    );
+    const chosenEmail = targetEmail || sourceEmail;
+    if (!chosenEmail) {
+      toast('请先在右侧选择或输入已授权的接收邮箱');
+      return;
+    }
+    if (sourceEmail && sourceEmail !== chosenEmail) {
+      try {
+        sourceToken = await getValidTokenForAccount(sourceEmail, false);
+      } catch (_e) {}
+    }
+    targetAccounts.push(chosenEmail);
+  } else {
+    if (!state.accounts.length) {
+      toast('请先在设置页导入 JSON 凭证并完成至少 1 个账号授权');
+      return;
+    }
+    const activeNorm = normalizeEntry(state.activeAccount || '');
+    if (activeNorm && activeNorm !== 'all') {
+      targetAccounts.push(activeNorm);
+    } else {
+      for (const acc of state.accounts) {
+        const em = normalizeEntry(acc.email);
+        if (em) targetAccounts.push(em);
+      }
+    }
+  }
+
+  if (topBtn) topBtn.disabled = true;
+  if (tfBtn) tfBtn.disabled = true;
+
+  let totalOwned = 0;
+  let totalOrphanFolders = 0;
+  let totalOrphanFiles = 0;
+  let totalRestoredOrig = 0;
+  let totalRefreshed = 0;
+  let totalFailed = 0;
+  let archiveFolderName = '📁 找回的隐藏游离文件';
+  let succeededAccounts = 0;
+
+  try {
+    for (const accEmail of targetAccounts) {
+      let token = '';
+      try {
+        token = await getValidTokenForAccount(accEmail, true);
+      } catch (err) {
+        const msg = `账号 ${accEmail} 尚未完成授权或令牌获取失败：${err?.message || err}`;
+        if (mode === 'transfer') await appendTransferLog(`❌ ${msg}`, true);
+        toast(msg);
+        continue;
+      }
+
+      if (mode === 'transfer') {
+        await appendTransferLog(
+          `📂 开始全盘扫描接收号 [${accEmail}] 中「能扫到但云盘网页看不见」的隐藏游离文件与断层目录…`,
+          false
+        );
+      }
+      $('progress').textContent = `📂 正在为 ${accEmail} 检索并找回隐藏游离文件…`;
+
+      if (typeof rescueInvisibleOrphanFiles === 'function') {
+        const res = await rescueInvisibleOrphanFiles({
+          accountEmail: accEmail,
+          targetToken: token,
+          sourceToken,
+          transferItems,
+          archiveFolderName,
+          concurrency,
+          onProgress(p) {
+            if (p?.message) $('progress').textContent = p.message;
+          }
+        });
+        totalOwned += res?.totalOwned || 0;
+        totalOrphanFolders += res?.orphanFoldersMounted || 0;
+        totalOrphanFiles += res?.orphanFilesArchived || 0;
+        totalRestoredOrig += res?.restoredToOrigParent || 0;
+        totalRefreshed += res?.refreshedFolders || 0;
+        totalFailed += res?.failedCount || 0;
+        if (res?.archiveFolderName) archiveFolderName = res.archiveFolderName;
+        succeededAccounts++;
+      } else if (typeof mountTransferredItemsToMyDriveRoot === 'function') {
+        const res = await mountTransferredItemsToMyDriveRoot({
+          targetToken: token,
+          sourceToken,
+          transferItems,
+          concurrency,
+          onProgress(p) {
+            if (p?.message) $('progress').textContent = p.message;
+          }
+        });
+        totalOwned += res?.totalOwned || 0;
+        totalOrphanFolders += res?.mountedFolders || 0;
+        totalOrphanFiles += res?.mountedFiles || 0;
+        totalRestoredOrig += res?.repairedChildCount || 0;
+        totalRefreshed += res?.refreshedFolderCount || 0;
+        succeededAccounts++;
+      }
+    }
+
+    if (succeededAccounts > 0) {
+      const rescuedSum = totalOrphanFolders + totalOrphanFiles + totalRestoredOrig;
+      const summaryLine =
+        rescuedSum > 0
+          ? `✅ 隐藏游离文件找回完成（共扫描 ${totalOwned} 项）：挂回根目录 ${totalOrphanFolders} 个文件夹 · 还原原父目录 ${totalRestoredOrig} 项 · 归档 ${totalOrphanFiles} 个孤儿单文件至「${archiveFolderName}」${
+              totalRefreshed > 0 ? ` · 刷新 ${totalRefreshed} 个目录索引` : ''
+            }${totalFailed > 0 ? ` · 失败 ${totalFailed} 项` : ''}！请刷新 Google 云盘网页查看。`
+          : `✅ 核查完成（共扫描 ${totalOwned} 项）：未发现隐藏游离文件，所有已拥有文件均已在『我的云端硬盘』目录树中可见${
+              totalRefreshed > 0 ? `（已顺便刷新 ${totalRefreshed} 个目录索引）` : ''
+            }。`;
+      $('progress').textContent = summaryLine;
+      if (mode === 'transfer') {
+        await appendTransferLog(summaryLine, true);
+      }
+      toast(summaryLine);
+    }
+  } catch (error) {
+    const errMsg = `找回隐藏游离文件失败：${error?.message || error}`;
+    if (mode === 'transfer') await appendTransferLog(`❌ ${errMsg}`, true);
+    toast(errMsg);
+  } finally {
+    if (topBtn) topBtn.disabled = state.accounts.length === 0;
+    if (tfBtn) tfBtn.disabled = false;
   }
 }
 
@@ -9825,6 +10325,10 @@ async function init() {
   // 3. 顶部栏按钮与账号切换 & 指定文件夹扫描栏
   $('scan').addEventListener('click', () => handleScan(state.activeAccount));
   $('export').addEventListener('click', exportCsv);
+  $('rescue-orphan-files-btn')?.addEventListener('click', () => handleRescueInvisibleOrphanFiles({ mode: 'topbar' }));
+  $('rail-remove-current-account-btn')?.addEventListener('click', () =>
+    handleRemoveAuthorizedAccountAction(state.activeAccount)
+  );
   $('quick-enforce-all').addEventListener('click', () => handleEnforceFiles(getScopedFilesByAccount()));
 
   const updateCustomFoldersBadge = () => {
@@ -11515,6 +12019,7 @@ async function init() {
     await handleOAuthFilesUpload(e.target.files || []);
     e.target.value = '';
   });
+  $('clear-all-auth-btn')?.addEventListener('click', handleClearAllAuthCredentialsAction);
 
   const handleSettingsViewClick = async e => {
     const btn = e.target.closest('[data-action]');
@@ -11522,21 +12027,21 @@ async function init() {
     const action = btn.dataset.action;
 
     if (action === 'auth-oauth-client') {
-      const uid = btn.dataset.uid;
-      const client = state.oauthClients.find(c => (c.uid || c.client_id) === uid);
+      const uid = btn.dataset.uid || '';
+      const idx = btn.dataset.idx !== undefined ? Number(btn.dataset.idx) : -1;
+      let client = state.oauthClients.find(
+        c => (c.uid || c.client_id || c.client_email || c.fileName) === uid
+      );
+      if (!client && Number.isInteger(idx) && idx >= 0 && idx < state.oauthClients.length) {
+        client = state.oauthClients[idx];
+      }
       if (client) {
         await handleAuthorizeWithClient(client);
       }
     } else if (action === 'remove-oauth-client') {
-      const uid = btn.dataset.uid;
-      state.oauthClients = await removeOAuthClient(uid);
-      renderAll();
-      toast('已移除该 OAuth JSON 凭证');
+      await handleRemoveOAuthClientAction(btn.dataset.uid || '', btn.dataset.idx ?? '');
     } else if (action === 'remove-account') {
-      state.accounts = await removeAuthorizedAccount(btn.dataset.email);
-      if (state.activeAccount === btn.dataset.email) state.activeAccount = 'all';
-      renderAll();
-      toast(`已移除账号 ${btn.dataset.email}`);
+      await handleRemoveAuthorizedAccountAction(btn.dataset.email || '');
     } else if (action === 'delete-group') {
       await handleDeleteGroupByName(btn.dataset.group);
     } else if (action === 'filter-files-by-group') {
@@ -11591,6 +12096,17 @@ async function init() {
   $('transfer-add-target-btn')?.addEventListener('click', () =>
     handleAddMoreAccount($('transfer-target-email-input')?.value || '', 'target')
   );
+  $('transfer-remove-source-btn')?.addEventListener('click', () =>
+    handleRemoveAuthorizedAccountAction($('transfer-source-select')?.value || state.transferState.sourceEmail || '')
+  );
+  $('transfer-remove-target-btn')?.addEventListener('click', () =>
+    handleRemoveAuthorizedAccountAction(
+      $('transfer-target-select')?.value ||
+        $('transfer-target-email-input')?.value ||
+        state.transferState.targetEmail ||
+        ''
+    )
+  );
 
   $('transfer-scan-source-btn')?.addEventListener('click', () => handleTransferScanSource(false));
   $('transfer-incremental-scan-btn')?.addEventListener('click', () => handleTransferScanSource(true));
@@ -11632,6 +12148,9 @@ async function init() {
   });
 
   $('transfer-accept-all-btn')?.addEventListener('click', handleTransferAcceptAll);
+  $('transfer-rescue-orphans-btn')?.addEventListener('click', () =>
+    handleRescueInvisibleOrphanFiles({ mode: 'transfer' })
+  );
   $('transfer-mount-to-root-btn')?.addEventListener('click', handleTransferMountToRoot);
   $('transfer-restore-spam-trash-btn')?.addEventListener('click', handleTransferRestoreSpamAndTrash);
   $('transfer-verify-compare-btn')?.addEventListener('click', handleTransferVerifyCompare);
@@ -11806,6 +12325,15 @@ async function init() {
   if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
     chrome.storage.onChanged.addListener(async (changes, areaName) => {
       if (areaName === 'local') {
+        if (changes?.authorizedAccounts || changes?.oauthClients) {
+          try {
+            const isBusy = Boolean(state.batchTaskRunning || state.transferRunning);
+            await syncStateAfterAuthChange({ skipSnapshot: isBusy });
+            renderAll();
+          } catch (_e) {
+            // ignore auth sync error
+          }
+        }
         if (changes?.thirdPartyAppAlerts) {
           const nextAlerts = changes.thirdPartyAppAlerts.newValue;
           state.thirdPartyAppAlerts = Array.isArray(nextAlerts) ? nextAlerts : [];

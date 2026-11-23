@@ -2333,6 +2333,82 @@ input[type="file"] {
   margin-top: 0.5rem;
 }
 
+#accounts-list,
+.credentials-stack,
+.accounts-manage-list {
+  display: flex;
+  flex-direction: column;
+  flex-wrap: nowrap;
+  gap: 0.5rem;
+  width: 100%;
+  margin-top: 0.625rem;
+}
+
+.credential-card-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  padding: 0.5625rem 0.75rem;
+  background-color: var(--surface-subtle);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  min-width: 0;
+}
+
+.account-manage-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  padding: 0.5rem 0.75rem;
+  background-color: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+  border-left: 3px solid var(--success-solid);
+  border-radius: 0 8px 8px 0;
+  min-width: 0;
+}
+
+.credential-info,
+.credential-main,
+.account-manage-info,
+.account-manage-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.375rem 0.5rem;
+  min-width: 0;
+  flex: 1 1 12rem;
+}
+
+.credential-title,
+.account-email-text {
+  font-size: var(--text-body);
+  font-weight: 600;
+  color: var(--text-primary);
+  word-break: break-all;
+}
+
+.credential-actions,
+.account-manage-actions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  flex-shrink: 0;
+}
+
+.accounts-sublist {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+  width: 100%;
+}
+
 .account-pill {
   display: inline-flex;
   align-items: center;
@@ -2915,10 +2991,46 @@ aside.app-rail,
   min-width: 0;
 }
 
+.rail-account-row {
+  display: flex;
+  align-items: center;
+  gap: 0.3125rem;
+  width: 100%;
+  min-width: 0;
+}
+
+.rail-account-row #account-switcher {
+  flex: 1;
+  min-width: 0;
+}
+
+#rail-remove-current-account-btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  padding: 0.125rem 0.375rem;
+  border-radius: 4px;
+}
+
+#rail-remove-current-account-btn:hover {
+  background-color: var(--danger-bg);
+  text-decoration: none;
+}
+
 .rail-status-line {
   display: flex;
   flex-direction: column;
   gap: 0.1875rem;
+  min-width: 0;
+}
+
+.rail-status-top,
+.rail-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.25rem;
   min-width: 0;
 }
 

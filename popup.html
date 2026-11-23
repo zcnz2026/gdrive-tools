@@ -23,9 +23,12 @@
         </div>
 
         <div class="rail-account-box">
-          <select id="account-switcher" class="select select-sm full-width" aria-label="切换当前查看或扫描的已授权账号" title="切换当前查看或扫描的已授权账号">
-            <option value="all">全部已授权账号 (0)</option>
-          </select>
+          <div class="rail-account-row row-flex">
+            <select id="account-switcher" class="select select-sm grow" aria-label="切换当前查看或扫描的已授权账号" title="切换当前查看或扫描的已授权账号">
+              <option value="all">全部已授权账号 (0)</option>
+            </select>
+            <button id="rail-remove-current-account-btn" type="button" class="btn-text btn-text-danger nowrap hidden" title="移除当前选中的授权账号">移除此号</button>
+          </div>
           <div class="rail-status-line">
             <span id="status" class="status-indicator">待授权</span>
             <span id="progress" class="progress-text">准备就绪</span>
@@ -84,6 +87,7 @@
           </select>
           <button id="scan" type="button" class="btn primary btn-sm" disabled>立即扫描</button>
           <button id="quick-enforce-all" type="button" class="btn warning btn-sm" disabled>一键修正异常 (0)</button>
+          <button id="rescue-orphan-files-btn" type="button" class="btn btn-sm" title="找回转移所有权后能扫描到但在 Google 云盘网页看不见的游离隐藏文件">📂 找回隐藏文件</button>
           <button id="export" type="button" class="btn btn-sm" disabled>导出 CSV</button>
         </div>
       </header>
@@ -918,13 +922,14 @@
                     <option value="">请选择已授权的来源邮箱</option>
                   </select>
                   <button id="transfer-add-source-btn" type="button" class="btn btn-xs" title="导入或授权新的来源邮箱">+授权来源号</button>
+                  <button id="transfer-remove-source-btn" type="button" class="btn danger btn-xs" title="移除当前选中的错误来源授权账号">移除来源号</button>
                 </div>
                 <div class="row-flex wrap-flex">
                   <button id="transfer-scan-source-btn" type="button" class="btn primary btn-sm" title="4线程并发极速扫描该来源账号名下所有『我是所有者』的文件夹与文件，并自动保存记录">扫描来源全盘</button>
                   <button id="transfer-incremental-scan-btn" type="button" class="btn btn-sm" title="不覆盖已有转移进度，仅把来源网盘新产生的文件或文件夹合并进记录">增量补扫</button>
                   <select id="transfer-concurrency-select" class="select select-sm" aria-label="并发线程数" title="选择多线程并发数">
-                    <option value="4">4 线程并发</option>
-                    <option value="8" selected>8 线程并发</option>
+                    <option value="4" selected>4 线程稳速（大文件夹推荐）</option>
+                    <option value="8">8 线程并发</option>
                     <option value="12">12 线程并发</option>
                     <option value="16">16 线程极速</option>
                   </select>
@@ -953,13 +958,14 @@
                   <h2>接收账号自动接管与归位</h2>
                   <span id="transfer-target-status-tag" class="meta-inline">请填写或选择接收邮箱</span>
                 </div>
-                <div class="row-flex">
+                <div class="row-flex wrap-flex">
                   <label for="transfer-target-select" class="field-label nowrap">接收账号</label>
                   <select id="transfer-target-select" class="select select-sm transfer-target-select">
                     <option value="">选已授权接收号</option>
                   </select>
                   <input id="transfer-target-email-input" type="email" class="input input-xs grow" aria-label="接收邮箱地址" placeholder="或直接输入接收邮箱 (如 new@gmail.com)">
                   <button id="transfer-add-target-btn" type="button" class="btn btn-xs" title="授权接收邮箱后，插件可在后台直接调用接收方 API 自动接受所有权">+授权接收号</button>
+                  <button id="transfer-remove-target-btn" type="button" class="btn danger btn-xs" title="移除当前选中的错误接收授权账号">移除接收号</button>
                 </div>
                 <div class="toolbar-split-row">
                   <label class="checkbox-inline" for="transfer-auto-accept-chk" title="勾选后，当接收邮箱已在插件内授权时，左边发起转移后右边自动调用 API 立即接管所有权">
@@ -969,6 +975,7 @@
                   <div class="row-flex wrap-flex">
                     <button id="transfer-accept-all-btn" type="button" class="btn primary btn-sm" title="使用接收邮箱令牌，对所有待接收文件一键批量调用 API 接受所有权">批量接受</button>
                     <button id="transfer-verify-compare-btn" type="button" class="btn btn-sm" title="实测对比左边来源邮箱与右边接收邮箱当前的真实所有者归属">刷新对比</button>
+                    <button id="transfer-rescue-orphans-btn" type="button" class="btn warning btn-sm" title="将接收账号名下能扫描到但在网页『我的云端硬盘』看不见的游离文件与文件夹一键归位显示">📂 找回看不见的文件</button>
 
                     <details class="inline-disclosure">
                       <summary class="btn btn-xs">迁入目录与修复 ▾</summary>
@@ -1522,7 +1529,10 @@
             <div class="pane-section">
               <div class="block-header">
                 <h2>账号与 OAuth JSON 授权</h2>
-                <span id="oauth-clients-info" class="meta-inline">已存凭证: 0</span>
+                <div class="row-flex wrap-flex">
+                  <span id="oauth-clients-info" class="meta-inline">已存凭证: 0</span>
+                  <button id="clear-all-auth-btn" type="button" class="btn danger btn-xs" title="一键清空所有已导入的 JSON 授权文件与已授权账号">🗑️ 清空全部凭证与账号</button>
+                </div>
               </div>
               <p class="muted">
                 支持导入桌面端 Google OAuth 客户端 JSON（单凭证可授权多个邮箱）或 Service Account 服务账号密钥 JSON。

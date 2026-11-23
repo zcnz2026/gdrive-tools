@@ -932,6 +932,12 @@ function setActiveTabHint(text, isLinked = false) {
 }
 
 function showNoAccountState() {
+  const accSelect = $('sp-account-select');
+  if (accSelect) {
+    accSelect.innerHTML = '';
+    accSelect.value = '';
+    accSelect.disabled = true;
+  }
   $('sp-no-account-box')?.classList.remove('hidden');
   $('sp-empty-box')?.classList.add('hidden');
   $('sp-file-view')?.classList.add('hidden');
@@ -1521,13 +1527,13 @@ function renderWideAlertAndExcludedBanner(file, evalStat, matchedAcc, isExcluded
 }
 
 function renderCurrentFileView() {
+  if (spState.accounts.length === 0) {
+    showNoAccountState();
+    return;
+  }
   const file = spState.currentFile;
   if (!file) {
-    if (spState.accounts.length === 0) {
-      showNoAccountState();
-    } else {
-      showEmptyState();
-    }
+    showEmptyState();
     return;
   }
 
@@ -1535,8 +1541,15 @@ function renderCurrentFileView() {
   $('sp-empty-box')?.classList.add('hidden');
   $('sp-file-view')?.classList.remove('hidden');
 
+  const accountEmails = [
+    ...new Set(spState.accounts.map(a => normalizeEntry(a.email)).filter(Boolean))
+  ];
   const trueOwner = normalizeEntry(file.owners?.[0]?.emailAddress || file.ownerAccount || spState.matchedAccount || '');
-  const matchedAcc = normalizeEntry(spState.matchedAccount || file.ownerAccount || spState.accounts[0]?.email || '');
+  const rawMatched = normalizeEntry(spState.matchedAccount || file.ownerAccount || '');
+  const matchedAcc = accountEmails.includes(rawMatched)
+    ? rawMatched
+    : accountEmails[0] || '';
+  spState.matchedAccount = matchedAcc;
   const isExcluded = compatIsFileExcluded(file, spState.policy);
   const rawEvaluation = evaluateFile(file, spState.policy, trueOwner);
   spState.evaluation = isExcluded
@@ -1572,10 +1585,6 @@ function renderCurrentFileView() {
 
   const accSelect = $('sp-account-select');
   if (accSelect) {
-    const accountEmails = [...new Set([
-      ...spState.accounts.map(a => normalizeEntry(a.email)).filter(Boolean),
-      ...(matchedAcc ? [matchedAcc] : [])
-    ])];
     accSelect.innerHTML = accountEmails
       .map(em => {
         const isOwner = Boolean(trueOwner && em === trueOwner);
@@ -2565,19 +2574,55 @@ async function initSidepanel() {
     chrome.storage.onChanged.addListener(async (changes, areaName) => {
       if (areaName !== 'local') return;
       try {
-        if (changes.authorizedAccounts) {
+        let needRerender = false;
+        if (changes.authorizedAccounts || changes.oauthClients) {
           const prevCount = spState.accounts.length;
           spState.accounts = await getAuthorizedAccounts();
-          if (spState.accounts.length === 0) {
+          const validEmails = [
+            ...new Set(spState.accounts.map(a => normalizeEntry(a.email)).filter(Boolean))
+          ];
+          const validSet = new Set(validEmails);
+
+          if (validEmails.length === 0) {
+            spState.preferredAccount = '';
+            spState.matchedAccount = '';
+            spState.currentFile = null;
+            spState.ancestorIds = [];
+            spState.evaluation = null;
+            spState.breakage = null;
+            setActiveTabHint('尚未授权 Google 账号', false);
             showNoAccountState();
             return;
           }
-          if (prevCount === 0 && spState.accounts.length > 0) {
+
+          if (prevCount === 0 && validEmails.length > 0) {
             await syncFromActiveTab({ force: true, notifyIfEmpty: false });
             return;
           }
+
+          if (spState.preferredAccount && !validSet.has(normalizeEntry(spState.preferredAccount))) {
+            spState.preferredAccount = '';
+          }
+
+          const matchedRemoved = Boolean(
+            spState.matchedAccount && !validSet.has(normalizeEntry(spState.matchedAccount))
+          );
+          if (matchedRemoved) {
+            spState.matchedAccount = validEmails[0] || '';
+            if (spState.currentFile?.id) {
+              renderCurrentFileView();
+              if (!spState.busyAction && !spState.inspectLoading) {
+                await inspectAndRenderById(spState.currentFile.id, {
+                  source: spState.currentSource,
+                  preferredAccount: spState.matchedAccount,
+                  silentToast: true
+                });
+                return;
+              }
+            }
+          }
+          needRerender = true;
         }
-        let needRerender = false;
         if (changes.policy) {
           spState.policy = await getPolicy();
           needRerender = true;

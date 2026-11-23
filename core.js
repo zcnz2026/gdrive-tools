@@ -79,6 +79,8 @@ async function safeStorageSet(payload) {
                     name: it.name,
                     mimeType: it.mimeType,
                     isFolder: it.isFolder,
+                    parents: Array.isArray(it.parents) ? it.parents.slice(0, 2) : [],
+                    origParentId: it.origParentId || (Array.isArray(it.parents) && it.parents[0]) || '',
                     sourceOwner: it.sourceOwner,
                     targetOwner: it.targetOwner,
                     currentOwner: it.currentOwner,
@@ -1564,9 +1566,37 @@ async function mintServiceAccountAccessToken({ clientEmail, privateKey, tokenUri
   };
 }
 
+function generateClientRecordUid(prefix = 'cred', index = 0) {
+  return `${prefix}_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
 async function getOAuthClients() {
   const data = await chrome.storage.local.get('oauthClients');
-  return Array.isArray(data.oauthClients) ? data.oauthClients : [];
+  const rawList = Array.isArray(data.oauthClients) ? data.oauthClients : [];
+  let mutated = false;
+  const normalized = rawList
+    .filter(c => c && typeof c === 'object' && (c.client_id || c.client_email || c.fileName))
+    .map((c, idx) => {
+      const existingUid = String(c.uid || '').trim();
+      const isSa = c.client_type === 'service_account' || Boolean(c.client_email && c.private_key);
+      const uid = existingUid || generateClientRecordUid(isSa ? 'sa' : 'cred', idx);
+      const clientEmail = c.client_email ? normalizeEntry(c.client_email) : '';
+      const clientId = String(c.client_id || clientEmail || uid).trim();
+      if (!existingUid || c.client_id !== clientId) {
+        mutated = true;
+      }
+      return {
+        ...c,
+        uid,
+        client_id: clientId,
+        ...(clientEmail ? { client_email: clientEmail } : {})
+      };
+    });
+
+  if (mutated || normalized.length !== rawList.length) {
+    await safeStorageSet({ oauthClients: normalized });
+  }
+  return normalized;
 }
 
 async function saveOAuthClients(newClients) {
@@ -1574,25 +1604,204 @@ async function saveOAuthClients(newClients) {
   const current = await getOAuthClients();
   const merged = [...current];
 
-  for (const c of list) {
-    if (!c || !c.client_id) continue;
-    const uid = c.uid || `cred_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const idx = merged.findIndex(x => (x.uid && x.uid === uid) || (!x.uid && x.client_id === c.client_id && x.fileName === c.fileName));
+  for (let i = 0; i < list.length; i++) {
+    const c = list[i];
+    if (!c || typeof c !== 'object' || (!c.client_id && !c.client_email)) continue;
+    const isSa = c.client_type === 'service_account' || Boolean(c.client_email && c.private_key);
+    const clientEmail = c.client_email ? normalizeEntry(c.client_email) : '';
+    const clientId = String(c.client_id || clientEmail || '').trim();
+    const incomingUid = String(c.uid || '').trim();
+
+    const idx = merged.findIndex(
+      x =>
+        (incomingUid && x.uid === incomingUid) ||
+        (isSa && clientEmail && normalizeEntry(x.client_email || '') === clientEmail) ||
+        (!incomingUid && clientId && x.client_id === clientId && x.fileName === c.fileName)
+    );
     if (idx >= 0) {
-      merged[idx] = { ...merged[idx], ...c, uid: merged[idx].uid || uid };
+      const resolvedUid = merged[idx].uid || incomingUid || generateClientRecordUid(isSa ? 'sa' : 'cred', i);
+      merged[idx] = {
+        ...merged[idx],
+        ...c,
+        uid: resolvedUid,
+        client_id: clientId || merged[idx].client_id || resolvedUid,
+        ...(clientEmail ? { client_email: clientEmail } : {})
+      };
     } else {
-      merged.push({ ...c, uid });
+      const uid = incomingUid || generateClientRecordUid(isSa ? 'sa' : 'cred', i);
+      merged.push({
+        ...c,
+        uid,
+        client_id: clientId || uid,
+        ...(clientEmail ? { client_email: clientEmail } : {})
+      });
     }
   }
   await safeStorageSet({ oauthClients: merged });
   return merged;
 }
 
-async function removeOAuthClient(uidOrClientId) {
-  const current = await getOAuthClients();
-  const next = current.filter(c => (c.uid || c.client_id) !== uidOrClientId);
-  await safeStorageSet({ oauthClients: next });
-  return next;
+async function pruneRemovedAccountsFromRuntimeState(removedEmails = []) {
+  const removedSet = new Set((removedEmails || []).map(normalizeEntry).filter(Boolean));
+  if (!removedSet.size) return;
+
+  try {
+    const st = await getOwnershipTransferState();
+    let stChanged = false;
+    const nextSt = { ...st };
+    if (st.sourceEmail && removedSet.has(normalizeEntry(st.sourceEmail))) {
+      nextSt.sourceEmail = '';
+      nextSt.items = [];
+      stChanged = true;
+    }
+    if (st.targetEmail && removedSet.has(normalizeEntry(st.targetEmail))) {
+      nextSt.targetEmail = '';
+      stChanged = true;
+    }
+    if (stChanged) {
+      await saveOwnershipTransferState(nextSt);
+    }
+  } catch (_te) {}
+
+  try {
+    const rawSnap = await chrome.storage.local.get('scanSnapshot');
+    const snap = rawSnap?.scanSnapshot;
+    if (snap && typeof snap === 'object') {
+      let snapChanged = false;
+      if (snap.accountEmail && removedSet.has(normalizeEntry(snap.accountEmail))) {
+        snap.accountEmail = '';
+        snapChanged = true;
+      }
+      if (Array.isArray(snap.files) && snap.files.length > 0) {
+        const keptFiles = snap.files.filter(f => {
+          const ownerAcc = normalizeEntry(f?.ownerAccount || f?.scannedByAccount || '');
+          return !ownerAcc || !removedSet.has(ownerAcc);
+        });
+        if (keptFiles.length !== snap.files.length) {
+          snap.files = keptFiles;
+          snapChanged = true;
+        }
+      }
+      if (snapChanged) {
+        await saveSnapshot(snap);
+      }
+    }
+  } catch (_se) {}
+}
+
+/**
+ * 彻底移除指定的 OAuth 客户端 JSON 凭证（支持 uid / client_id / client_email / fileName / 索引双重定位），
+ * 并默认连同由该凭证签发或绑定的已授权账号及转移台残留状态一并清理。
+ */
+async function removeOAuthClientAndAccounts(
+  uidOrId,
+  { removeBoundAccounts = true, index = -1 } = {}
+) {
+  const cleanKey = String(uidOrId ?? '').trim();
+  const normKey = normalizeEntry(cleanKey);
+  const currentClients = await getOAuthClients();
+
+  const removedClients = [];
+  let nextClients = [];
+
+  for (let i = 0; i < currentClients.length; i++) {
+    const c = currentClients[i];
+    const matchedByKey =
+      Boolean(cleanKey) &&
+      (c.uid === cleanKey ||
+        c.client_id === cleanKey ||
+        normalizeEntry(c.client_email || '') === normKey ||
+        c.fileName === cleanKey);
+    if (matchedByKey) {
+      removedClients.push(c);
+    } else {
+      nextClients.push(c);
+    }
+  }
+
+  // 兜底：若历史异常数据按字符串未匹配但调用方提供了有效行索引 index，按索引精准移除
+  if (
+    removedClients.length === 0 &&
+    Number.isInteger(index) &&
+    index >= 0 &&
+    index < currentClients.length
+  ) {
+    removedClients.push(currentClients[index]);
+    nextClients = currentClients.filter((_, idx) => idx !== index);
+  }
+
+  await safeStorageSet({ oauthClients: nextClients });
+
+  let nextAccounts = await getAuthorizedAccounts();
+  const removedAccountEmails = [];
+
+  if (removeBoundAccounts !== false && removedClients.length > 0) {
+    const removedUids = new Set(removedClients.map(c => String(c.uid || '').trim()).filter(Boolean));
+    const removedClientIds = new Set(
+      removedClients.map(c => String(c.client_id || '').trim()).filter(Boolean)
+    );
+    const removedBoundEmails = new Set();
+
+    for (const rc of removedClients) {
+      if (rc.client_email) removedBoundEmails.add(normalizeEntry(rc.client_email));
+      if (Array.isArray(rc.boundEmails)) {
+        for (const em of rc.boundEmails) {
+          const n = normalizeEntry(em);
+          if (n) removedBoundEmails.add(n);
+        }
+      }
+      if (rc.boundEmail) {
+        for (const part of String(rc.boundEmail).split(/[,，;\s]+/)) {
+          const n = normalizeEntry(part);
+          if (n && n.includes('@')) removedBoundEmails.add(n);
+        }
+      }
+    }
+
+    // 避免误删已被另一个未删除凭证接管的同 client_id 账号
+    const keptClientIds = new Set(
+      nextClients.map(c => String(c.client_id || '').trim()).filter(Boolean)
+    );
+
+    const keptAccounts = [];
+    for (const acc of nextAccounts) {
+      const accEmail = normalizeEntry(acc?.email || '');
+      const matchUid = Boolean(acc?.clientUid && removedUids.has(String(acc.clientUid).trim()));
+      const matchClientId = Boolean(
+        acc?.clientId &&
+          removedClientIds.has(String(acc.clientId).trim()) &&
+          !keptClientIds.has(String(acc.clientId).trim())
+      );
+      const matchBoundEmail = Boolean(accEmail && removedBoundEmails.has(accEmail));
+
+      if (matchUid || matchClientId || matchBoundEmail) {
+        if (accEmail) removedAccountEmails.push(accEmail);
+      } else {
+        keptAccounts.push(acc);
+      }
+    }
+
+    if (keptAccounts.length !== nextAccounts.length) {
+      nextAccounts = keptAccounts;
+      await safeStorageSet({ authorizedAccounts: nextAccounts });
+    }
+
+    if (removedAccountEmails.length > 0) {
+      await pruneRemovedAccountsFromRuntimeState(removedAccountEmails);
+    }
+  }
+
+  return {
+    oauthClients: nextClients,
+    authorizedAccounts: nextAccounts,
+    removedClientCount: removedClients.length,
+    removedAccountEmails
+  };
+}
+
+async function removeOAuthClient(uidOrClientId, options = {}) {
+  const res = await removeOAuthClientAndAccounts(uidOrClientId, options);
+  return Object.assign([...res.oauthClients], res);
 }
 
 async function getAuthorizedAccounts() {
@@ -1615,12 +1824,96 @@ async function saveAuthorizedAccount(account) {
   return mergedAccount;
 }
 
-async function removeAuthorizedAccount(email) {
+async function removeAuthorizedAccount(email, { removeServiceAccountClient = true } = {}) {
   const normEmail = normalizeEntry(email);
-  const current = await getAuthorizedAccounts();
-  const next = current.filter(a => normalizeEntry(a.email) !== normEmail);
-  await safeStorageSet({ authorizedAccounts: next });
-  return next;
+  if (!normEmail) {
+    const cur = await getAuthorizedAccounts();
+    return cur;
+  }
+
+  const currentAccounts = await getAuthorizedAccounts();
+  const nextAccounts = currentAccounts.filter(a => normalizeEntry(a.email) !== normEmail);
+  await safeStorageSet({ authorizedAccounts: nextAccounts });
+
+  const currentClients = await getOAuthClients();
+  let clientsChanged = false;
+  const nextClients = [];
+
+  for (const c of currentClients) {
+    const isSa = c.client_type === 'service_account' || Boolean(c.client_email && c.private_key);
+    if (
+      isSa &&
+      removeServiceAccountClient !== false &&
+      (normalizeEntry(c.client_email || '') === normEmail ||
+        normalizeEntry(c.boundEmail || '') === normEmail)
+    ) {
+      clientsChanged = true;
+      continue;
+    }
+
+    const prevBoundList = Array.isArray(c.boundEmails)
+      ? c.boundEmails.map(normalizeEntry).filter(Boolean)
+      : c.boundEmail
+      ? String(c.boundEmail)
+          .split(/[,，;\s]+/)
+          .map(normalizeEntry)
+          .filter(Boolean)
+      : [];
+
+    if (prevBoundList.includes(normEmail)) {
+      const remainingBound = prevBoundList.filter(em => em !== normEmail);
+      nextClients.push({
+        ...c,
+        boundEmails: remainingBound,
+        boundEmail: remainingBound.join(', ')
+      });
+      clientsChanged = true;
+    } else {
+      nextClients.push(c);
+    }
+  }
+
+  if (clientsChanged) {
+    await safeStorageSet({ oauthClients: nextClients });
+  }
+
+  await pruneRemovedAccountsFromRuntimeState([normEmail]);
+
+  return Object.assign([...nextAccounts], {
+    authorizedAccounts: nextAccounts,
+    oauthClients: nextClients,
+    removedEmail: normEmail
+  });
+}
+
+/**
+ * 一键清空全部已导入的 OAuth JSON 凭证与已授权账号，并重置扫描快照与转移台账号选择
+ */
+async function clearAllAuthCredentials() {
+  await safeStorageSet({
+    oauthClients: [],
+    authorizedAccounts: []
+  });
+
+  try {
+    await clearOwnershipTransferState();
+  } catch (_te) {}
+
+  try {
+    await chrome.storage.local.remove(['scanSnapshot', 'autoScanCheckpoint']);
+  } catch (_se) {}
+
+  try {
+    if (typeof chrome !== 'undefined' && chrome.action?.setBadgeText) {
+      await chrome.action.setBadgeText({ text: '' });
+    }
+  } catch (_be) {}
+
+  return {
+    oauthClients: [],
+    authorizedAccounts: [],
+    cleared: true
+  };
 }
 
 async function refreshAccountAccessToken(account) {
@@ -1770,9 +2063,15 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
       privateKey: client.private_key,
       tokenUri: safeSaTokenUri
     });
+    const savedClients = await saveOAuthClients([
+      { ...client, client_email: email, token_uri: safeSaTokenUri, boundEmail: email }
+    ]);
+    const matchedSaClient =
+      savedClients.find(c => normalizeEntry(c.client_email || '') === email) || savedClients[0];
     const savedAccount = await saveAuthorizedAccount({
       email,
       displayName: email.split('@')[0],
+      clientUid: matchedSaClient?.uid || client.uid || '',
       clientId: client.client_id || email,
       isServiceAccount: true,
       privateKey: client.private_key,
@@ -1781,7 +2080,6 @@ async function authorizeWithOAuthClient(client, loginHint = '') {
       expiresAt: Date.now() + minted.expiresIn * 1000,
       authorizedAt: new Date().toISOString()
     });
-    await saveOAuthClients([{ ...client, token_uri: safeSaTokenUri, boundEmail: email }]);
     return savedAccount;
   }
 
@@ -2335,7 +2633,7 @@ function reportWriteSuccess() {
 
 function reportWriteRateLimit() {
   globalWritePacer.consecutiveOk = 0;
-  globalWritePacer.minIntervalMs = Math.min(240, Math.round(globalWritePacer.minIntervalMs * 1.25) + 18);
+  globalWritePacer.minIntervalMs = Math.min(360, Math.round(globalWritePacer.minIntervalMs * 1.3) + 22);
 }
 
 async function driveApi(token, path, options = {}, retry = 0) {
@@ -2353,25 +2651,33 @@ async function driveApi(token, path, options = {}, retry = 0) {
       ...(options.headers || {})
     }
   });
-  if ((response.status === 429 || response.status === 403 || response.status >= 500) && retry < 8) {
-    const body = await response.clone().json().catch(() => ({}));
-    const reason = body?.error?.errors?.[0]?.reason;
-    if (
-      response.status !== 429 &&
-      response.status < 500 &&
-      !['rateLimitExceeded', 'userRateLimitExceeded', 'sharingRateLimitExceeded'].includes(reason)
-    ) {
-      throw new Error(body?.error?.message || `Drive API 错误 ${response.status}`);
+  if ((response.status === 429 || response.status === 403 || response.status >= 500) && retry < 12) {
+    let body = {};
+    try {
+      body = await response.clone().json();
+    } catch (_je1) {}
+    const reason = body?.error?.errors?.[0]?.reason || '';
+    const errMsg = String(body?.error?.message || '');
+    const isRetryableQuota403 =
+      ['rateLimitExceeded', 'userRateLimitExceeded', 'sharingRateLimitExceeded', 'quotaExceeded'].includes(
+        reason
+      ) || /rate.?limit|sharing.?rate|user.?rate|too many requests|quota.?exceeded/i.test(errMsg);
+
+    if (response.status !== 429 && response.status < 500 && !isRetryableQuota403) {
+      throw new Error(errMsg || `Drive API 错误 ${response.status}`);
     }
     if (isWrite) {
       reportWriteRateLimit();
     }
-    const waitMs = Math.min(260 * 1.5 ** retry + Math.random() * 150, 4500);
+    const waitMs = Math.min(300 * 1.55 ** retry + Math.random() * 250, 9000);
     await new Promise(r => setTimeout(r, waitMs));
     return driveApi(token, path, options, retry + 1);
   }
   if (!response.ok) {
-    const body = await response.json().catch(() => ({}));
+    let body = {};
+    try {
+      body = await response.json();
+    } catch (_je2) {}
     throw new Error(body?.error?.message || `Drive API 错误 ${response.status}`);
   }
   if (isWrite) {
@@ -6276,11 +6582,20 @@ function buildTransferItemsFromRawFiles(
       currentOwner = prev.currentOwner || currentOwner;
     }
 
+    const resolvedParents = Array.isArray(f.parents)
+      ? f.parents
+      : Array.isArray(prev?.parents)
+      ? prev.parents
+      : [];
+    const resolvedOrigParentId =
+      f.origParentId || resolvedParents[0] || prev?.origParentId || '';
+
     nextItems.push({
       id: f.id,
       name: f.name || '(无名称)',
       mimeType: f.mimeType || '',
-      parents: Array.isArray(f.parents) ? f.parents : Array.isArray(prev?.parents) ? prev.parents : [],
+      parents: resolvedParents,
+      origParentId: resolvedOrigParentId,
       webViewLink: f.webViewLink || `https://drive.google.com/open?id=${f.id}`,
       sourceOwner: normSource,
       targetOwner: normTarget,
@@ -6517,7 +6832,7 @@ async function acceptSingleItemOwnership({ targetToken, item, targetEmail }) {
     try {
       const updated = await driveApi(
         targetToken,
-        `/files/${encodeURIComponent(item.id)}/permissions/${encodeURIComponent(permId)}?transferOwnership=true&moveToNewOwnersRoot=false&supportsAllDrives=true`,
+        `/files/${encodeURIComponent(item.id)}/permissions/${encodeURIComponent(permId)}?transferOwnership=true&moveToNewOwnersRoot=false&supportsAllDrives=true&fields=id,role,pendingOwner`,
         {
           method: 'PATCH',
           body: JSON.stringify({ role: 'owner' })
@@ -6528,7 +6843,7 @@ async function acceptSingleItemOwnership({ targetToken, item, targetEmail }) {
           accepted: true,
           stage: 'completed',
           currentOwner: normTarget,
-          targetPermissionId: permId,
+          targetPermissionId: updated.id || permId,
           statusText: '✅ 接收方 API 已自动接受所有权',
           logMsg: `接收方 ${normTarget} 已通过 API 自动接管《${item.name}》所有权`
         };
@@ -6540,7 +6855,7 @@ async function acceptSingleItemOwnership({ targetToken, item, targetEmail }) {
     try {
       const created = await driveApi(
         targetToken,
-        `/files/${encodeURIComponent(item.id)}/permissions?transferOwnership=true&moveToNewOwnersRoot=false&supportsAllDrives=true`,
+        `/files/${encodeURIComponent(item.id)}/permissions?transferOwnership=true&moveToNewOwnersRoot=false&supportsAllDrives=true&fields=id,role,pendingOwner`,
         {
           method: 'POST',
           body: JSON.stringify({ type: 'user', role: 'owner', emailAddress: normTarget })
@@ -6696,47 +7011,84 @@ async function transferSingleItemOwnership({
   if (!sourceToken) throw new Error('缺少来源邮箱授权令牌');
   if (!normTarget) throw new Error('缺少接收邮箱地址');
 
+  if (item?.mimeType === 'application/vnd.google-apps.shortcut') {
+    throw new Error('Google 云盘快捷方式不支持转移所有权');
+  }
+
   const isPersonalGmail = /@(gmail|googlemail)\.com$/i.test(normTarget);
   const logs = [];
   let permId = item.targetPermissionId || knownTargetPermId || '';
-  let alreadyPending = item.stage === 'pending_accept' && Boolean(item.targetPermissionId);
+  let alreadyPending = false;
+  let lastTransferErrMsg = '';
+
+  // 若历史条目已标记 pending_accept，先向 Drive API 实测确认是否真的已处于 owner 或 pendingOwner === true（防止历史继承权限假成功漏转）
+  if (item.stage === 'pending_accept' && item.targetPermissionId) {
+    try {
+      const verifyPerm = await driveApi(
+        sourceToken,
+        `/files/${encodeURIComponent(item.id)}/permissions/${encodeURIComponent(
+          item.targetPermissionId
+        )}?supportsAllDrives=true&fields=id,role,pendingOwner`
+      );
+      if (verifyPerm?.role === 'owner') {
+        return {
+          stage: 'completed',
+          acceptedByApi: true,
+          currentOwner: normTarget,
+          targetPermissionId: verifyPerm.id || item.targetPermissionId,
+          statusText: '✅ 已归属接收邮箱',
+          error: '',
+          logs: [`✅ 《${item.name}》所有者已是 ${normTarget}`]
+        };
+      }
+      if (verifyPerm?.pendingOwner === true) {
+        permId = verifyPerm.id || item.targetPermissionId;
+        alreadyPending = true;
+      } else {
+        permId = '';
+      }
+    } catch (_vpErr) {
+      permId = '';
+    }
+  }
 
   if (!alreadyPending) {
-    // 非 @gmail.com（如 Google Workspace 企业同域账号）优先尝试 1 步直接转移所有权
+    // 非 @gmail.com（如 Google Workspace 企业同域账号）优先尝试 1 步直接转移所有权，必须带 fields=id,role,pendingOwner 严查响应体
     if (!isPersonalGmail) {
       try {
         const directCreate = await driveApi(
           sourceToken,
-          `/files/${encodeURIComponent(item.id)}/permissions?transferOwnership=true&moveToNewOwnersRoot=false&sendNotificationEmail=false&supportsAllDrives=true`,
+          `/files/${encodeURIComponent(item.id)}/permissions?transferOwnership=true&moveToNewOwnersRoot=false&sendNotificationEmail=false&supportsAllDrives=true&fields=id,role,pendingOwner`,
           {
             method: 'POST',
             body: JSON.stringify({ type: 'user', role: 'owner', emailAddress: normTarget })
           }
         );
-        permId = directCreate?.id || permId;
         if (directCreate?.role === 'owner') {
           return {
             stage: 'completed',
+            acceptedByApi: true,
             currentOwner: normTarget,
-            targetPermissionId: permId,
+            targetPermissionId: directCreate.id || permId,
             statusText: '✅ 已直接完成所有权转移',
             error: '',
             logs: [`✅ 来源号已将《${item.name}》直接转移所有权给 ${normTarget}`]
           };
         }
-        if (directCreate?.pendingOwner) {
+        if (directCreate?.pendingOwner === true) {
+          permId = directCreate.id || permId;
           alreadyPending = true;
         }
-      } catch (_directErr) {
-        // 自动进入两步法
+      } catch (directErr) {
+        lastTransferErrMsg = directErr?.message || '';
       }
     }
 
-    // 超高速继承捷径（1次请求完结）：因为父文件夹优先授权了 writer，子文件已自动继承接收方的固定 permId，
-    // 若已知 permId，直接尝试 1 步 PATCH pendingOwner=true（成功则省去 50% 的 POST 写配额与耗时！）
+    // 尝试快速 PATCH 已知 permId，但必须严格核验返回体 pendingOwner === true || role === 'owner'！
+    // 若该 permId 来自父文件夹纯继承，Google Drive 会忽略 pendingOwner（返回 pendingOwner: false/undefined）或报错，此时立即清空 permId 改建文件级直属权限！
     if (!alreadyPending && permId) {
       try {
-        await driveApi(
+        const fastPatchRes = await driveApi(
           sourceToken,
           `/files/${encodeURIComponent(item.id)}/permissions/${encodeURIComponent(permId)}?supportsAllDrives=true&fields=id,role,pendingOwner`,
           {
@@ -6744,15 +7096,32 @@ async function transferSingleItemOwnership({
             body: JSON.stringify({ role: 'writer', pendingOwner: true })
           }
         );
-        alreadyPending = true;
-        logs.push(`⚡ 已对《${item.name}》一步设为待接收 (复用继承权限 permId)`);
-      } catch (_fastPatchErr) {
-        // 若该文件不在已共享的父目录内（尚未继承 writer），清空 permId 走下方标准两步法
+        if (fastPatchRes?.role === 'owner') {
+          return {
+            stage: 'completed',
+            acceptedByApi: true,
+            currentOwner: normTarget,
+            targetPermissionId: fastPatchRes.id || permId,
+            statusText: '✅ 已归属接收邮箱',
+            error: '',
+            logs: [`✅ 《${item.name}》已直接归属 ${normTarget}`]
+          };
+        }
+        if (fastPatchRes?.pendingOwner === true) {
+          permId = fastPatchRes.id || permId;
+          alreadyPending = true;
+          logs.push(`⚡ 已对《${item.name}》一步设为待接收 (pendingOwner 已确认生效)`);
+        } else {
+          // 纯继承权限未能激活 pendingOwner，立即丢弃继承 permId 走下方文件级直属 POST
+          permId = '';
+        }
+      } catch (fastErr) {
+        lastTransferErrMsg = fastErr?.message || lastTransferErrMsg;
         permId = '';
       }
     }
 
-    // 极速两步法 Step 1：直接通过幂等 POST 授予/升级接收方为 writer 并一步拿到 permId
+    // 极速两步法 Step 1：对该文件单独发起直属 POST writer 权限，确保生成文件级直接授权而非仅靠父级继承
     if (!alreadyPending && !permId) {
       try {
         const createdWriter = await driveApi(
@@ -6767,6 +7136,7 @@ async function transferSingleItemOwnership({
         if (createdWriter?.role === 'owner') {
           return {
             stage: 'completed',
+            acceptedByApi: true,
             currentOwner: normTarget,
             targetPermissionId: permId,
             statusText: '✅ 已归属接收邮箱',
@@ -6774,14 +7144,16 @@ async function transferSingleItemOwnership({
             logs: [`✅ 《${item.name}》所有者已是 ${normTarget}`]
           };
         }
-        if (createdWriter?.pendingOwner) {
+        if (createdWriter?.pendingOwner === true) {
           alreadyPending = true;
         }
       } catch (postErr) {
         const errMsg = String(postErr?.message || '');
+        lastTransferErrMsg = errMsg || lastTransferErrMsg;
         if (/cannotModifyOwnerPermission|already.*owner/i.test(errMsg)) {
           return {
             stage: 'completed',
+            acceptedByApi: true,
             currentOwner: normTarget,
             targetPermissionId: permId,
             statusText: '✅ 已归属接收邮箱',
@@ -6789,15 +7161,18 @@ async function transferSingleItemOwnership({
             logs: [`✅ 《${item.name}》所有者已是 ${normTarget}`]
           };
         }
-        // 回退读取一次权限列表
+        // 回退读取一次权限列表核查
         const permRes = await driveApi(
           sourceToken,
-          `/files/${encodeURIComponent(item.id)}/permissions?supportsAllDrives=true&fields=permissions(id,type,role,emailAddress,pendingOwner)`
+          `/files/${encodeURIComponent(item.id)}/permissions?supportsAllDrives=true&fields=permissions(id,type,role,emailAddress,pendingOwner,permissionDetails(inherited))`
         );
-        const targetPerm = (permRes?.permissions || []).find(p => normalizeEntry(p.emailAddress || '') === normTarget);
+        const targetPerm = (permRes?.permissions || []).find(
+          p => normalizeEntry(p.emailAddress || '') === normTarget
+        );
         if (targetPerm?.role === 'owner') {
           return {
             stage: 'completed',
+            acceptedByApi: true,
             currentOwner: normTarget,
             targetPermissionId: targetPerm.id || '',
             statusText: '✅ 已归属接收邮箱',
@@ -6807,17 +7182,17 @@ async function transferSingleItemOwnership({
         }
         if (targetPerm?.id) {
           permId = targetPerm.id;
-          alreadyPending = Boolean(targetPerm.pendingOwner);
+          alreadyPending = Boolean(targetPerm.pendingOwner === true);
         } else {
           throw postErr;
         }
       }
     }
 
-    // 极速两步法 Step 2：设置 pendingOwner: true 发起所有权转移邀请
+    // 极速两步法 Step 2：设置 pendingOwner: true 发起所有权转移邀请，每一步均严格检查返回体是否生效
     if (!alreadyPending && permId) {
       try {
-        await driveApi(
+        const patchRes1 = await driveApi(
           sourceToken,
           `/files/${encodeURIComponent(item.id)}/permissions/${encodeURIComponent(permId)}?supportsAllDrives=true&fields=id,role,pendingOwner`,
           {
@@ -6825,20 +7200,123 @@ async function transferSingleItemOwnership({
             body: JSON.stringify({ role: 'writer', pendingOwner: true })
           }
         );
-        alreadyPending = true;
-        logs.push(`📨 已对《${item.name}》发起转移邀请 (pendingOwner=true)`);
-      } catch (_err1) {
-        await driveApi(
-          sourceToken,
-          `/files/${encodeURIComponent(item.id)}/permissions/${encodeURIComponent(permId)}?transferOwnership=true&moveToNewOwnersRoot=false&supportsAllDrives=true&fields=id,role,pendingOwner`,
-          {
-            method: 'PATCH',
-            body: JSON.stringify({ role: 'writer', pendingOwner: true })
-          }
-        );
-        alreadyPending = true;
-        logs.push(`📨 已对《${item.name}》发起转移邀请 (pendingOwner=true)`);
+        if (patchRes1?.role === 'owner') {
+          return {
+            stage: 'completed',
+            acceptedByApi: true,
+            currentOwner: normTarget,
+            targetPermissionId: patchRes1.id || permId,
+            statusText: '✅ 已直接完成所有权转移',
+            error: '',
+            logs: [`✅ 《${item.name}》已直接完成所有权转移`]
+          };
+        }
+        if (patchRes1?.pendingOwner === true) {
+          permId = patchRes1.id || permId;
+          alreadyPending = true;
+          logs.push(`📨 已对《${item.name}》发起转移邀请 (pendingOwner=true 已确认)`);
+        }
+      } catch (err1) {
+        lastTransferErrMsg = err1?.message || lastTransferErrMsg;
       }
+
+      if (!alreadyPending) {
+        try {
+          const patchRes2 = await driveApi(
+            sourceToken,
+            `/files/${encodeURIComponent(item.id)}/permissions/${encodeURIComponent(permId)}?transferOwnership=true&moveToNewOwnersRoot=false&supportsAllDrives=true&fields=id,role,pendingOwner`,
+            {
+              method: 'PATCH',
+              body: JSON.stringify({ role: 'writer', pendingOwner: true })
+            }
+          );
+          if (patchRes2?.role === 'owner') {
+            return {
+              stage: 'completed',
+              acceptedByApi: true,
+              currentOwner: normTarget,
+              targetPermissionId: patchRes2.id || permId,
+              statusText: '✅ 已直接完成所有权转移',
+              error: '',
+              logs: [`✅ 《${item.name}》已直接完成所有权转移`]
+            };
+          }
+          if (patchRes2?.pendingOwner === true) {
+            permId = patchRes2.id || permId;
+            alreadyPending = true;
+            logs.push(`📨 已对《${item.name}》发起转移邀请 (transferOwnership pendingOwner=true 已确认)`);
+          }
+        } catch (err2) {
+          lastTransferErrMsg = err2?.message || lastTransferErrMsg;
+        }
+      }
+
+      if (!alreadyPending) {
+        try {
+          const patchRes3 = await driveApi(
+            sourceToken,
+            `/files/${encodeURIComponent(item.id)}/permissions/${encodeURIComponent(permId)}?transferOwnership=true&moveToNewOwnersRoot=false&supportsAllDrives=true&fields=id,role,pendingOwner`,
+            {
+              method: 'PATCH',
+              body: JSON.stringify({ role: 'owner' })
+            }
+          );
+          if (patchRes3?.role === 'owner') {
+            return {
+              stage: 'completed',
+              acceptedByApi: true,
+              currentOwner: normTarget,
+              targetPermissionId: patchRes3.id || permId,
+              statusText: '✅ 已直接完成所有权转移',
+              error: '',
+              logs: [`✅ 《${item.name}》已直接完成所有权转移`]
+            };
+          }
+          if (patchRes3?.pendingOwner === true) {
+            permId = patchRes3.id || permId;
+            alreadyPending = true;
+            logs.push(`📨 已对《${item.name}》发起转移邀请 (pendingOwner=true 已确认)`);
+          }
+        } catch (err3) {
+          lastTransferErrMsg = err3?.message || lastTransferErrMsg;
+        }
+      }
+    }
+
+    // 最终真实性兜底校验：若既未变为 owner 也未确认 pendingOwner === true，实时查一次文件权限，仍无效则明确抛错绝不假报成功！
+    if (!alreadyPending) {
+      try {
+        const finalCheck = await driveApi(
+          sourceToken,
+          `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id,mimeType,ownedByMe,owners(emailAddress),permissions(id,emailAddress,role,pendingOwner)`
+        );
+        const realOwner = normalizeEntry(finalCheck?.owners?.[0]?.emailAddress || '');
+        const tp = (finalCheck?.permissions || []).find(
+          p => normalizeEntry(p.emailAddress || '') === normTarget
+        );
+        if (realOwner === normTarget || tp?.role === 'owner') {
+          return {
+            stage: 'completed',
+            acceptedByApi: true,
+            currentOwner: normTarget,
+            targetPermissionId: tp?.id || permId,
+            statusText: '✅ 已归属接收邮箱',
+            error: '',
+            logs: [`✅ 核验确认《${item.name}》已归属 ${normTarget}`]
+          };
+        }
+        if (tp?.pendingOwner === true) {
+          permId = tp.id || permId;
+          alreadyPending = true;
+        }
+      } catch (_fcErr) {}
+    }
+
+    if (!alreadyPending) {
+      const cleanReason = lastTransferErrMsg
+        ? `（原因：${lastTransferErrMsg}）`
+        : '（Google Drive 未返回有效的 pendingOwner 或 owner 状态）';
+      throw new Error(`Google 云盘限制此类型文件跨账号直接转移所有权${cleanReason}`);
     }
   }
 
@@ -7007,25 +7485,107 @@ async function verifyOwnershipTransferItems({
 }
 
 /**
- * 将已转移给接收邮箱（或来自来源邮箱）的顶层文件夹与顶层文件一键归入接收邮箱的「我的云端硬盘 (My Drive)」根目录，
- * 自动修复跨账号转移导致的「点开文件夹一闪而过变空 / 游离未归档 (is:unorganized)」问题，
- * 并在上层父文件夹转移完成后自动将曾暂挂根目录的子文件夹/子文件恢复回原父文件夹，100% 保持原始目录树结构！
+ * 全盘检索并一键找回当前账号「已拥有但云盘网页看不见」的隐身游离文件与断层文件夹：
+ * 1) 原父目录也已归属当前账号但子项脱钩 -> 自动归位回原父文件夹 (restoredToOrigParent)
+ * 2) 悬空/无父目录或上级仍归属他人的断层文件夹 -> 自动挂载到『我的云端硬盘 (root)』并完整保留内部子目录树 (orphanFoldersMounted)
+ * 3) 无可达父目录的孤儿单文件 (is:unorganized 或挂在他人未挂载目录中) -> 自动归集到根目录『📁 找回的隐藏游离文件』文件夹 (orphanFilesArchived)
  */
-async function mountTransferredItemsToMyDriveRoot({
+async function rescueInvisibleOrphanFiles({
+  accountEmail = '',
+  targetEmail = '',
   targetToken = '',
   sourceToken = '',
   transferItems = [],
-  concurrency = 8,
+  archiveFolderName = '📁 找回的隐藏游离文件',
+  concurrency = 6,
+  refreshExistingFolders = false,
+  shouldStop = null,
   onProgress = null
-}) {
-  if (!targetToken) {
-    throw new Error('请先在右侧授权或选择已授权的「接收邮箱」，才能将其归入接收号的『我的云端硬盘』');
+} = {}) {
+  const cleanArchiveName = String(archiveFolderName || '📁 找回的隐藏游离文件').trim() || '📁 找回的隐藏游离文件';
+  const rawAccount = String(accountEmail || targetEmail || '').trim();
+
+  // 支持 accountEmail === 'all' 一键遍历全部已授权账号聚合找回
+  if (!targetToken && rawAccount.toLowerCase() === 'all') {
+    const accounts = await getAuthorizedAccounts();
+    if (!accounts.length) {
+      throw new Error('当前尚无已授权账号，请先在设置页导入 JSON 凭证并授权账号');
+    }
+    const agg = {
+      accountEmail: 'all',
+      totalOwned: 0,
+      orphanFoldersMounted: 0,
+      orphanFilesArchived: 0,
+      restoredToOrigParent: 0,
+      refreshedFolders: 0,
+      archiveFolderId: '',
+      archiveFolderName: cleanArchiveName,
+      failedCount: 0,
+      totalTopLevel: 0,
+      mountedCount: 0,
+      mountedFolders: 0,
+      mountedFiles: 0,
+      repairedChildCount: 0,
+      refreshedFolderCount: 0
+    };
+    for (const acc of accounts) {
+      if (shouldStop && shouldStop()) break;
+      const em = normalizeEntry(acc?.email || '');
+      if (!em) continue;
+      const sub = await rescueInvisibleOrphanFiles({
+        accountEmail: em,
+        sourceToken,
+        transferItems,
+        archiveFolderName: cleanArchiveName,
+        concurrency,
+        refreshExistingFolders,
+        shouldStop,
+        onProgress
+      });
+      agg.totalOwned += sub.totalOwned || 0;
+      agg.orphanFoldersMounted += sub.orphanFoldersMounted || 0;
+      agg.orphanFilesArchived += sub.orphanFilesArchived || 0;
+      agg.restoredToOrigParent += sub.restoredToOrigParent || 0;
+      agg.refreshedFolders += sub.refreshedFolders || 0;
+      agg.failedCount += sub.failedCount || 0;
+      if (sub.archiveFolderId && !agg.archiveFolderId) agg.archiveFolderId = sub.archiveFolderId;
+    }
+    agg.totalTopLevel = agg.orphanFoldersMounted + agg.orphanFilesArchived;
+    agg.mountedCount = agg.totalTopLevel;
+    agg.mountedFolders = agg.orphanFoldersMounted;
+    agg.mountedFiles = agg.orphanFilesArchived;
+    agg.repairedChildCount = agg.restoredToOrigParent;
+    agg.refreshedFolderCount = agg.refreshedFolders;
+    return agg;
   }
 
-  if (onProgress) {
-    onProgress({ message: '正在读取接收邮箱『我的云端硬盘 (root)』根目录 ID…' });
+  const activeEmail = normalizeEntry(rawAccount);
+  let liveToken = targetToken;
+  if (!liveToken && activeEmail) {
+    liveToken = await getValidTokenForAccount(activeEmail, true);
   }
-  const targetRootMeta = await driveApi(targetToken, '/files/root?fields=id');
+  if (!liveToken) {
+    throw new Error('请先选择或授权要找回隐藏文件的 Google 账号');
+  }
+
+  async function callTargetDrive(apiPath, options = {}) {
+    try {
+      return await driveApi(liveToken, apiPath, options);
+    } catch (err) {
+      const msg = String(err?.message || err || '');
+      if (activeEmail && (err?.status === 401 || /401|Invalid Credentials|UNAUTHENTICATED/i.test(msg))) {
+        liveToken = await getValidTokenForAccount(activeEmail, false, true);
+        return await driveApi(liveToken, apiPath, options);
+      }
+      throw err;
+    }
+  }
+
+  const labelPrefix = activeEmail ? `[${activeEmail}] ` : '';
+  if (onProgress) {
+    onProgress({ message: `📂 ${labelPrefix}正在读取『我的云端硬盘 (root)』根目录标识…` });
+  }
+  const targetRootMeta = await callTargetDrive('/files/root?fields=id');
   const targetRootId = targetRootMeta?.id || 'root';
 
   let sourceRootId = '';
@@ -7036,7 +7596,7 @@ async function mountTransferredItemsToMyDriveRoot({
     } catch (_e) {}
   }
 
-  // 4 线程极速扫描接收邮箱当前已拥有的全部文件与文件夹及其 parents 父目录关系
+  // 4 分片并发扫描当前账号已拥有的全部文件夹与文件
   const ownedFiles = [];
   const seenIds = new Set();
   const baseQ = "trashed = false and 'me' in owners";
@@ -7051,8 +7611,8 @@ async function mountTransferredItemsToMyDriveRoot({
     shards.map(async sq => {
       let pt = '';
       do {
-        const res = await driveApi(
-          targetToken,
+        if (shouldStop && shouldStop()) break;
+        const res = await callTargetDrive(
           `/files?pageSize=1000&supportsAllDrives=true&includeItemsFromAllDrives=true&q=${encodeURIComponent(
             sq
           )}&fields=nextPageToken,files(id,name,mimeType,parents)${pt ? `&pageToken=${encodeURIComponent(pt)}` : ''}`
@@ -7065,24 +7625,29 @@ async function mountTransferredItemsToMyDriveRoot({
         }
         pt = res?.nextPageToken || '';
         if (onProgress) {
-          onProgress({ message: `正在分析接收邮箱目录树结构（已读取 ${ownedFiles.length} 项）…` });
+          onProgress({ message: `📂 ${labelPrefix}正在分析云盘目录树可达性（已读取 ${ownedFiles.length} 项）…` });
         }
       } while (pt);
     })
   );
 
-  // 仅将「接收方当前已实际拥有 ('me' in owners)」的文件夹计入有效父文件夹集合！
-  // （关键修复：若某子文件夹如《Suki 整理完毕》已归属接收方，但其上级文件夹仍归属旧账号，不能把未转移的上级算作已挂载父目录，否则该子文件夹会悬空变成 is:unorganized 并导致点开一闪而过！）
   const ownedFolderIds = new Set();
+  let archiveFolderId = '';
   for (const f of ownedFiles) {
     if (f.mimeType === 'application/vnd.google-apps.folder') {
       ownedFolderIds.add(f.id);
+      if (
+        !archiveFolderId &&
+        f.name === cleanArchiveName &&
+        Array.isArray(f.parents) &&
+        (f.parents.includes(targetRootId) || f.parents.includes('root'))
+      ) {
+        archiveFolderId = f.id;
+      }
     }
   }
 
-  // 构建每个条目的「原始父文件夹 ID 映射表 (origParentMap)」，用于：
-  // 1) 当子文件夹/子文件从原父目录脱落时，自动塞回原父文件夹；
-  // 2) 当上级文件夹稍后也完成转移归属接收方时，将此前暂挂在 root 的子文件夹自动归位回上级文件夹内部！
+  // 构建原始父目录映射表 origParentMap（综合 transferItems、本地快照与当前非 root 父引用）
   const origParentMap = new Map();
   const transferItemById = new Map();
   const isRootId = pid => !pid || pid === 'root' || pid === targetRootId || (sourceRootId && pid === sourceRootId);
@@ -7111,7 +7676,6 @@ async function mountTransferredItemsToMyDriveRoot({
     }
   } catch (_eSnap) {}
 
-  // 对当前 ownedFiles 中仍保留着非 root 父目录引用的条目（例如上级文件夹尚在旧账号名下），先记下其原始父文件夹 ID
   for (const f of ownedFiles) {
     const parents = Array.isArray(f.parents) ? f.parents : [];
     const nonRootParent = parents.find(pid => !isRootId(pid));
@@ -7124,7 +7688,172 @@ async function mountTransferredItemsToMyDriveRoot({
     }
   }
 
-  // 单父目录模型安全移动辅助函数：自动携带 removeParents 替换旧父目录，彻底杜绝 Google Drive 403 Increasing the number of parents is not allowed
+  // 记录每个已拥有文件夹规划后的父目录，防止归位产生环路
+  const plannedFolderParent = new Map();
+  for (const f of ownedFiles) {
+    if (f.mimeType !== 'application/vnd.google-apps.folder') continue;
+    const parents = Array.isArray(f.parents) ? f.parents : [];
+    if (parents.includes(targetRootId) || parents.includes('root')) {
+      plannedFolderParent.set(f.id, targetRootId);
+    } else {
+      const ownedPid = parents.find(pid => ownedFolderIds.has(pid)) || '';
+      plannedFolderParent.set(f.id, ownedPid);
+    }
+  }
+
+  function wouldCreateFolderCycle(folderId, candidateParentId) {
+    if (!folderId || !candidateParentId) return false;
+    if (folderId === candidateParentId) return true;
+    let cur = candidateParentId;
+    const visited = new Set([folderId]);
+    let guard = 0;
+    while (cur && cur !== targetRootId && cur !== 'root' && guard < 128) {
+      if (visited.has(cur)) return true;
+      visited.add(cur);
+      cur = plannedFolderParent.get(cur) || '';
+      guard++;
+    }
+    return false;
+  }
+
+  // 步骤 1：原父目录同样已归属当前账号，但当前条目脱钩 -> 优先还原回原父目录
+  const restoreChildTasks = [];
+  const handledIds = new Set();
+  if (archiveFolderId) {
+    handledIds.add(archiveFolderId);
+  }
+
+  for (const f of ownedFiles) {
+    if (handledIds.has(f.id)) continue;
+    const origPid = origParentMap.get(f.id);
+    if (origPid && origPid !== f.id && ownedFolderIds.has(origPid) && origPid !== archiveFolderId) {
+      const isFolder = f.mimeType === 'application/vnd.google-apps.folder';
+      if (isFolder && wouldCreateFolderCycle(f.id, origPid)) {
+        continue;
+      }
+      const parents = Array.isArray(f.parents) ? f.parents : [];
+      if (!parents.includes(origPid)) {
+        restoreChildTasks.push({ item: f, destParentId: origPid, kind: 'restore_child' });
+        handledIds.add(f.id);
+        if (isFolder) {
+          plannedFolderParent.set(f.id, origPid);
+        }
+      }
+    }
+  }
+
+  // 步骤 2：基于 BFS 计算从『我的云端硬盘 (targetRootId)』出发真实可达的全部已拥有文件夹
+  const folderChildrenMap = new Map();
+  const ownedFolderList = [];
+  for (const f of ownedFiles) {
+    if (f.mimeType !== 'application/vnd.google-apps.folder') continue;
+    ownedFolderList.push(f);
+    const effParents = handledIds.has(f.id) && plannedFolderParent.get(f.id)
+      ? [plannedFolderParent.get(f.id)]
+      : Array.isArray(f.parents)
+        ? f.parents
+        : [];
+    for (const pid of effParents) {
+      if (!pid) continue;
+      let arr = folderChildrenMap.get(pid);
+      if (!arr) {
+        arr = [];
+        folderChildrenMap.set(pid, arr);
+      }
+      arr.push(f.id);
+    }
+  }
+
+  const reachableFolderIds = new Set([targetRootId, 'root']);
+  function propagateReachable(seedId) {
+    const queue = [seedId];
+    reachableFolderIds.add(seedId);
+    while (queue.length > 0) {
+      const curr = queue.shift();
+      const children = folderChildrenMap.get(curr);
+      if (!children) continue;
+      for (const cid of children) {
+        if (!reachableFolderIds.has(cid)) {
+          reachableFolderIds.add(cid);
+          queue.push(cid);
+        }
+      }
+    }
+  }
+  propagateReachable(targetRootId);
+  propagateReachable('root');
+
+  // 找出不可达的断层顶层文件夹（无父目录或上级文件夹不在当前账号名下），直接挂回 root 并保留其内部整棵子目录树
+  const mountFolderRootTasks = [];
+  for (const fld of ownedFolderList) {
+    if (reachableFolderIds.has(fld.id)) continue;
+    const effParents = handledIds.has(fld.id) && plannedFolderParent.get(fld.id)
+      ? [plannedFolderParent.get(fld.id)]
+      : Array.isArray(fld.parents)
+        ? fld.parents
+        : [];
+    const hasOwnedParent = effParents.some(pid => ownedFolderIds.has(pid));
+    if (!hasOwnedParent) {
+      mountFolderRootTasks.push({ item: fld, destParentId: 'root', kind: 'mount_folder_root' });
+      handledIds.add(fld.id);
+      plannedFolderParent.set(fld.id, targetRootId);
+      propagateReachable(fld.id);
+    }
+  }
+
+  // 兜底打破孤岛循环文件夹：若仍有未连通到 root 的已拥有文件夹，将其挂回 root 并连通子树
+  for (const fld of ownedFolderList) {
+    if (!reachableFolderIds.has(fld.id)) {
+      mountFolderRootTasks.push({ item: fld, destParentId: 'root', kind: 'mount_folder_root' });
+      handledIds.add(fld.id);
+      plannedFolderParent.set(fld.id, targetRootId);
+      propagateReachable(fld.id);
+    }
+  }
+
+  // 步骤 3：筛选所有不在『我的云端硬盘』且不在任何可达已拥有文件夹内的孤儿单文件 -> 归档至专属找回目录
+  const archiveOrphanFileTasks = [];
+  for (const f of ownedFiles) {
+    if (f.mimeType === 'application/vnd.google-apps.folder') continue;
+    if (handledIds.has(f.id)) continue;
+    const parents = Array.isArray(f.parents) ? f.parents : [];
+    const isVisibleInTree = parents.some(pid => reachableFolderIds.has(pid));
+    if (!isVisibleInTree) {
+      archiveOrphanFileTasks.push({ item: f, kind: 'archive_orphan_file' });
+      handledIds.add(f.id);
+    }
+  }
+
+  // 若存在孤儿单文件，按需查找或新建『📁 找回的隐藏游离文件』归档目录
+  if (archiveOrphanFileTasks.length > 0 && !archiveFolderId) {
+    try {
+      const checkQ = `mimeType = 'application/vnd.google-apps.folder' and trashed = false and '${escapeDriveQueryLiteral(
+        targetRootId
+      )}' in parents and name = '${escapeDriveQueryLiteral(cleanArchiveName)}'`;
+      const existingRes = await callTargetDrive(
+        `/files?pageSize=5&supportsAllDrives=true&includeItemsFromAllDrives=true&q=${encodeURIComponent(
+          checkQ
+        )}&fields=files(id,name,parents)`
+      );
+      if (existingRes?.files?.length && existingRes.files[0]?.id) {
+        archiveFolderId = existingRes.files[0].id;
+      }
+    } catch (_eFindArchive) {}
+
+    if (!archiveFolderId) {
+      const created = await callTargetDrive('/files?supportsAllDrives=true&fields=id,name,parents', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: cleanArchiveName,
+          mimeType: 'application/vnd.google-apps.folder',
+          parents: ['root']
+        })
+      });
+      archiveFolderId = created?.id || 'root';
+    }
+  }
+
+  // 单父目录安全移动函数：自动替换旧父目录，避免 403 Increasing the number of parents is not allowed
   async function moveDriveItemToParent(item, destParentId) {
     const effectiveDest = destParentId === 'root' ? targetRootId : destParentId;
     const curParents = Array.isArray(item.parents) ? item.parents.filter(Boolean) : [];
@@ -7132,8 +7861,7 @@ async function mountTransferredItemsToMyDriveRoot({
 
     if (removeList.length > 0) {
       try {
-        await driveApi(
-          targetToken,
+        await callTargetDrive(
           `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(
             destParentId
           )}&removeParents=${encodeURIComponent(removeList.join(','))}&supportsAllDrives=true&fields=id,parents`,
@@ -7147,22 +7875,19 @@ async function mountTransferredItemsToMyDriveRoot({
     }
 
     try {
-      await driveApi(
-        targetToken,
+      await callTargetDrive(
         `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(destParentId)}&supportsAllDrives=true&fields=id,parents`,
         { method: 'PATCH' }
       );
       item.parents = [effectiveDest];
       return { moved: true };
     } catch (_errDirect) {
-      // 查询实时 parents 后再精准替换或刷新元数据索引
-      const liveMeta = await driveApi(
-        targetToken,
+      const liveMeta = await callTargetDrive(
         `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id,parents`
       );
       const liveParents = Array.isArray(liveMeta?.parents) ? liveMeta.parents.filter(Boolean) : [];
       if (liveParents.includes(effectiveDest) || liveParents.includes(destParentId)) {
-        await driveApi(targetToken, `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id`, {
+        await callTargetDrive(`/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id`, {
           method: 'PATCH',
           body: JSON.stringify({ name: item.name })
         });
@@ -7171,8 +7896,7 @@ async function mountTransferredItemsToMyDriveRoot({
       }
       const liveRemove = liveParents.filter(pid => pid !== destParentId && pid !== effectiveDest);
       const rmParam = liveRemove.length ? `&removeParents=${encodeURIComponent(liveRemove.join(','))}` : '';
-      await driveApi(
-        targetToken,
+      await callTargetDrive(
         `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(destParentId)}${rmParam}&supportsAllDrives=true&fields=id,parents`,
         { method: 'PATCH' }
       );
@@ -7181,115 +7905,89 @@ async function mountTransferredItemsToMyDriveRoot({
     }
   }
 
-  // 队列 1：子目录脱钩归位（原父文件夹 origPid 现已归属接收方 ownedFolderIds，但当前条目不在 origPid 内）
-  const restoreChildTasks = [];
-  const handledIds = new Set();
-
-  for (const f of ownedFiles) {
-    const origPid = origParentMap.get(f.id);
-    if (origPid && origPid !== f.id && ownedFolderIds.has(origPid)) {
-      const parents = Array.isArray(f.parents) ? f.parents : [];
-      if (!parents.includes(origPid)) {
-        restoreChildTasks.push({ item: f, destParentId: origPid, kind: 'restore_child' });
-        handledIds.add(f.id);
-      }
-    }
-  }
-
-  // 队列 2：顶层或悬空文件夹/文件挂入『我的云端硬盘 (root)』根目录
-  // 条件：尚未在 targetRootId 下，且当前没有任何已归属接收方的父文件夹 (ownedFolderIds) 承载它
-  const mountRootTasks = [];
-  for (const f of ownedFiles) {
-    if (handledIds.has(f.id)) continue;
-    const parents = Array.isArray(f.parents) ? f.parents : [];
-    if (parents.includes(targetRootId)) continue;
-    const isInsideOwnedSubfolder = parents.some(pid => ownedFolderIds.has(pid));
-    if (!isInsideOwnedSubfolder) {
-      mountRootTasks.push({ item: f, destParentId: 'root', kind: 'mount_root' });
-      handledIds.add(f.id);
-    }
-  }
-
-  // 排序：文件夹优先于普通文件执行，确保父容器先就位
   const sortFoldersFirst = (a, b) => {
     const af = a.item.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
     const bf = b.item.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
     return af - bf;
   };
   restoreChildTasks.sort(sortFoldersFirst);
-  mountRootTasks.sort(sortFoldersFirst);
 
-  // 队列 3：对已在目录树中但可能因跨账号转移导致网页端视图索引卡死（点开一闪而过）的已拥有文件夹，执行一次轻量元数据刷新激活索引
   const refreshFolderTasks = [];
-  for (const f of ownedFiles) {
-    if (f.mimeType === 'application/vnd.google-apps.folder' && !handledIds.has(f.id)) {
-      refreshFolderTasks.push({ item: f, kind: 'refresh_folder' });
+  if (refreshExistingFolders) {
+    for (const fld of ownedFolderList) {
+      if (!handledIds.has(fld.id) && fld.id !== archiveFolderId) {
+        refreshFolderTasks.push({ item: fld, kind: 'refresh_folder' });
+      }
     }
   }
 
-  const allTasks = [...mountRootTasks, ...restoreChildTasks, ...refreshFolderTasks];
+  const allTasks = [
+    ...mountFolderRootTasks,
+    ...restoreChildTasks,
+    ...archiveOrphanFileTasks,
+    ...refreshFolderTasks
+  ];
   const totalTasks = allTasks.length;
 
-  let mountedCount = 0;
-  let mountedFolders = 0;
-  let mountedFiles = 0;
-  let repairedChildCount = 0;
-  let refreshedFolderCount = 0;
+  let orphanFoldersMounted = 0;
+  let orphanFilesArchived = 0;
+  let restoredToOrigParent = 0;
+  let refreshedFolders = 0;
   let failedCount = 0;
   let cursor = 0;
 
   if (totalTasks > 0) {
-    const workerCount = Math.min(Math.max(1, concurrency), totalTasks);
+    const workerCount = Math.min(Math.max(1, Number(concurrency) || 6), totalTasks);
     const workers = Array.from({ length: workerCount }, async (_, workerIdx) => {
       if (workerIdx > 0) {
         await new Promise(r => setTimeout(r, workerIdx * 50));
       }
       while (cursor < totalTasks) {
+        if (shouldStop && shouldStop()) break;
         const idx = cursor++;
         if (idx >= totalTasks) break;
         const task = allTasks[idx];
         const { item, destParentId, kind } = task;
 
         try {
-          if (kind === 'mount_root') {
+          if (kind === 'mount_folder_root') {
             await moveDriveItemToParent(item, 'root');
-            mountedCount++;
-            if (item.mimeType === 'application/vnd.google-apps.folder') mountedFolders++;
-            else mountedFiles++;
+            orphanFoldersMounted++;
           } else if (kind === 'restore_child') {
             await moveDriveItemToParent(item, destParentId);
-            repairedChildCount++;
+            restoredToOrigParent++;
+          } else if (kind === 'archive_orphan_file') {
+            await moveDriveItemToParent(item, archiveFolderId || 'root');
+            orphanFilesArchived++;
           } else if (kind === 'refresh_folder') {
             const pId = Array.isArray(item.parents) && item.parents[0] ? item.parents[0] : '';
             if (pId && pId !== targetRootId && pId !== 'root') {
-              await driveApi(
-                targetToken,
+              await callTargetDrive(
                 `/files/${encodeURIComponent(item.id)}?addParents=root&removeParents=${encodeURIComponent(pId)}&supportsAllDrives=true&fields=id`,
                 { method: 'PATCH', body: JSON.stringify({ name: item.name }) }
               );
-              await driveApi(
-                targetToken,
+              await callTargetDrive(
                 `/files/${encodeURIComponent(item.id)}?addParents=${encodeURIComponent(pId)}&removeParents=root&supportsAllDrives=true&fields=id`,
                 { method: 'PATCH', body: JSON.stringify({ name: item.name }) }
               );
             } else {
-              await driveApi(targetToken, `/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id`, {
+              await callTargetDrive(`/files/${encodeURIComponent(item.id)}?supportsAllDrives=true&fields=id`, {
                 method: 'PATCH',
                 body: JSON.stringify({ name: item.name })
               });
             }
-            refreshedFolderCount++;
+            refreshedFolders++;
           }
-        } catch (_err) {
+        } catch (_errTask) {
           failedCount++;
         }
 
-        const done = mountedCount + repairedChildCount + refreshedFolderCount + failedCount;
+        const done = orphanFoldersMounted + restoredToOrigParent + orphanFilesArchived + refreshedFolders + failedCount;
         if (onProgress && (done % 5 === 0 || done === totalTasks)) {
           onProgress({
             done,
             total: totalTasks,
-            message: `📂 正在归位并刷新目录索引 (${done}/${totalTasks})：挂入根目录 ${mountedFolders} 个文件夹/${mountedFiles} 个文件 · 归位子项 ${repairedChildCount} 个 · 激活文件夹索引 ${refreshedFolderCount} 个…`
+            message: `📂 ${labelPrefix}正在找回并归位隐藏文件 (${done}/${totalTasks})：挂回根目录 ${orphanFoldersMounted} 个文件夹 · 还原原父目录 ${restoredToOrigParent} 项 · 归档游离文件 ${orphanFilesArchived} 个…`
           });
         }
       }
@@ -7298,21 +7996,58 @@ async function mountTransferredItemsToMyDriveRoot({
   }
 
   return {
+    accountEmail: activeEmail || rawAccount,
     totalOwned: ownedFiles.length,
-    totalTopLevel: mountRootTasks.length,
-    mountedCount,
-    mountedFolders,
-    mountedFiles,
-    repairedChildCount,
-    refreshedFolderCount,
-    failedCount
+    orphanFoldersMounted,
+    orphanFilesArchived,
+    restoredToOrigParent,
+    refreshedFolders,
+    archiveFolderId,
+    archiveFolderName: cleanArchiveName,
+    failedCount,
+    totalTopLevel: orphanFoldersMounted + orphanFilesArchived,
+    mountedCount: orphanFoldersMounted + orphanFilesArchived,
+    mountedFolders: orphanFoldersMounted,
+    mountedFiles: orphanFilesArchived,
+    repairedChildCount: restoredToOrigParent,
+    refreshedFolderCount: refreshedFolders
   };
+}
+
+/**
+ * 将已转移给接收邮箱（或来自来源邮箱）的断层文件夹与游离文件一键归入接收邮箱的「我的云端硬盘 (My Drive)」，
+ * 自动还原已接管父目录层级、挂载断层目录至根目录，并将无归属孤儿单文件归集到『📁 找回的隐藏游离文件』并激活目录索引。
+ */
+async function mountTransferredItemsToMyDriveRoot({
+  accountEmail = '',
+  targetEmail = '',
+  targetToken = '',
+  sourceToken = '',
+  transferItems = [],
+  archiveFolderName = '📁 找回的隐藏游离文件',
+  concurrency = 6,
+  onProgress = null
+} = {}) {
+  if (!targetToken && !accountEmail && !targetEmail) {
+    throw new Error('请先在右侧授权或选择已授权的「接收邮箱」，才能将其归入接收号的『我的云端硬盘』');
+  }
+  return await rescueInvisibleOrphanFiles({
+    accountEmail,
+    targetEmail,
+    targetToken,
+    sourceToken,
+    transferItems,
+    archiveFolderName,
+    concurrency,
+    refreshExistingFolders: true,
+    onProgress
+  });
 }
 
 /**
  * 定向扫描 1 个或多个指定的 Google Drive 源文件夹（递归遍历其内部所有子文件夹与文件），
  * 即使该文件夹在网页端点开一闪而过变空，API 仍能通过 '<folderId>' in parents 100% 扫出内部所有文件！
- * 若同时授权了来源邮箱与接收邮箱，自动双端合并扫描，不论文件当前归属新号还是旧号都能全部扫出。
+ * 若同时授权了来源邮箱与接收邮箱，自动双端合并扫描，遇到分页异常或 401 过期自动刷新重试并单目录降级兜底，绝不静默吞错漏扫。
  */
 async function scanSpecificFoldersForTransfer({
   sourceEmail = '',
@@ -7352,9 +8087,38 @@ async function scanSpecificFoldersForTransfer({
     targetToken = await getValidTokenForAccount(normTarget, true, false);
   }
 
-  const activeTokens = [...new Set([sourceToken, targetToken].filter(Boolean))];
-  if (!activeTokens.length) {
+  const tokenSlots = [];
+  const seenTokens = new Set();
+  if (sourceToken) {
+    seenTokens.add(sourceToken);
+    tokenSlots.push({ email: normSource, token: sourceToken });
+  }
+  if (targetToken && !seenTokens.has(targetToken)) {
+    seenTokens.add(targetToken);
+    tokenSlots.push({ email: normTarget, token: targetToken });
+  }
+  if (!tokenSlots.length) {
     throw new Error('请先在上方选择并授权「来源邮箱」或「接收邮箱」后再扫描指定文件夹');
+  }
+
+  async function callSlotDrive(slot, apiPath) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await driveApi(slot.token, apiPath);
+      } catch (err) {
+        const msg = String(err?.message || err || '');
+        if (slot.email && (err?.status === 401 || /401|Invalid Credentials|UNAUTHENTICATED/i.test(msg))) {
+          slot.token = await getValidTokenForAccount(slot.email, false, true);
+          continue;
+        }
+        if (attempt < 2 && (err?.status >= 500 || err?.status === 429 || /network|fetch|timeout|rate/i.test(msg))) {
+          await new Promise(r => setTimeout(r, 400 * (attempt + 1)));
+          continue;
+        }
+        throw err;
+      }
+    }
+    return null;
   }
 
   const fastFields =
@@ -7365,29 +8129,54 @@ async function scanSpecificFoldersForTransfer({
   const rawFiles = [];
   const seenFileIds = new Set();
   const rootFolderIdSet = new Set(cleanFolderIds);
+  let lastFatalScanError = null;
 
   // 1. 先拉取指定的源文件夹自身元数据
   for (const fid of cleanFolderIds) {
     if (shouldStop && shouldStop()) break;
-    for (const tk of activeTokens) {
+    for (const slot of tokenSlots) {
       try {
-        const meta = await driveApi(
-          tk,
+        const meta = await callSlotDrive(
+          slot,
           `/files/${encodeURIComponent(fid)}?supportsAllDrives=true&fields=${encodeURIComponent(singleFields)}`
         );
         if (meta?.id && !seenFileIds.has(meta.id)) {
           meta._isScannedSourceRoot = true;
+          if (!meta.origParentId && Array.isArray(meta.parents) && meta.parents[0]) {
+            meta.origParentId = meta.parents[0];
+          }
           seenFileIds.add(meta.id);
           rawFiles.push(meta);
         }
         break;
-      } catch (_e) {
-        // try next token
+      } catch (errMeta) {
+        lastFatalScanError = errMeta;
       }
     }
   }
 
-  // 2. BFS 逐层扫描文件夹内部的全部子文件夹与文件（支持双账号令牌互补扫描，不漏任何跨账号子项）
+  async function fetchChildrenForIdsWithSlot(slot, parentIds) {
+    const parentClause = parentIds.map(id => `'${escapeDriveQueryLiteral(id)}' in parents`).join(' or ');
+    const q = `trashed = false and mimeType != 'application/vnd.google-apps.shortcut' and (${parentClause})`;
+    let pageToken = '';
+    const collected = [];
+    do {
+      if (shouldStop && shouldStop()) break;
+      const res = await callSlotDrive(
+        slot,
+        `/files?pageSize=1000&supportsAllDrives=true&includeItemsFromAllDrives=true&q=${encodeURIComponent(
+          q
+        )}&fields=${encodeURIComponent(fastFields)}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`
+      );
+      for (const f of res?.files || []) {
+        if (f?.id) collected.push(f);
+      }
+      pageToken = res?.nextPageToken || '';
+    } while (pageToken);
+    return collected;
+  }
+
+  // 2. BFS 逐层扫描文件夹内部的全部子文件夹与文件（chunkSize = 8，支持批次异常自动降级为单目录逐一扫描，绝不漏项）
   let currentLevelFolderIds = [...cleanFolderIds];
   const visitedFolders = new Set(cleanFolderIds);
   let depth = 0;
@@ -7397,48 +8186,54 @@ async function scanSpecificFoldersForTransfer({
     if (shouldStop && shouldStop()) break;
     depth++;
     const nextLevelFolderIds = [];
-    const chunkSize = 15;
+    const chunkSize = 8;
 
     for (let i = 0; i < currentLevelFolderIds.length; i += chunkSize) {
       if (shouldStop && shouldStop()) break;
       const chunk = currentLevelFolderIds.slice(i, i + chunkSize);
-      const parentClause = chunk.map(id => `'${escapeDriveQueryLiteral(id)}' in parents`).join(' or ');
-      const q = `trashed = false and mimeType != 'application/vnd.google-apps.shortcut' and (${parentClause})`;
 
       let addedInBatch = 0;
+      const ingestFileList = list => {
+        for (const f of list || []) {
+          if (!f?.id) continue;
+          if (!f.origParentId && Array.isArray(f.parents) && f.parents[0]) {
+            f.origParentId = f.parents[0];
+          }
+          if (!seenFileIds.has(f.id)) {
+            seenFileIds.add(f.id);
+            rawFiles.push(f);
+            addedInBatch++;
+          }
+          if (
+            recursive &&
+            f.mimeType === 'application/vnd.google-apps.folder' &&
+            !visitedFolders.has(f.id)
+          ) {
+            visitedFolders.add(f.id);
+            nextLevelFolderIds.push(f.id);
+          }
+        }
+      };
+
       await Promise.all(
-        activeTokens.map(async tk => {
-          let pageToken = '';
-          do {
-            if (shouldStop && shouldStop()) break;
-            try {
-              const res = await driveApi(
-                tk,
-                `/files?pageSize=1000&supportsAllDrives=true&includeItemsFromAllDrives=true&q=${encodeURIComponent(
-                  q
-                )}&fields=${encodeURIComponent(fastFields)}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`
-              );
-              for (const f of res?.files || []) {
-                if (!f?.id) continue;
-                if (!seenFileIds.has(f.id)) {
-                  seenFileIds.add(f.id);
-                  rawFiles.push(f);
-                  addedInBatch++;
-                }
-                if (
-                  recursive &&
-                  f.mimeType === 'application/vnd.google-apps.folder' &&
-                  !visitedFolders.has(f.id)
-                ) {
-                  visitedFolders.add(f.id);
-                  nextLevelFolderIds.push(f.id);
+        tokenSlots.map(async slot => {
+          try {
+            const batchFiles = await fetchChildrenForIdsWithSlot(slot, chunk);
+            ingestFileList(batchFiles);
+          } catch (errChunk) {
+            lastFatalScanError = errChunk;
+            if (chunk.length > 1) {
+              for (const singleFolderId of chunk) {
+                if (shouldStop && shouldStop()) break;
+                try {
+                  const singleFiles = await fetchChildrenForIdsWithSlot(slot, [singleFolderId]);
+                  ingestFileList(singleFiles);
+                } catch (errSingle) {
+                  lastFatalScanError = errSingle;
                 }
               }
-              pageToken = res?.nextPageToken || '';
-            } catch (_errPage) {
-              pageToken = '';
             }
-          } while (pageToken);
+          }
         })
       );
 
@@ -7448,7 +8243,7 @@ async function scanSpecificFoldersForTransfer({
           phase: 'scanning',
           page: batchSeq,
           count: rawFiles.length,
-          message: `📁 正在扫描指定文件夹第 ${depth} 层目录（已发现 ${rawFiles.length} 项）…`
+          message: `📁 正在深度扫描指定文件夹第 ${depth} 层目录（已发现 ${rawFiles.length} 项）…`
         });
       }
 
@@ -7474,6 +8269,12 @@ async function scanSpecificFoldersForTransfer({
     }
 
     currentLevelFolderIds = nextLevelFolderIds;
+  }
+
+  if (rawFiles.length === 0 && lastFatalScanError) {
+    throw new Error(
+      `无法读取指定源文件夹（请确认所选账号对该文件夹拥有访问权限）：${lastFatalScanError?.message || lastFatalScanError}`
+    );
   }
 
   const finalItems = buildTransferItemsFromRawFiles(rawFiles, {
@@ -14866,9 +15667,14 @@ async function exportAllExtensionConfig({ theme = '' } = {}) {
       : []
   }));
 
+  const manifestVer =
+    typeof chrome !== 'undefined' && typeof chrome.runtime?.getManifest === 'function'
+      ? chrome.runtime.getManifest()?.version || '1.2.3'
+      : '1.2.3';
+
   return {
     schema: FULL_CONFIG_SCHEMA_V2,
-    version: '1.2.2',
+    version: manifestVer,
     exportedAt: new Date().toISOString(),
     policy: {
       writers: normalizeEmailList(policy.writers || []),
